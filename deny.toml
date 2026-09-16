@@ -1,0 +1,38 @@
+# cargo-deny configuration — the Rust counterpart to the Go repos' govulncheck step.
+# Run with `make audit` (or `cargo deny check`).
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail on any crate with a security advisory or one that is no longer maintained.
+yanked = "deny"
+unmaintained = "all"
+
+[licenses]
+# Permissive licenses only. A copyleft dependency would change this project's own
+# licensing obligations, so it must be a deliberate decision, not a silent upgrade.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Duplicate versions of the same crate are a warning, not an error: they are usually
+# a transitive dependency's problem and not always fixable from here.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# crates.io only. A git or custom-registry dependency would undermine the reproducibility
+# the whole project is about.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

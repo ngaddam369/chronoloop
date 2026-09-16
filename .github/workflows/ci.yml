@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [master]
+
+# A newer push to the same ref supersedes the one in flight — don't pay for both.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental compilation is wasted on a fresh runner and bloats the cache it has to save.
+  CARGO_INCREMENTAL: 0
+
+# Every job below is independent — no `needs:` — so they all start at once and the
+# pipeline costs the slowest job, not the sum. `format` and `audit` never compile the
+# crate at all.
+
+jobs:
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      # Release, not debug: a debug build here would just duplicate what `test` already
+      # compiles. Release catches what debug does not and produces the shipping binary.
+      - name: Build (release)
+        run: cargo build --locked --release
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+      - name: Test
+        run: cargo test --locked --all-targets
+      # --all-targets skips doctests, so they get their own invocation.
+      - name: Doctests
+        run: cargo test --locked --doc
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

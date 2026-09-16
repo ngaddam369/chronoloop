@@ -1,0 +1,7 @@
+# Proper nouns that `clippy::doc_markdown` would otherwise demand be wrapped in backticks.
+# Backticks render as code, which is wrong for a product name in prose. `".."` extends
+# clippy's default list rather than replacing it.
+#
+# Add a name here only when it is a real proper noun. Do not use this to silence
+# doc_markdown on an actual type name — those genuinely do want backticks.
+doc-valid-idents = ["FoundationDB", ".."]

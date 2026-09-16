@@ -1,0 +1,28 @@
+[package]
+name = "chronoloop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+description = "Deterministic simulation engine for infrastructure control loops — virtual time, replayable history, shrinkable failures"
+repository = "https://github.com/ngaddam369/chronoloop"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["simulation", "deterministic", "testing", "distributed-systems", "replay"]
+categories = ["development-tools::testing", "simulation"]
+
+[dependencies]
+# Deliberately empty. Dependencies arrive with the code that needs them, per phase.
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+# Allow-list: pedantic lints that fight this codebase rather than improve it.
+# Keep this list short and justified — widening it silently defeats the point.
+module_name_repetitions = "allow" # clock::VirtualClock reads better than clock::Virtual
+missing_errors_doc = "allow"      # re-enable once the error taxonomy settles
+must_use_candidate = "allow"      # would demand #[must_use] on nearly every constructor
