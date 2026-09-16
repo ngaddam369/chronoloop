@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local-only working documents
+TODO.md
+CLAUDE.md
+
+# Simulation artifacts
+/traces
+*.repro
+
+# mdBook build output
+docs/book/
