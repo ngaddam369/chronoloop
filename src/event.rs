@@ -1,8 +1,7 @@
 //! The queue of future events, ordered so that replay is deterministic.
 
-use core::cmp::Ordering;
 use core::fmt;
-use std::collections::BinaryHeap;
+use std::collections::BTreeMap;
 
 use crate::clock::VirtualTime;
 
@@ -15,53 +14,32 @@ pub struct Scheduled<E> {
     pub event: E,
 }
 
-/// A heap entry. Ordered by `(at, seq)` only, reversed so the max-heap pops the earliest entry.
-struct Entry<E> {
+/// Identifies one scheduled event, so that whoever scheduled it can take it back.
+///
+/// Returned by [`EventQueue::push`] and accepted by [`EventQueue::cancel`]. Sequence numbers only
+/// ever go up, so an identifier whose event has already fired or been cancelled can never name a
+/// later one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventId {
     at: VirtualTime,
     seq: u64,
-    event: E,
-}
-
-impl<E> Entry<E> {
-    fn key(&self) -> (VirtualTime, u64) {
-        (self.at, self.seq)
-    }
-}
-
-impl<E> PartialEq for Entry<E> {
-    fn eq(&self, other: &Self) -> bool {
-        self.key() == other.key()
-    }
-}
-
-impl<E> Eq for Entry<E> {}
-
-impl<E> PartialOrd for Entry<E> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<E> Ord for Entry<E> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.key().cmp(&self.key())
-    }
 }
 
 /// Future events, popped earliest first.
 ///
 /// Events scheduled for the same virtual instant pop in the order they were pushed. Every push is
-/// stamped with a monotonic sequence number, so ties never depend on the heap's internal layout
-/// and the same pushes always pop in the same order.
+/// stamped with a monotonic sequence number and the queue is keyed by `(instant, sequence)`, so
+/// ties never depend on the queue's internal layout and the same pushes always pop in the same
+/// order. That key is unique, which is also what lets a single event be cancelled by name.
 pub struct EventQueue<E> {
-    heap: BinaryHeap<Entry<E>>,
+    pending: BTreeMap<EventId, E>,
     next_seq: u64,
 }
 
 impl<E> Default for EventQueue<E> {
     fn default() -> Self {
         Self {
-            heap: BinaryHeap::new(),
+            pending: BTreeMap::new(),
             next_seq: 0,
         }
     }
@@ -70,7 +48,7 @@ impl<E> Default for EventQueue<E> {
 impl<E: fmt::Debug> fmt::Debug for EventQueue<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EventQueue")
-            .field("pending", &self.heap.len())
+            .field("pending", &self.pending.len())
             .field("next_seq", &self.next_seq)
             .finish()
     }
@@ -82,27 +60,47 @@ impl<E> EventQueue<E> {
         Self::default()
     }
 
-    /// Schedules `event` for the virtual instant `at`.
+    /// Returns the number of events waiting to fire.
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Returns `true` if no event is waiting to fire.
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Schedules `event` for the virtual instant `at`, returning the identifier that cancels it.
     ///
     /// # Panics
     ///
     /// Panics if the queue has already accepted `u64::MAX` pushes, which cannot happen in practice.
-    pub fn push(&mut self, at: VirtualTime, event: E) {
+    pub fn push(&mut self, at: VirtualTime, event: E) -> EventId {
         let seq = self.next_seq;
         // Unreachable: exhausting a u64 at a billion pushes per second takes over 580 years.
         self.next_seq = seq
             .checked_add(1)
             .expect("event sequence number exhausted after u64::MAX pushes");
-        self.heap.push(Entry { at, seq, event });
+        let id = EventId { at, seq };
+        self.pending.insert(id, event);
+        id
     }
 
     /// Removes and returns the earliest event, or `None` if the queue is empty.
     ///
     /// Events scheduled for the same instant are returned in the order they were pushed.
     pub fn pop(&mut self) -> Option<Scheduled<E>> {
-        self.heap
-            .pop()
-            .map(|Entry { at, event, .. }| Scheduled { at, event })
+        self.pending
+            .pop_first()
+            .map(|(EventId { at, .. }, event)| Scheduled { at, event })
+    }
+
+    /// Takes the event named by `id` back out of the queue, returning it.
+    ///
+    /// Returns `None` if that event has already fired or already been cancelled, so cancelling a
+    /// wait that has since completed costs nothing and means nothing.
+    pub fn cancel(&mut self, id: EventId) -> Option<E> {
+        self.pending.remove(&id)
     }
 }
 
@@ -204,6 +202,143 @@ mod tests {
                 (30, "c"),
             ]
         );
+    }
+
+    #[test]
+    fn cancel_removes_only_the_named_event() {
+        struct Case {
+            name: &'static str,
+            pushes: &'static [(u64, &'static str)],
+            cancel: &'static [usize],
+            want: &'static [(u64, &'static str)],
+        }
+        const MAX: u64 = u64::MAX;
+        let cases = [
+            Case {
+                name: "nothing cancelled",
+                pushes: &[(10, "a"), (20, "b")],
+                cancel: &[],
+                want: &[(10, "a"), (20, "b")],
+            },
+            Case {
+                name: "the earliest event",
+                pushes: &[(10, "a"), (20, "b"), (30, "c")],
+                cancel: &[0],
+                want: &[(20, "b"), (30, "c")],
+            },
+            Case {
+                name: "the latest event",
+                pushes: &[(10, "a"), (20, "b"), (30, "c")],
+                cancel: &[2],
+                want: &[(10, "a"), (20, "b")],
+            },
+            Case {
+                name: "one of three tied at an instant",
+                pushes: &[(5, "first"), (5, "second"), (5, "third")],
+                cancel: &[1],
+                want: &[(5, "first"), (5, "third")],
+            },
+            Case {
+                name: "a tie at the maximum instant",
+                pushes: &[(MAX, "x"), (0, "early"), (MAX, "y")],
+                cancel: &[0],
+                want: &[(0, "early"), (MAX, "y")],
+            },
+            Case {
+                name: "every event",
+                pushes: &[(10, "a"), (20, "b")],
+                cancel: &[0, 1],
+                want: &[],
+            },
+        ];
+        for case in cases {
+            let mut queue = EventQueue::new();
+            let ids: Vec<EventId> = case
+                .pushes
+                .iter()
+                .map(|&(at, label)| queue.push(t(at), label))
+                .collect();
+
+            for &index in case.cancel {
+                assert_eq!(
+                    queue.cancel(ids[index]),
+                    Some(case.pushes[index].1),
+                    "{}: cancelling a pending event returns it",
+                    case.name
+                );
+            }
+
+            assert_eq!(queue.len(), case.want.len(), "{}", case.name);
+            assert_eq!(drain(&mut queue), case.want, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn cancelling_an_event_that_is_no_longer_pending_does_nothing() {
+        struct Case {
+            name: &'static str,
+            pops: usize,
+            cancels_before: usize,
+        }
+        let cases = [
+            Case {
+                name: "already popped",
+                pops: 1,
+                cancels_before: 0,
+            },
+            Case {
+                name: "already cancelled",
+                pops: 0,
+                cancels_before: 1,
+            },
+        ];
+        for case in cases {
+            let mut queue = EventQueue::new();
+            let first = queue.push(t(10), "a");
+            queue.push(t(20), "b");
+
+            for _ in 0..case.pops {
+                assert_eq!(queue.pop().map(|s| s.event), Some("a"), "{}", case.name);
+            }
+            for _ in 0..case.cancels_before {
+                assert_eq!(queue.cancel(first), Some("a"), "{}", case.name);
+            }
+
+            assert_eq!(queue.cancel(first), None, "{}", case.name);
+            assert_eq!(drain(&mut queue), [(20, "b")], "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn a_cancelled_identifier_never_names_a_later_event() {
+        // Sequence numbers only ever go up, so a stale identifier cannot collide with a live event.
+        let mut queue = EventQueue::new();
+        let first = queue.push(t(10), "a");
+
+        assert_eq!(queue.cancel(first), Some("a"));
+        queue.push(t(10), "pushed after the cancel");
+
+        assert_eq!(queue.cancel(first), None);
+        assert_eq!(drain(&mut queue), [(10, "pushed after the cancel")]);
+    }
+
+    #[test]
+    fn len_and_is_empty_follow_the_pending_events() {
+        let mut queue = EventQueue::new();
+        assert_eq!(queue.len(), 0);
+        assert!(queue.is_empty());
+
+        let first = queue.push(t(10), "a");
+        queue.push(t(20), "b");
+        assert_eq!(queue.len(), 2);
+        assert!(!queue.is_empty());
+
+        assert_eq!(queue.cancel(first), Some("a"));
+        assert_eq!(queue.len(), 1);
+
+        assert_eq!(queue.pop().map(|s| s.event), Some("b"));
+        assert_eq!(queue.len(), 0);
+        assert!(queue.is_empty());
     }
 
     #[test]

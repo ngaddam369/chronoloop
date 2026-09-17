@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Wake;
 
 use crate::clock::{ClockError, VirtualClock, VirtualTime};
-use crate::event::EventQueue;
+use crate::event::{EventId, EventQueue};
 
 /// Identifies a task, assigned in spawn order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -47,8 +47,20 @@ impl Handle {
     }
 
     /// Schedules `waker` to be woken once the simulation reaches the instant `at`.
-    pub fn schedule_wake(&self, at: VirtualTime, waker: Waker) {
-        self.shared.borrow_mut().queue.push(at, waker);
+    ///
+    /// Returns the identifier that [`Handle::cancel_wake`] takes to call the wake-up off again.
+    pub fn schedule_wake(&self, at: VirtualTime, waker: Waker) -> EventId {
+        self.shared.borrow_mut().queue.push(at, waker)
+    }
+
+    /// Calls off the wake-up named by `id`, dropping the waker it was holding.
+    ///
+    /// A wake-up that has already been delivered, or already been called off, is left alone: a
+    /// wait that completed before it was abandoned costs nothing to abandon.
+    pub fn cancel_wake(&self, id: EventId) {
+        // The borrow ends with the statement, so the waker is dropped outside it.
+        let cancelled = self.shared.borrow_mut().queue.cancel(id);
+        drop(cancelled);
     }
 
     /// Returns a future that completes once `duration` of virtual time has gone by.
@@ -93,10 +105,29 @@ impl Handle {
 }
 
 /// A wait on the virtual clock, created by [`Handle::sleep`] or [`Handle::sleep_until`].
+///
+/// Dropping a wait takes its timer back out of the queue. An abandoned wait therefore leaves no
+/// trace in the run: it cannot wake the task that walked away from it, and it cannot move the
+/// clock to an instant nothing in the simulation is waiting for.
 pub struct Sleep {
     handle: Handle,
     deadline: VirtualTime,
-    registered: Option<Waker>,
+    registered: Option<(EventId, Waker)>,
+}
+
+impl Sleep {
+    /// Takes this wait's timer back out of the queue, if it still holds one.
+    fn disarm(&mut self) {
+        if let Some((id, _)) = self.registered.take() {
+            self.handle.cancel_wake(id);
+        }
+    }
+}
+
+impl Drop for Sleep {
+    fn drop(&mut self) {
+        self.disarm();
+    }
 }
 
 impl fmt::Debug for Sleep {
@@ -112,6 +143,7 @@ impl Future for Sleep {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if self.handle.now() >= self.deadline {
+            self.disarm();
             return Poll::Ready(());
         }
         // Re-arm only when the stored waker would not wake this task, so being polled again
@@ -119,11 +151,14 @@ impl Future for Sleep {
         let armed = self
             .registered
             .as_ref()
-            .is_some_and(|waker| waker.will_wake(cx.waker()));
+            .is_some_and(|(_, waker)| waker.will_wake(cx.waker()));
         if !armed {
+            // A waker that would not wake this task is of no use, and neither is the timer holding
+            // it: call that one off rather than leaving it to fire beside its replacement.
+            self.disarm();
             let waker = cx.waker().clone();
-            self.handle.schedule_wake(self.deadline, waker.clone());
-            self.registered = Some(waker);
+            let id = self.handle.schedule_wake(self.deadline, waker.clone());
+            self.registered = Some((id, waker));
         }
         Poll::Pending
     }
@@ -289,20 +324,24 @@ impl Executor {
         id
     }
 
-    /// Runs until every task has finished.
+    /// Runs until every task has finished, and stops the clock where the last one left it.
+    ///
+    /// Events still queued when the final task finishes are discarded rather than run out: with no
+    /// task left to observe them, delivering them would only carry the clock past the end of the
+    /// work. The instant the run ends at is therefore the instant the work ended at.
     ///
     /// Returns [`ExecutorError::Stalled`] if the events run out while tasks are still waiting, and
     /// [`ExecutorError::Clock`] if an event was scheduled for an instant already passed.
     pub fn run(&mut self) -> Result<(), ExecutorError> {
         loop {
             self.poll_ready();
+            if self.tasks.is_empty() {
+                return Ok(());
+            }
 
             // The borrow ends with the statement: nothing may hold it across a poll.
             let next = self.shared.borrow_mut().queue.pop();
             let Some(scheduled) = next else {
-                if self.tasks.is_empty() {
-                    return Ok(());
-                }
                 return Err(ExecutorError::Stalled {
                     pending: self.tasks.keys().copied().collect(),
                 });
@@ -332,6 +371,9 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HOUR: u64 = 3600 * 1_000_000_000;
+    const DAY: u64 = 24 * HOUR;
 
     type Log = Rc<RefCell<Vec<(u64, String)>>>;
     type WakerSlot = Rc<RefCell<Option<Waker>>>;
@@ -423,6 +465,40 @@ mod tests {
             let now = self.handle.now().as_nanos();
             self.polls.borrow_mut().push(now);
             self.sleep.as_mut().poll(cx)
+        }
+    }
+
+    /// Wraps a [`Sleep`], handing it a freshly built waker on every poll.
+    ///
+    /// The waker forwards to the one the executor supplied, so waking it still wakes the task, but
+    /// [`Waker::will_wake`] answers `false` every time — the case a combinator that polls its
+    /// children through their own wakers produces.
+    struct FreshWakerEachPoll {
+        sleep: Pin<Box<Sleep>>,
+    }
+
+    struct Forward(Mutex<Option<Waker>>);
+
+    impl Wake for Forward {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            let waker = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
+
+    impl Future for FreshWakerEachPoll {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let forwarding = Waker::from(Arc::new(Forward(Mutex::new(Some(cx.waker().clone())))));
+            let mut forwarded = Context::from_waker(&forwarding);
+            self.sleep.as_mut().poll(&mut forwarded)
         }
     }
 
@@ -662,6 +738,85 @@ mod tests {
 
         assert_eq!(executor.run(), Ok(()));
         assert_eq!(*log.borrow(), [(0, "polled".to_owned())]);
+        // The run ended with the last task, so the wake-up it left behind never moved the clock.
+        assert_eq!(executor.handle().now(), VirtualTime::ZERO);
+    }
+
+    #[test]
+    fn a_wait_abandoned_before_its_deadline_never_fires() {
+        let polls: Rc<RefCell<Vec<u64>>> = Rc::default();
+        let mut executor = Executor::new();
+        let handle = executor.handle();
+        let task_polls = Rc::clone(&polls);
+        executor.spawn(async move {
+            let mut abandoned = Box::pin(handle.sleep(Duration::from_nanos(DAY)));
+            // Arm the wait, then walk away from it — a reconcile whose work finished before its
+            // own timeout did.
+            let armed = core::future::poll_fn(|cx| Poll::Ready(abandoned.as_mut().poll(cx))).await;
+            assert!(armed.is_pending(), "the wait must still have been pending");
+            drop(abandoned);
+
+            CountedSleep {
+                sleep: Box::pin(handle.sleep(Duration::from_nanos(2 * DAY))),
+                handle: handle.clone(),
+                polls: task_polls,
+            }
+            .await;
+        });
+
+        assert_eq!(executor.run(), Ok(()));
+        // Without the abandoned timer there is no stop at one day: the task waits out its own two.
+        assert_eq!(*polls.borrow(), [0, 2 * DAY]);
+        assert_eq!(executor.handle().now().as_nanos(), 2 * DAY);
+    }
+
+    #[test]
+    fn a_run_ends_at_the_instant_its_last_task_finished() {
+        let mut executor = Executor::new();
+        let handle = executor.handle();
+        executor.spawn(async move {
+            let mut abandoned = Box::pin(handle.sleep(Duration::from_nanos(DAY)));
+            let armed = core::future::poll_fn(|cx| Poll::Ready(abandoned.as_mut().poll(cx))).await;
+            assert!(armed.is_pending(), "the wait must still have been pending");
+            drop(abandoned);
+            handle.sleep(Duration::from_nanos(10)).await;
+        });
+
+        assert_eq!(executor.run(), Ok(()));
+        assert_eq!(executor.handle().now().as_nanos(), 10);
+    }
+
+    #[test]
+    fn a_wait_polled_with_a_new_waker_arms_only_one_timer() {
+        const DEADLINE: u64 = 50;
+
+        let polls: Rc<RefCell<Vec<u64>>> = Rc::default();
+        let mut executor = Executor::new();
+        let handle = executor.handle();
+        let task_polls = Rc::clone(&polls);
+        executor.spawn(async move {
+            let waker = core::future::poll_fn(|cx| Poll::Ready(cx.waker().clone())).await;
+            // Wake the task while the wait is outstanding, so the wait is polled a second time and
+            // sees a different waker than the one it registered.
+            waker.wake();
+            FreshWakerEachPoll {
+                sleep: Box::pin(handle.sleep_until(t(DEADLINE))),
+            }
+            .await;
+
+            // A second wait, whose polls count the wake-ups the first one left behind.
+            CountedSleep {
+                sleep: Box::pin(handle.sleep_until(t(DEADLINE + 10))),
+                handle: handle.clone(),
+                polls: task_polls,
+            }
+            .await;
+        });
+
+        assert_eq!(executor.run(), Ok(()));
+        // A second timer left over from the re-arm would wake the task again at the deadline, and
+        // the wait that follows would be polled twice there.
+        assert_eq!(*polls.borrow(), [DEADLINE, DEADLINE + 10]);
     }
 
     #[test]
@@ -777,7 +932,6 @@ mod tests {
 
     #[test]
     fn a_sleep_costs_the_same_polls_however_long_the_span() {
-        const HOUR: u64 = 3600 * 1_000_000_000;
         struct Case {
             name: &'static str,
             deadline: u64,
@@ -827,7 +981,6 @@ mod tests {
 
     #[test]
     fn run_cost_tracks_event_count_not_elapsed_virtual_time() {
-        const HOUR: u64 = 3600 * 1_000_000_000;
         const SLEEPS: u64 = 10_000;
 
         let polls: Rc<RefCell<Vec<u64>>> = Rc::default();
