@@ -4,7 +4,8 @@ use core::cell::RefCell;
 use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Waker};
+use core::task::{Context, Poll, Waker};
+use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -48,6 +49,83 @@ impl Handle {
     /// Schedules `waker` to be woken once the simulation reaches the instant `at`.
     pub fn schedule_wake(&self, at: VirtualTime, waker: Waker) {
         self.shared.borrow_mut().queue.push(at, waker);
+    }
+
+    /// Returns a future that completes once `duration` of virtual time has gone by.
+    ///
+    /// Waiting costs no real time: the clock jumps to the deadline once nothing else can run. A
+    /// duration reaching beyond the end of virtual time is capped there.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use chronoloop::executor::{Executor, ExecutorError};
+    ///
+    /// let mut executor = Executor::new();
+    /// let handle = executor.handle();
+    /// executor.spawn(async move {
+    ///     handle.sleep(Duration::from_secs(3600)).await;
+    /// });
+    /// executor.run()?;
+    ///
+    /// assert_eq!(executor.handle().now().to_string(), "3600.000000000s");
+    /// # Ok::<(), ExecutorError>(())
+    /// ```
+    pub fn sleep(&self, duration: Duration) -> Sleep {
+        let deadline = self
+            .now()
+            .checked_add(duration)
+            .unwrap_or(VirtualTime::from_nanos(u64::MAX));
+        self.sleep_until(deadline)
+    }
+
+    /// Returns a future that completes once the simulation reaches `deadline`.
+    ///
+    /// A deadline the simulation has already passed completes on the first poll.
+    pub fn sleep_until(&self, deadline: VirtualTime) -> Sleep {
+        Sleep {
+            handle: self.clone(),
+            deadline,
+            registered: None,
+        }
+    }
+}
+
+/// A wait on the virtual clock, created by [`Handle::sleep`] or [`Handle::sleep_until`].
+pub struct Sleep {
+    handle: Handle,
+    deadline: VirtualTime,
+    registered: Option<Waker>,
+}
+
+impl fmt::Debug for Sleep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sleep")
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Future for Sleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.handle.now() >= self.deadline {
+            return Poll::Ready(());
+        }
+        // Re-arm only when the stored waker would not wake this task, so being polled again
+        // before the deadline leaves one timer in the queue rather than two.
+        let armed = self
+            .registered
+            .as_ref()
+            .is_some_and(|waker| waker.will_wake(cx.waker()));
+        if !armed {
+            let waker = cx.waker().clone();
+            self.handle.schedule_wake(self.deadline, waker.clone());
+            self.registered = Some(waker);
+        }
+        Poll::Pending
     }
 }
 
@@ -254,7 +332,6 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::task::Poll;
 
     type Log = Rc<RefCell<Vec<(u64, String)>>>;
     type WakerSlot = Rc<RefCell<Option<Waker>>>;
@@ -263,51 +340,45 @@ mod tests {
         VirtualTime::from_nanos(nanos)
     }
 
-    /// Waits for each deadline in turn, logging every time it wakes, then finishes.
-    struct WakeAt {
-        handle: Handle,
+    /// Spawns a task that waits until each instant in turn, logging every wake-up.
+    fn spawn_sleeper(
+        executor: &mut Executor,
         label: &'static str,
-        deadlines: Vec<VirtualTime>,
-        next: usize,
-        log: Log,
-    }
-
-    impl WakeAt {
-        fn spawn(executor: &mut Executor, label: &'static str, deadlines: &[u64], log: &Log) {
-            let future = Self {
-                handle: executor.handle(),
-                label,
-                deadlines: deadlines.iter().copied().map(t).collect(),
-                next: 0,
-                log: Rc::clone(log),
-            };
-            executor.spawn(future);
-        }
-    }
-
-    impl Future for WakeAt {
-        type Output = ();
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            loop {
-                let now = self.handle.now();
-                let Some(&deadline) = self.deadlines.get(self.next) else {
-                    self.log
-                        .borrow_mut()
-                        .push((now.as_nanos(), format!("{} done", self.label)));
-                    return Poll::Ready(());
-                };
-                if now >= deadline {
-                    self.log
-                        .borrow_mut()
-                        .push((now.as_nanos(), format!("{} wake", self.label)));
-                    self.next += 1;
-                } else {
-                    self.handle.schedule_wake(deadline, cx.waker().clone());
-                    return Poll::Pending;
-                }
+        deadlines: &'static [u64],
+        log: &Log,
+    ) {
+        let handle = executor.handle();
+        let log = Rc::clone(log);
+        executor.spawn(async move {
+            for &deadline in deadlines {
+                handle.sleep_until(t(deadline)).await;
+                log.borrow_mut()
+                    .push((handle.now().as_nanos(), format!("{label} wake")));
             }
-        }
+            log.borrow_mut()
+                .push((handle.now().as_nanos(), format!("{label} done")));
+        });
+    }
+
+    /// Spawns a task that sleeps for each duration in turn, logging every wake-up.
+    fn spawn_napper(executor: &mut Executor, label: &'static str, naps: &'static [u64], log: &Log) {
+        let handle = executor.handle();
+        let log = Rc::clone(log);
+        executor.spawn(async move {
+            for &nap in naps {
+                handle.sleep(Duration::from_nanos(nap)).await;
+                log.borrow_mut()
+                    .push((handle.now().as_nanos(), format!("{label} wake")));
+            }
+            log.borrow_mut()
+                .push((handle.now().as_nanos(), format!("{label} done")));
+        });
+    }
+
+    fn entries(want: &[(u64, &str)]) -> Vec<(u64, String)> {
+        want.iter()
+            .map(|(at, entry)| (*at, (*entry).to_owned()))
+            .collect()
     }
 
     /// Parks forever, publishing its waker so another task can wake it.
@@ -368,7 +439,7 @@ mod tests {
         let log: Log = Log::default();
         let mut executor = Executor::new();
         for label in ["first", "second", "third"] {
-            WakeAt::spawn(&mut executor, label, &[], &log);
+            spawn_sleeper(&mut executor, label, &[], &log);
         }
 
         assert_eq!(executor.run(), Ok(()));
@@ -470,16 +541,11 @@ mod tests {
             let log: Log = Log::default();
             let mut executor = Executor::new();
             for (label, deadlines) in case.tasks {
-                WakeAt::spawn(&mut executor, label, deadlines, &log);
+                spawn_sleeper(&mut executor, label, deadlines, &log);
             }
 
             assert_eq!(executor.run(), Ok(()), "{}", case.name);
-            let want: Vec<(u64, String)> = case
-                .want
-                .iter()
-                .map(|(at, entry)| (*at, (*entry).to_owned()))
-                .collect();
-            assert_eq!(*log.borrow(), want, "{}", case.name);
+            assert_eq!(*log.borrow(), entries(case.want), "{}", case.name);
         }
     }
 
@@ -495,7 +561,7 @@ mod tests {
             handle: executor.handle(),
             parked: false,
         });
-        WakeAt::spawn(&mut executor, "finishes", &[], &log);
+        spawn_sleeper(&mut executor, "finishes", &[], &log);
         let third = executor.spawn(Park {
             label: "also parked",
             slot: WakerSlot::default(),
@@ -577,5 +643,116 @@ mod tests {
 
         assert_eq!(executor.run(), Ok(()));
         assert_eq!(*log.borrow(), [(0, "polled".to_owned())]);
+    }
+
+    #[test]
+    fn sleep_resolves_when_the_clock_reaches_the_deadline() {
+        struct Case {
+            name: &'static str,
+            tasks: &'static [(&'static str, &'static [u64])],
+            want: &'static [(u64, &'static str)],
+        }
+        let cases = [
+            Case {
+                name: "one task sleeping several times",
+                tasks: &[("a", &[10, 15, 75])],
+                want: &[
+                    (10, "a wake"),
+                    (25, "a wake"),
+                    (100, "a wake"),
+                    (100, "a done"),
+                ],
+            },
+            Case {
+                name: "two tasks with different naps interleave",
+                tasks: &[("a", &[10, 20]), ("b", &[20, 20])],
+                want: &[
+                    (10, "a wake"),
+                    (20, "b wake"),
+                    (30, "a wake"),
+                    (30, "a done"),
+                    (40, "b wake"),
+                    (40, "b done"),
+                ],
+            },
+            Case {
+                name: "equal naps wake in spawn order",
+                tasks: &[("a", &[10]), ("b", &[10])],
+                want: &[
+                    (10, "a wake"),
+                    (10, "a done"),
+                    (10, "b wake"),
+                    (10, "b done"),
+                ],
+            },
+            Case {
+                name: "a nap of no length",
+                tasks: &[("a", &[0])],
+                want: &[(0, "a wake"), (0, "a done")],
+            },
+        ];
+
+        for case in cases {
+            let log: Log = Log::default();
+            let mut executor = Executor::new();
+            for (label, naps) in case.tasks {
+                spawn_napper(&mut executor, label, naps, &log);
+            }
+
+            assert_eq!(executor.run(), Ok(()), "{}", case.name);
+            assert_eq!(*log.borrow(), entries(case.want), "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn sleep_until_an_instant_already_passed_completes_immediately() {
+        let log: Log = Log::default();
+        let mut executor = Executor::new();
+        spawn_sleeper(&mut executor, "a", &[100, 50], &log);
+
+        assert_eq!(executor.run(), Ok(()));
+        assert_eq!(
+            *log.borrow(),
+            entries(&[(100, "a wake"), (100, "a wake"), (100, "a done")])
+        );
+    }
+
+    #[test]
+    fn sleep_saturates_at_the_end_of_virtual_time() {
+        let log: Log = Log::default();
+        let mut executor = Executor::new();
+        let handle = executor.handle();
+        let task_log = Rc::clone(&log);
+        executor.spawn(async move {
+            handle.sleep(Duration::from_nanos(1)).await;
+            handle.sleep(Duration::MAX).await;
+            task_log
+                .borrow_mut()
+                .push((handle.now().as_nanos(), "woke at the end".to_owned()));
+        });
+
+        assert_eq!(executor.run(), Ok(()));
+        assert_eq!(*log.borrow(), entries(&[(u64::MAX, "woke at the end")]));
+    }
+
+    #[test]
+    fn spurious_wake_does_not_resolve_a_pending_sleep() {
+        let log: Log = Log::default();
+        let mut executor = Executor::new();
+        let handle = executor.handle();
+        let task_log = Rc::clone(&log);
+        executor.spawn(async move {
+            let waker = core::future::poll_fn(|cx| Poll::Ready(cx.waker().clone())).await;
+            let sleep = handle.sleep(Duration::from_nanos(50));
+            // Wake the task while the sleep is outstanding: it must be polled again and stay pending.
+            waker.wake();
+            sleep.await;
+            task_log
+                .borrow_mut()
+                .push((handle.now().as_nanos(), "slept".to_owned()));
+        });
+
+        assert_eq!(executor.run(), Ok(()));
+        assert_eq!(*log.borrow(), entries(&[(50, "slept")]));
     }
 }
