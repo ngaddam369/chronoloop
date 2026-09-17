@@ -407,6 +407,25 @@ mod tests {
         }
     }
 
+    /// Wraps a [`Sleep`], recording the instant of every poll it passes through.
+    ///
+    /// Boxing the inner future keeps the wrapper `Unpin` without a hand-written projection.
+    struct CountedSleep {
+        sleep: Pin<Box<Sleep>>,
+        handle: Handle,
+        polls: Rc<RefCell<Vec<u64>>>,
+    }
+
+    impl Future for CountedSleep {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let now = self.handle.now().as_nanos();
+            self.polls.borrow_mut().push(now);
+            self.sleep.as_mut().poll(cx)
+        }
+    }
+
     /// Waits until `at`, then wakes the parked tasks in the order it was given them.
     struct WakeOthers {
         handle: Handle,
@@ -754,5 +773,87 @@ mod tests {
 
         assert_eq!(executor.run(), Ok(()));
         assert_eq!(*log.borrow(), entries(&[(50, "slept")]));
+    }
+
+    #[test]
+    fn a_sleep_costs_the_same_polls_however_long_the_span() {
+        const HOUR: u64 = 3600 * 1_000_000_000;
+        struct Case {
+            name: &'static str,
+            deadline: u64,
+        }
+        // The spans differ by nineteen orders of magnitude; the cost must not notice.
+        let cases = [
+            Case {
+                name: "one nanosecond",
+                deadline: 1,
+            },
+            Case {
+                name: "one hour",
+                deadline: HOUR,
+            },
+            Case {
+                name: "one year",
+                deadline: 365 * 24 * HOUR,
+            },
+            Case {
+                name: "the end of virtual time",
+                deadline: u64::MAX,
+            },
+        ];
+
+        for case in cases {
+            let polls: Rc<RefCell<Vec<u64>>> = Rc::default();
+            let mut executor = Executor::new();
+            let handle = executor.handle();
+            let future = CountedSleep {
+                sleep: Box::pin(handle.sleep_until(t(case.deadline))),
+                handle,
+                polls: Rc::clone(&polls),
+            };
+            executor.spawn(future);
+
+            assert_eq!(executor.run(), Ok(()), "{}", case.name);
+            // Polled once at the start and once at the deadline: the clock got there in one move.
+            assert_eq!(*polls.borrow(), [0, case.deadline], "{}", case.name);
+            assert_eq!(
+                executor.handle().now().as_nanos(),
+                case.deadline,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn run_cost_tracks_event_count_not_elapsed_virtual_time() {
+        const HOUR: u64 = 3600 * 1_000_000_000;
+        const SLEEPS: u64 = 10_000;
+
+        let polls: Rc<RefCell<Vec<u64>>> = Rc::default();
+        let wakes: Rc<RefCell<Vec<u64>>> = Rc::default();
+        let mut executor = Executor::new();
+        let handle = executor.handle();
+        let task_polls = Rc::clone(&polls);
+        let task_wakes = Rc::clone(&wakes);
+        executor.spawn(async move {
+            for _ in 0..SLEEPS {
+                CountedSleep {
+                    sleep: Box::pin(handle.sleep(Duration::from_nanos(HOUR))),
+                    handle: handle.clone(),
+                    polls: Rc::clone(&task_polls),
+                }
+                .await;
+                task_wakes.borrow_mut().push(handle.now().as_nanos());
+            }
+        });
+
+        assert_eq!(executor.run(), Ok(()));
+
+        let want_wakes: Vec<u64> = (1..=SLEEPS).map(|nth| nth * HOUR).collect();
+        assert_eq!(*wakes.borrow(), want_wakes);
+        // Two polls per sleep — pending, then ready — and not one more for the year in between.
+        assert_eq!(polls.borrow().len(), 2 * want_wakes.len());
+        assert_eq!(executor.handle().now().as_nanos(), SLEEPS * HOUR);
     }
 }
