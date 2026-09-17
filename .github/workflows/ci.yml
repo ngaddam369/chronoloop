@@ -60,9 +60,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions-rust-lang/setup-rust-toolchain@v2
+      # Naming the targets keeps the benchmark out: it is a harness-free program, so selecting it
+      # would run the whole thing, unoptimised, on every push.
       - name: Test
-        run: cargo test --locked --all-targets
-      # --all-targets skips doctests, so they get their own invocation.
+        run: cargo test --locked --lib --bins --tests
+      # Selecting targets skips doctests, so they get their own invocation.
       - name: Doctests
         run: cargo test --locked --doc
 

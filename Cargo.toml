@@ -10,6 +10,14 @@ readme = "README.md"
 keywords = ["simulation", "deterministic", "testing", "distributed-systems", "replay"]
 categories = ["development-tools::testing", "simulation"]
 
+# `harness = false` means this target is a plain program, so anything that runs it runs the whole
+# benchmark. `test = false` keeps a bare `cargo test` away from it; `--all-targets` selects benches
+# explicitly and ignores that, which is why the test commands name their targets instead.
+[[bench]]
+name = "simulation"
+harness = false
+test = false
+
 [dependencies]
 # `default-features = false` drops os_rng, thread_rng and std_rng, so getrandom is never compiled
 # in and OS entropy cannot reach a simulation even by accident. The seed is the only entropy there is.

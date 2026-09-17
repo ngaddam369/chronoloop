@@ -14,9 +14,9 @@ fmt:
 lint:
 	cargo clippy --all-targets -- -D warnings
 
-## test: run all tests, including doctests
+## test: run all tests, including doctests (never the benches — those are `make bench`)
 test:
-	cargo test --all-targets
+	cargo test --lib --bins --tests
 	cargo test --doc
 
 ## bench: run the benchmark suite (no benches until Phase 2)
