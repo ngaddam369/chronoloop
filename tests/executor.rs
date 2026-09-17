@@ -6,20 +6,22 @@ use std::rc::Rc;
 use chronoloop::clock::VirtualTime;
 use chronoloop::executor::Executor;
 
+mod common;
+
+use common::{Journal, finish};
+
 const SECOND: u64 = 1_000_000_000;
 const HOUR: u64 = 3600 * SECOND;
 const ROUNDS: u32 = 3;
 
-type Log = Rc<RefCell<Vec<(u64, String)>>>;
-
-/// Runs the exchange and returns the log plus the instant the run ended at.
+/// Runs the exchange and returns the history plus the instant the run ended at.
 fn exchange() -> (Vec<(u64, String)>, u64) {
     let mut executor = Executor::new();
-    let log: Log = Log::default();
+    let journal = Journal::new();
     let mailbox: Rc<RefCell<Option<u32>>> = Rc::default();
 
     let sender = executor.handle();
-    let sender_log = Rc::clone(&log);
+    let sender_journal = journal.clone();
     let sender_mailbox = Rc::clone(&mailbox);
     executor.spawn(async move {
         for round in 0..ROUNDS {
@@ -27,14 +29,12 @@ fn exchange() -> (Vec<(u64, String)>, u64) {
                 .sleep_until(VirtualTime::from_nanos(u64::from(round) * HOUR + SECOND))
                 .await;
             *sender_mailbox.borrow_mut() = Some(round);
-            sender_log
-                .borrow_mut()
-                .push((sender.now().as_nanos(), format!("sent {round}")));
+            sender_journal.record(&sender, format!("sent {round}"));
         }
     });
 
     let receiver = executor.handle();
-    let receiver_log = Rc::clone(&log);
+    let receiver_journal = journal.clone();
     let receiver_mailbox = Rc::clone(&mailbox);
     executor.spawn(async move {
         for round in 0..ROUNDS {
@@ -47,18 +47,12 @@ fn exchange() -> (Vec<(u64, String)>, u64) {
                 Some(message) => format!("received {message}"),
                 None => "received nothing".to_owned(),
             };
-            receiver_log
-                .borrow_mut()
-                .push((receiver.now().as_nanos(), entry));
+            receiver_journal.record(&receiver, entry);
         }
     });
 
-    executor
-        .run()
-        .unwrap_or_else(|e| panic!("run did not finish: {e}"));
-    let ended_at = executor.handle().now().as_nanos();
-    let entries = log.borrow().clone();
-    (entries, ended_at)
+    let ended_at = finish(&mut executor);
+    (journal.entries(), ended_at)
 }
 
 #[test]
@@ -75,9 +69,4 @@ fn two_tasks_exchange_messages_over_hours_of_virtual_time() {
     ];
     assert_eq!(log, want);
     assert_eq!(ended_at, 2 * HOUR + 2 * SECOND);
-}
-
-#[test]
-fn the_same_run_replays_identically() {
-    assert_eq!(exchange(), exchange());
 }

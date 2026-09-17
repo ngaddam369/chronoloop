@@ -1,10 +1,17 @@
 //! A year of virtual time, traversed by two long-lived loops the way a real operator runs.
 
-use core::cell::RefCell;
+use core::cell::Cell;
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 use core::time::Duration;
 use std::rc::Rc;
 
-use chronoloop::executor::Executor;
+use chronoloop::executor::{Executor, Sleep};
+
+mod common;
+
+use common::{Journal, finish};
 
 const SECOND: u64 = 1_000_000_000;
 const HOUR: u64 = 3600 * SECOND;
@@ -12,91 +19,122 @@ const DAY: u64 = 24 * HOUR;
 const YEAR_DAYS: u64 = 365;
 const RENEWALS: u64 = YEAR_DAYS * 24;
 
-type Log = Rc<RefCell<Vec<(u64, String)>>>;
+/// A wait that counts the polls it passes through, so the cost of a run can be observed.
+struct CountedSleep {
+    sleep: Pin<Box<Sleep>>,
+    polls: Rc<Cell<u64>>,
+}
 
-/// Runs a lease renewer and a watchdog for a simulated year, returning the log and the final instant.
-fn run() -> (Vec<(u64, String)>, u64) {
+impl Future for CountedSleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.polls.set(self.polls.get() + 1);
+        self.sleep.as_mut().poll(cx)
+    }
+}
+
+/// What a year of the lease renewer and the watchdog came to.
+struct Year {
+    log: Vec<(u64, String)>,
+    ended_at: u64,
+    polls: u64,
+}
+
+/// Runs a lease renewer and a watchdog for a simulated year.
+fn run() -> Year {
     let mut executor = Executor::new();
-    let log: Log = Log::default();
+    let journal = Journal::new();
+    let polls: Rc<Cell<u64>> = Rc::default();
 
     let renewer = executor.handle();
-    let renewer_log = Rc::clone(&log);
+    let renewer_journal = journal.clone();
+    let renewer_polls = Rc::clone(&polls);
     executor.spawn(async move {
         for renewal in 1..=RENEWALS {
-            renewer.sleep(Duration::from_nanos(HOUR)).await;
-            renewer_log
-                .borrow_mut()
-                .push((renewer.now().as_nanos(), format!("renewed lease {renewal}")));
+            CountedSleep {
+                sleep: Box::pin(renewer.sleep(Duration::from_nanos(HOUR))),
+                polls: Rc::clone(&renewer_polls),
+            }
+            .await;
+            renewer_journal.record(&renewer, format!("renewed lease {renewal}"));
         }
     });
 
     let watchdog = executor.handle();
-    let watchdog_log = Rc::clone(&log);
+    let watchdog_journal = journal.clone();
+    let watchdog_polls = Rc::clone(&polls);
     executor.spawn(async move {
         for sweep in 1..=YEAR_DAYS {
-            watchdog.sleep(Duration::from_nanos(DAY)).await;
-            watchdog_log
-                .borrow_mut()
-                .push((watchdog.now().as_nanos(), format!("swept day {sweep}")));
+            CountedSleep {
+                sleep: Box::pin(watchdog.sleep(Duration::from_nanos(DAY))),
+                polls: Rc::clone(&watchdog_polls),
+            }
+            .await;
+            watchdog_journal.record(&watchdog, format!("swept day {sweep}"));
         }
     });
 
-    executor
-        .run()
-        .unwrap_or_else(|e| panic!("run did not finish: {e}"));
-    let ended_at = executor.handle().now().as_nanos();
-    let entries = log.borrow().clone();
-    (entries, ended_at)
+    let ended_at = finish(&mut executor);
+
+    Year {
+        log: journal.entries(),
+        ended_at,
+        polls: polls.get(),
+    }
+}
+
+/// The history the two schedules imply, worked out from the schedules rather than from the engine.
+///
+/// The renewer wakes on every hour and the watchdog at the end of every day. Where they share an
+/// instant the sweep comes first, because its timer for that midnight was armed twenty-three hours
+/// before the renewal's was.
+fn implied_history() -> Vec<(u64, String)> {
+    let mut want = Vec::new();
+    for hour in 1..=RENEWALS {
+        if hour % 24 == 0 {
+            want.push((hour * HOUR, format!("swept day {}", hour / 24)));
+        }
+        want.push((hour * HOUR, format!("renewed lease {hour}")));
+    }
+    want
 }
 
 #[test]
-fn a_year_of_virtual_time_costs_only_its_scheduled_events() {
-    let (log, ended_at) = run();
+fn a_year_writes_the_history_its_schedules_imply() {
+    let year = run();
 
-    // One entry per scheduled wake-up and not one more, however far apart the wake-ups are.
-    assert_eq!(log.len() as u64, RENEWALS + YEAR_DAYS);
-    assert_eq!(ended_at, YEAR_DAYS * DAY);
-
-    assert_eq!(
-        log.first(),
-        Some(&(HOUR, "renewed lease 1".to_owned())),
-        "the first entry is the first renewal"
-    );
-    assert_eq!(
-        log.last(),
-        Some(&(YEAR_DAYS * DAY, format!("renewed lease {RENEWALS}"))),
-        "the last entry is the final renewal"
-    );
+    assert_eq!(year.log, implied_history());
+    assert_eq!(year.ended_at, YEAR_DAYS * DAY);
 }
 
 #[test]
-fn entries_run_forwards_with_ties_broken_by_the_order_the_timers_were_armed() {
-    let (log, _) = run();
+fn a_year_of_virtual_time_costs_two_polls_per_scheduled_wake() {
+    let year = run();
 
-    for pair in log.windows(2) {
-        let [(earlier, before), (later, after)] = pair else {
-            unreachable!("windows(2) always yields pairs")
-        };
-        assert!(
-            earlier <= later,
-            "log went backwards from {before} at {earlier} to {after} at {later}"
+    // Pending once when the wait is armed, ready once when its instant arrives — and nothing for
+    // the hours, days or months in between. A wait that re-armed itself on every poll, or a timer
+    // that fired twice, would show up here and nowhere else: the history would be unchanged.
+    assert_eq!(year.polls, 2 * (RENEWALS + YEAR_DAYS));
+}
+
+#[test]
+fn ties_at_a_day_boundary_go_to_the_timer_that_was_armed_first() {
+    let year = run();
+
+    // The tie goes to whichever timer was armed first, not to whichever task was spawned first:
+    // the watchdog asked for midnight a whole day ahead, the renewer only at the twenty-third
+    // hour, so the sweep holds the lower sequence number — on every boundary, not just the first.
+    for day in [1, 2, 180, YEAR_DAYS] {
+        let at_midnight: Vec<&(u64, String)> =
+            year.log.iter().filter(|(at, _)| *at == day * DAY).collect();
+        assert_eq!(
+            at_midnight,
+            [
+                &(day * DAY, format!("swept day {day}")),
+                &(day * DAY, format!("renewed lease {}", day * 24)),
+            ],
+            "day {day}"
         );
     }
-
-    // Both loops are due at the end of the first day. The tie goes to whichever timer was armed
-    // first, not to whichever task was spawned first: the watchdog asked to be woken at instant 0,
-    // the renewer only at the twenty-third hour, so the sweep holds the lower sequence number.
-    let midnight: Vec<&(u64, String)> = log.iter().filter(|(at, _)| *at == DAY).collect();
-    assert_eq!(
-        midnight,
-        [
-            &(DAY, "swept day 1".to_owned()),
-            &(DAY, "renewed lease 24".to_owned()),
-        ]
-    );
-}
-
-#[test]
-fn a_year_of_virtual_time_replays_identically() {
-    assert_eq!(run(), run());
 }
