@@ -11,7 +11,10 @@ keywords = ["simulation", "deterministic", "testing", "distributed-systems", "re
 categories = ["development-tools::testing", "simulation"]
 
 [dependencies]
-# Deliberately empty. Dependencies arrive with the code that needs them, per phase.
+# `default-features = false` drops os_rng, thread_rng and std_rng, so getrandom is never compiled
+# in and OS entropy cannot reach a simulation even by accident. The seed is the only entropy there is.
+rand = { version = "0.9", default-features = false }
+rand_chacha = { version = "0.9", default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"
