@@ -8,10 +8,11 @@ use core::time::Duration;
 use std::rc::Rc;
 
 use chronoloop::executor::{Executor, Sleep};
+use chronoloop::history::{Entry, Recorder};
 
 mod common;
 
-use common::{Journal, finish};
+use common::{entry, finish};
 
 const SECOND: u64 = 1_000_000_000;
 const HOUR: u64 = 3600 * SECOND;
@@ -36,7 +37,7 @@ impl Future for CountedSleep {
 
 /// What a year of the lease renewer and the watchdog came to.
 struct Year {
-    log: Vec<(u64, String)>,
+    log: Vec<Entry>,
     ended_at: u64,
     polls: u64,
 }
@@ -44,11 +45,11 @@ struct Year {
 /// Runs a lease renewer and a watchdog for a simulated year.
 fn run() -> Year {
     let mut executor = Executor::new();
-    let journal = Journal::new();
+    let recorder = Recorder::new();
     let polls: Rc<Cell<u64>> = Rc::default();
 
     let renewer = executor.handle();
-    let renewer_journal = journal.clone();
+    let renewer_history = recorder.clone();
     let renewer_polls = Rc::clone(&polls);
     executor.spawn(async move {
         for renewal in 1..=RENEWALS {
@@ -57,12 +58,12 @@ fn run() -> Year {
                 polls: Rc::clone(&renewer_polls),
             }
             .await;
-            renewer_journal.record(&renewer, format!("renewed lease {renewal}"));
+            renewer_history.record(&renewer, format!("renewed lease {renewal}"));
         }
     });
 
     let watchdog = executor.handle();
-    let watchdog_journal = journal.clone();
+    let watchdog_history = recorder.clone();
     let watchdog_polls = Rc::clone(&polls);
     executor.spawn(async move {
         for sweep in 1..=YEAR_DAYS {
@@ -71,14 +72,14 @@ fn run() -> Year {
                 polls: Rc::clone(&watchdog_polls),
             }
             .await;
-            watchdog_journal.record(&watchdog, format!("swept day {sweep}"));
+            watchdog_history.record(&watchdog, format!("swept day {sweep}"));
         }
     });
 
     let ended_at = finish(&mut executor);
 
     Year {
-        log: journal.entries(),
+        log: recorder.entries(),
         ended_at,
         polls: polls.get(),
     }
@@ -89,13 +90,13 @@ fn run() -> Year {
 /// The renewer wakes on every hour and the watchdog at the end of every day. Where they share an
 /// instant the sweep comes first, because its timer for that midnight was armed twenty-three hours
 /// before the renewal's was.
-fn implied_history() -> Vec<(u64, String)> {
+fn implied_history() -> Vec<Entry> {
     let mut want = Vec::new();
     for hour in 1..=RENEWALS {
         if hour % 24 == 0 {
-            want.push((hour * HOUR, format!("swept day {}", hour / 24)));
+            want.push(entry(hour * HOUR, format!("swept day {}", hour / 24)));
         }
-        want.push((hour * HOUR, format!("renewed lease {hour}")));
+        want.push(entry(hour * HOUR, format!("renewed lease {hour}")));
     }
     want
 }
@@ -128,13 +129,16 @@ fn ties_at_a_day_boundary_go_to_the_timer_that_was_armed_first() {
     // the watchdog asked for midnight a whole day ahead, the renewer only at the twenty-third
     // hour, so the sweep holds the lower sequence number — on every boundary, not just the first.
     for day in [1, 2, 180, YEAR_DAYS] {
-        let at_midnight: Vec<&(u64, String)> =
-            year.log.iter().filter(|(at, _)| *at == day * DAY).collect();
+        let at_midnight: Vec<&Entry> = year
+            .log
+            .iter()
+            .filter(|recorded| recorded.at.as_nanos() == day * DAY)
+            .collect();
         assert_eq!(
             at_midnight,
             [
-                &(day * DAY, format!("swept day {day}")),
-                &(day * DAY, format!("renewed lease {}", day * 24)),
+                &entry(day * DAY, format!("swept day {day}")),
+                &entry(day * DAY, format!("renewed lease {}", day * 24)),
             ],
             "day {day}"
         );

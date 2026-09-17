@@ -5,22 +5,21 @@ use core::time::Duration;
 use std::rc::Rc;
 
 use chronoloop::executor::Executor;
+use chronoloop::history::{Entry, Recorder};
 use chronoloop::rng::SeededRng;
 
 const LABELS: [&str; 3] = ["alpha", "beta", "gamma"];
 const STEPS: u32 = 3;
 
-type Log = Rc<RefCell<Vec<(u64, String)>>>;
-
 /// Runs three tasks whose delays all come from one generator, and returns what they logged.
-fn run(seed: u64) -> Vec<(u64, String)> {
+fn run(seed: u64) -> Vec<Entry> {
     let mut executor = Executor::new();
-    let log: Log = Log::default();
+    let recorder = Recorder::new();
     let rng = Rc::new(RefCell::new(SeededRng::from_seed(seed)));
 
     for label in LABELS {
         let handle = executor.handle();
-        let task_log = Rc::clone(&log);
+        let history = recorder.clone();
         let task_rng = Rc::clone(&rng);
         executor.spawn(async move {
             for step in 0..STEPS {
@@ -28,9 +27,7 @@ fn run(seed: u64) -> Vec<(u64, String)> {
                     .borrow_mut()
                     .duration_in(Duration::from_millis(1)..=Duration::from_millis(100));
                 handle.sleep(delay).await;
-                task_log
-                    .borrow_mut()
-                    .push((handle.now().as_nanos(), format!("{label} step {step}")));
+                history.record(&handle, format!("{label} step {step}"));
             }
         });
     }
@@ -38,12 +35,19 @@ fn run(seed: u64) -> Vec<(u64, String)> {
     executor
         .run()
         .unwrap_or_else(|e| panic!("run did not finish: {e}"));
-    log.borrow().clone()
+    recorder.entries()
 }
 
-fn labels_in_order(log: &[(u64, String)]) -> Vec<String> {
+fn labels_in_order(log: &[Entry]) -> Vec<String> {
     log.iter()
-        .map(|(_, entry)| entry.split(' ').next().unwrap_or_default().to_owned())
+        .map(|entry| {
+            entry
+                .message
+                .split(' ')
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        })
         .collect()
 }
 
@@ -72,7 +76,7 @@ fn randomised_delays_reorder_the_tasks() {
         "random delays must interleave the tasks, not leave them in spawn order"
     );
 
-    let times: Vec<u64> = log.iter().map(|(at, _)| *at).collect();
+    let times: Vec<u64> = log.iter().map(|entry| entry.at.as_nanos()).collect();
     assert!(
         times.windows(2).all(|pair| pair[0] <= pair[1]),
         "virtual time must never go backwards: {times:?}"

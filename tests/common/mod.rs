@@ -1,32 +1,12 @@
-//! What every integration test needs: somewhere to write a history, and a way to finish a run.
+//! What every integration test needs: a way to finish a run, and a way to spell what it recorded.
 
-use core::cell::RefCell;
-use std::rc::Rc;
+use chronoloop::clock::VirtualTime;
+use chronoloop::executor::Executor;
+use chronoloop::history::Entry;
 
-use chronoloop::executor::{Executor, Handle};
-
-/// The history a run wrote, each entry stamped with the virtual instant it happened at.
-///
-/// Cloning shares one journal rather than copying it, so every task in a run can hold one and the
-/// entries all land in the same place, in the order the run produced them.
-#[derive(Clone)]
-pub struct Journal(Rc<RefCell<Vec<(u64, String)>>>);
-
-impl Journal {
-    /// Creates an empty journal.
-    pub fn new() -> Self {
-        Self(Rc::new(RefCell::new(Vec::new())))
-    }
-
-    /// Records `entry` at the instant `handle` has reached.
-    pub fn record(&self, handle: &Handle, entry: String) {
-        self.0.borrow_mut().push((handle.now().as_nanos(), entry));
-    }
-
-    /// Returns everything recorded so far, in order.
-    pub fn entries(&self) -> Vec<(u64, String)> {
-        self.0.borrow().clone()
-    }
+/// An entry of a history, in the shorthand these tests write their expectations in.
+pub fn entry(at: u64, message: impl Into<String>) -> Entry {
+    Entry::new(VirtualTime::from_nanos(at), message)
 }
 
 /// Runs `executor` to completion and returns the instant the run ended at.

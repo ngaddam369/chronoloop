@@ -19,6 +19,17 @@ harness = false
 test = false
 
 [dependencies]
+# `default-features = false` keeps out the colour machinery (anstream, anstyle-*) and the
+# did-you-mean suggestions (strsim), neither of which a two-subcommand CLI needs. The features left
+# are the ones that make a mistyped invocation say so: argument parsing, help, usage and context.
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }
+
 # `default-features = false` drops os_rng, thread_rng and std_rng, so getrandom is never compiled
 # in and OS entropy cannot reach a simulation even by accident. The seed is the only entropy there is.
 rand = { version = "0.9", default-features = false }

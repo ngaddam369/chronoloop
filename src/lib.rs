@@ -37,9 +37,24 @@
 //!
 //! # Status
 //!
-//! Scaffold only. The deterministic core is built in phases from here.
+//! What works today is the deterministic core and one system running on it. A run is driven by a
+//! [`VirtualClock`] over a [`EventQueue`], polled by a single-threaded [`Executor`], with every
+//! random choice drawn from a [`SeededRng`]; [`pingpong`] is a two-task exchange over that clock,
+//! and its [`Recording`] can be written to a file and replayed against a later run of the engine.
+//!
+//! The content-addressed state history, the fault schedules, and the shrinking built on top of them
+//! are not here yet.
+//!
+//! [`VirtualClock`]: clock::VirtualClock
+//! [`EventQueue`]: event::EventQueue
+//! [`Executor`]: executor::Executor
+//! [`SeededRng`]: rng::SeededRng
+//! [`pingpong`]: systems::pingpong
+//! [`Recording`]: history::Recording
 
 pub mod clock;
 pub mod event;
 pub mod executor;
+pub mod history;
 pub mod rng;
+pub mod systems;
