@@ -88,6 +88,8 @@ fn different_seeds_write_different_histories() {
 fn a_recorded_history_replays_unchanged() {
     // Recorded from an actual run of RECORDED_SEED. Unlike the two tests above, this one survives
     // the process it was written in: it fails if the engine ever schedules this fleet differently.
+    // These instants also depend on the draws behind the intervals, which are pinned beside the
+    // generator itself — so a change there fails there first, and a failure here means the engine.
     let want: Vec<(u64, String)> = [
         (17_406_116_577, "controller 3 reconciled 1"),
         (40_347_322_415, "controller 1 reconciled 1"),

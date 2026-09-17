@@ -158,6 +158,18 @@ mod tests {
     }
 
     #[test]
+    fn recorded_bounded_draws_do_not_change() {
+        // Bounded draws go through the sampling the underlying crate provides rather than through
+        // the stream above, so the stream holding still is not enough to keep them the same. A
+        // recorded history whose intervals were drawn this way is only replayable while this holds,
+        // which is why it is pinned here, beside the draw, rather than left to fail somewhere that
+        // would blame the engine for a dependency's change.
+        let mut rng = SeededRng::from_seed(42);
+        let bounded: Vec<u64> = (0..8).map(|_| rng.range(1..=60)).collect();
+        assert_eq!(bounded, vec![41, 58, 26, 38, 18, 9, 19, 49]);
+    }
+
+    #[test]
     fn range_stays_within_its_bounds() {
         struct Case {
             name: &'static str,

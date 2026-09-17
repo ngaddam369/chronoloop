@@ -113,8 +113,10 @@ fn a_year_of_virtual_time_costs_two_polls_per_scheduled_wake() {
     let year = run();
 
     // Pending once when the wait is armed, ready once when its instant arrives — and nothing for
-    // the hours, days or months in between. A wait that re-armed itself on every poll, or a timer
-    // that fired twice, would show up here and nowhere else: the history would be unchanged.
+    // the hours, days or months in between. A timer that fired twice, or any other wake-up nothing
+    // in the run asked for, would show up here and nowhere else: the history would be unchanged.
+    // Re-arming is a different matter and is not visible from here — it moves queue traffic around
+    // without adding a poll, so it is caught where the queue itself is under test.
     assert_eq!(year.polls, 2 * (RENEWALS + YEAR_DAYS));
 }
 
