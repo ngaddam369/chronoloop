@@ -46,8 +46,10 @@
 //! for: written against [`Clock`], [`Rng`] and [`Network`], it can wait, arm a deadline, draw a
 //! delay and talk to another node, and it has no way to get at the machine's clock, its entropy or
 //! a socket. What its messages go through is a [`VirtualNetwork`], where latency, loss, duplication
-//! and partitions all come from the same seed as everything else. The content-addressed state
-//! history, the fault schedules, and the shrinking built on top of them are not here yet.
+//! and partitions all come from the same seed as everything else. A running task can start another
+//! and wait for what it produces, with identifiers handed out in spawn order rather than taken from
+//! an address. The content-addressed state history, the fault schedules, and the shrinking built on
+//! top of them are not here yet.
 //!
 //! [`VirtualClock`]: clock::VirtualClock
 //! [`EventQueue`]: event::EventQueue

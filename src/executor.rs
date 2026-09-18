@@ -23,23 +23,93 @@ impl fmt::Display for TaskId {
     }
 }
 
-/// The clock and the event queue, shared between the executor and every [`Handle`].
+/// The clock, the event queue and the tasks waiting to be taken on, shared between the executor and
+/// every [`Handle`].
 ///
 /// Borrows of this cell are always short-lived and are never held across a poll of a future, so a
 /// conflicting borrow cannot arise.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Shared {
     clock: VirtualClock,
     queue: EventQueue<Waker>,
+    /// Tasks spawned but not yet taken on by the loop, in the order they were spawned.
+    spawned: Vec<(TaskId, Task)>,
+    next_id: u64,
+}
+
+impl fmt::Debug for Shared {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Shared")
+            .field("clock", &self.clock)
+            .field("queue", &self.queue)
+            .field("spawned", &self.spawned.len())
+            .field("next_id", &self.next_id)
+            .finish()
+    }
 }
 
 /// A future's view of the simulation it is running inside.
 #[derive(Clone)]
 pub struct Handle {
     shared: Rc<RefCell<Shared>>,
+    ready: Arc<ReadyQueue>,
 }
 
 impl Handle {
+    /// Spawns `future` as a task of the simulation this handle belongs to.
+    ///
+    /// A task spawned while the simulation is running is taken on before the next task is polled,
+    /// so it gets its first poll in the same pass rather than waiting for the clock to move. Its
+    /// identifier is the next one the counter has, whoever asked for it and whenever they asked.
+    ///
+    /// Dropping the returned handle detaches the task: it says only that nobody is waiting for the
+    /// answer, and the work still happens.
+    ///
+    /// # Panics
+    ///
+    /// Panics after `u64::MAX` spawns, which cannot happen in practice.
+    pub fn spawn<T: 'static>(&self, future: impl Future<Output = T> + 'static) -> JoinHandle<T> {
+        let join = Rc::new(RefCell::new(Join::default()));
+        let finishing = Rc::clone(&join);
+        let finishes = async move {
+            let output = future.await;
+            // The borrow ends with the statement, so the waking happens outside it. Waking marks
+            // the joiner ready rather than polling it, so this task finishes first.
+            let waiting = {
+                let mut join = finishing.borrow_mut();
+                join.output = Some(output);
+                join.finished = true;
+                join.waiting.take()
+            };
+            if let Some(waker) = waiting {
+                waker.wake();
+            }
+        };
+
+        let mut shared = self.shared.borrow_mut();
+        let id = TaskId(shared.next_id);
+        // Unreachable: a simulation cannot spawn u64::MAX tasks.
+        shared.next_id = shared
+            .next_id
+            .checked_add(1)
+            .expect("task identifiers exhausted after u64::MAX spawns");
+        let waker = Waker::from(Arc::new(TaskWaker {
+            id,
+            ready: Arc::clone(&self.ready),
+        }));
+        shared.spawned.push((
+            id,
+            Task {
+                future: Box::pin(finishes),
+                waker,
+            },
+        ));
+        drop(shared);
+
+        self.ready.mark(id);
+        JoinHandle { id, join }
+    }
+
     /// Schedules `waker` to be woken once the simulation reaches the instant `at`.
     ///
     /// Returns the identifier that [`Handle::cancel_wake`] takes to call the wake-up off again.
@@ -188,6 +258,101 @@ struct Task {
     waker: Waker,
 }
 
+/// What a spawned task leaves behind for whoever joins it.
+#[derive(Debug)]
+struct Join<T> {
+    /// What the task produced, from the moment it finished until the joiner takes it.
+    output: Option<T>,
+    /// Whether the task has finished, which stays true after the output has been taken.
+    finished: bool,
+    /// The waker of whoever is waiting, if anyone is.
+    waiting: Option<Waker>,
+}
+
+impl<T> Default for Join<T> {
+    fn default() -> Self {
+        Self {
+            output: None,
+            finished: false,
+            waiting: None,
+        }
+    }
+}
+
+/// A wait for a spawned task to finish, returned by [`Handle::spawn`] and [`Executor::spawn`].
+///
+/// Awaiting it gives back whatever the task produced. Dropping it instead detaches the task, which
+/// runs on exactly as it would have: a handle nobody holds means nobody is waiting for the answer,
+/// not that the answer is no longer wanted. Either way the wait takes back the waker it registered,
+/// so an abandoned join cannot mark a task ready for something nothing is waiting for.
+///
+/// One waker is enough here, which it was not for a mailbox: a handle cannot be cloned, so there is
+/// exactly one joiner and it is the one the finishing task wakes.
+pub struct JoinHandle<T> {
+    id: TaskId,
+    join: Rc<RefCell<Join<T>>>,
+}
+
+impl<T> JoinHandle<T> {
+    /// Returns the identifier of the task being waited on.
+    pub fn id(&self) -> TaskId {
+        self.id
+    }
+}
+
+impl<T> Drop for JoinHandle<T> {
+    fn drop(&mut self) {
+        // The borrow ends with the statement, so the waker is dropped outside it.
+        let registered = self.join.borrow_mut().waiting.take();
+        drop(registered);
+    }
+}
+
+impl<T> fmt::Debug for JoinHandle<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JoinHandle")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> Future for JoinHandle<T> {
+    type Output = T;
+
+    /// # Panics
+    ///
+    /// Panics if polled again after it has already given back the task's output, which a future
+    /// must never be.
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        let this = self.get_mut();
+        // One borrow, ending with the statement.
+        let taken = {
+            let mut join = this.join.borrow_mut();
+            let taken = join.output.take();
+            if taken.is_none() {
+                assert!(
+                    !join.finished,
+                    "a join was polled again after it gave back its task's output"
+                );
+                // Register only when the waker held would not wake whoever is polling now, so
+                // being polled twice before the task finishes leaves one waker rather than two.
+                if !join
+                    .waiting
+                    .as_ref()
+                    .is_some_and(|waker| waker.will_wake(cx.waker()))
+                {
+                    join.waiting = Some(cx.waker().clone());
+                }
+            }
+            taken
+        };
+        match taken {
+            Some(output) => Poll::Ready(output),
+            None => Poll::Pending,
+        }
+    }
+}
+
 /// Errors that end a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -242,7 +407,6 @@ pub struct Executor {
     shared: Rc<RefCell<Shared>>,
     tasks: BTreeMap<TaskId, Task>,
     ready: Arc<ReadyQueue>,
-    next_id: u64,
 }
 
 impl fmt::Debug for Executor {
@@ -260,38 +424,26 @@ impl Executor {
         Self::default()
     }
 
-    /// Returns a handle to this executor's clock and event queue.
+    /// Returns a handle to this executor's clock, event queue and spawning.
     pub fn handle(&self) -> Handle {
         Handle {
             shared: Rc::clone(&self.shared),
+            ready: Arc::clone(&self.ready),
         }
     }
 
-    /// Spawns `future` as a task and returns its identifier.
+    /// Spawns `future` as a task, returning the wait for what it produces.
+    ///
+    /// The same spawning a running task does through [`Handle::spawn`], from outside the run.
     ///
     /// # Panics
     ///
     /// Panics after `u64::MAX` spawns, which cannot happen in practice.
-    pub fn spawn(&mut self, future: impl Future<Output = ()> + 'static) -> TaskId {
-        let id = TaskId(self.next_id);
-        // Unreachable: a simulation cannot spawn u64::MAX tasks.
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .expect("task identifiers exhausted after u64::MAX spawns");
-        let waker = Waker::from(Arc::new(TaskWaker {
-            id,
-            ready: Arc::clone(&self.ready),
-        }));
-        self.tasks.insert(
-            id,
-            Task {
-                future: Box::pin(future),
-                waker,
-            },
-        );
-        self.ready.mark(id);
-        id
+    pub fn spawn<T: 'static>(
+        &mut self,
+        future: impl Future<Output = T> + 'static,
+    ) -> JoinHandle<T> {
+        self.handle().spawn(future)
     }
 
     /// Runs until every task has finished, and stops the clock where the last one left it.
@@ -322,9 +474,26 @@ impl Executor {
         }
     }
 
-    /// Polls ready tasks until none is left, including tasks woken during this pass.
+    /// Takes on every task spawned since this was last called.
+    ///
+    /// Spawning only files a task; the loop is what adopts it. Doing that here, rather than once
+    /// between passes, is what lets a task spawned during a poll run in the same pass as its
+    /// parent — and what keeps it from being mistaken below for a task that has already finished.
+    fn adopt_spawned(&mut self) {
+        // The borrow ends with the statement, so nothing is held while the tasks are moved over.
+        let spawned = core::mem::take(&mut self.shared.borrow_mut().spawned);
+        for (id, task) in spawned {
+            self.tasks.insert(id, task);
+        }
+    }
+
+    /// Polls ready tasks until none is left, including tasks woken or spawned during this pass.
     fn poll_ready(&mut self) {
-        while let Some(id) = self.ready.take_lowest() {
+        loop {
+            self.adopt_spawned();
+            let Some(id) = self.ready.take_lowest() else {
+                return;
+            };
             // A task that has already finished may still have live wakers.
             let Some(task) = self.tasks.get_mut(&id) else {
                 continue;
@@ -621,21 +790,25 @@ mod tests {
         let log: Log = Log::default();
         let mut executor = Executor::new();
 
-        let first = executor.spawn(Park {
-            label: "parked",
-            slot: WakerSlot::default(),
-            log: Rc::clone(&log),
-            handle: executor.handle(),
-            parked: false,
-        });
+        let first = executor
+            .spawn(Park {
+                label: "parked",
+                slot: WakerSlot::default(),
+                log: Rc::clone(&log),
+                handle: executor.handle(),
+                parked: false,
+            })
+            .id();
         spawn_sleeper(&mut executor, "finishes", &[], &log);
-        let third = executor.spawn(Park {
-            label: "also parked",
-            slot: WakerSlot::default(),
-            log: Rc::clone(&log),
-            handle: executor.handle(),
-            parked: false,
-        });
+        let third = executor
+            .spawn(Park {
+                label: "also parked",
+                slot: WakerSlot::default(),
+                log: Rc::clone(&log),
+                handle: executor.handle(),
+                parked: false,
+            })
+            .id();
 
         assert_eq!(
             executor.run(),
@@ -980,5 +1153,254 @@ mod tests {
         // Two polls per sleep — pending, then ready — and not one more for the year in between.
         assert_eq!(polls.borrow().len(), 2 * want_wakes.len());
         assert_eq!(executor.handle().now().as_nanos(), SLEEPS * HOUR);
+    }
+
+    #[test]
+    fn task_ids_are_handed_out_in_spawn_order_including_from_inside_a_run() {
+        let log: Log = Log::default();
+        let mut executor = Executor::new();
+        let handle = executor.handle();
+        let task_log = Rc::clone(&log);
+
+        let first = executor.spawn(async move {
+            // Spawned while the run is under way. Its identifier is the next one the counter has,
+            // never one that depends on where its future happens to sit in memory.
+            let child = handle.spawn(async {});
+            task_log
+                .borrow_mut()
+                .push((0, format!("child is {}", child.id())));
+            child.await;
+        });
+        let second = executor.spawn(async {});
+
+        assert_eq!(executor.run(), Ok(()));
+        assert_eq!((first.id(), second.id()), (TaskId(0), TaskId(1)));
+        assert_eq!(*log.borrow(), entries(&[(0, "child is task 2")]));
+    }
+
+    #[test]
+    fn a_task_spawned_during_a_run_is_polled_in_the_same_pass() {
+        // The loop takes on what has been spawned before it polls the next task, so a child runs
+        // out its first poll beside its parent rather than waiting for the clock to move. A loop
+        // that only took on new tasks between passes would leave the child sitting until something
+        // else woke the run — and one that never took them on at all would drop it silently.
+        let log: Log = Log::default();
+        let mut executor = Executor::new();
+        let handle = executor.handle();
+        let task_log = Rc::clone(&log);
+
+        executor.spawn(async move {
+            let child_log = Rc::clone(&task_log);
+            let child_clock = handle.clone();
+            handle.spawn(async move {
+                child_log
+                    .borrow_mut()
+                    .push((child_clock.now().as_nanos(), "child ran".to_owned()));
+            });
+            task_log
+                .borrow_mut()
+                .push((handle.now().as_nanos(), "parent spawned".to_owned()));
+            handle.sleep(Duration::from_nanos(10)).await;
+            task_log
+                .borrow_mut()
+                .push((handle.now().as_nanos(), "parent woke".to_owned()));
+        });
+
+        assert_eq!(executor.run(), Ok(()));
+        assert_eq!(
+            *log.borrow(),
+            entries(&[(0, "parent spawned"), (0, "child ran"), (10, "parent woke")])
+        );
+    }
+
+    #[test]
+    fn joining_a_task_yields_what_it_produced() {
+        struct Case {
+            name: &'static str,
+            wait: u64,
+        }
+        let cases = [
+            Case {
+                name: "a task that finishes at once",
+                wait: 0,
+            },
+            Case {
+                name: "a task that finishes after a wait",
+                wait: HOUR,
+            },
+        ];
+
+        for case in cases {
+            let mut executor = Executor::new();
+            let handle = executor.handle();
+            let outcome: Rc<RefCell<Option<u64>>> = Rc::default();
+            let slot = Rc::clone(&outcome);
+
+            let worker_clock = handle.clone();
+            let worker = executor.spawn(async move {
+                worker_clock.sleep(Duration::from_nanos(case.wait)).await;
+                worker_clock.now().as_nanos()
+            });
+            executor.spawn(async move {
+                *slot.borrow_mut() = Some(worker.await);
+            });
+
+            assert_eq!(executor.run(), Ok(()), "{}", case.name);
+            assert_eq!(*outcome.borrow(), Some(case.wait), "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn a_join_lands_at_the_instant_its_task_finished() {
+        // The quicker task was spawned second and is waited on first, and its join lands when it
+        // finishes rather than when the other one does.
+        let log: Log = Log::default();
+        let mut executor = Executor::new();
+        let handle = executor.handle();
+        let task_log = Rc::clone(&log);
+
+        let slow_clock = handle.clone();
+        let slow = executor.spawn(async move {
+            slow_clock.sleep(Duration::from_nanos(2 * HOUR)).await;
+            "slow"
+        });
+        let quick_clock = handle.clone();
+        let quick = executor.spawn(async move {
+            quick_clock.sleep(Duration::from_nanos(HOUR)).await;
+            "quick"
+        });
+
+        executor.spawn(async move {
+            for worker in [quick, slow] {
+                let who = worker.await;
+                task_log
+                    .borrow_mut()
+                    .push((handle.now().as_nanos(), format!("{who} joined")));
+            }
+        });
+
+        assert_eq!(executor.run(), Ok(()));
+        assert_eq!(
+            *log.borrow(),
+            entries(&[(HOUR, "quick joined"), (2 * HOUR, "slow joined")])
+        );
+    }
+
+    #[test]
+    fn joining_a_task_that_has_already_finished_completes_at_once() {
+        // Waiting on the slow one first means the quick one is long done by the time it is asked
+        // about. Its join completes on the first poll, at the instant the wait before it ended.
+        let log: Log = Log::default();
+        let mut executor = Executor::new();
+        let handle = executor.handle();
+        let task_log = Rc::clone(&log);
+
+        let slow_clock = handle.clone();
+        let slow = executor.spawn(async move {
+            slow_clock.sleep(Duration::from_nanos(2 * HOUR)).await;
+            "slow"
+        });
+        let quick_clock = handle.clone();
+        let quick = executor.spawn(async move {
+            quick_clock.sleep(Duration::from_nanos(HOUR)).await;
+            "quick"
+        });
+
+        executor.spawn(async move {
+            for worker in [slow, quick] {
+                let who = worker.await;
+                task_log
+                    .borrow_mut()
+                    .push((handle.now().as_nanos(), format!("{who} joined")));
+            }
+        });
+
+        assert_eq!(executor.run(), Ok(()));
+        assert_eq!(
+            *log.borrow(),
+            entries(&[(2 * HOUR, "slow joined"), (2 * HOUR, "quick joined")])
+        );
+        // Nothing was left to wait for after the second join, so the run ends where the first did.
+        assert_eq!(executor.handle().now().as_nanos(), 2 * HOUR);
+    }
+
+    #[test]
+    fn a_dropped_join_handle_leaves_its_task_running() {
+        // Walking away from the handle says only that nobody is waiting. The work still happens.
+        let log: Log = Log::default();
+        let mut executor = Executor::new();
+        let handle = executor.handle();
+        let task_log = Rc::clone(&log);
+
+        let worker = executor.spawn(async move {
+            handle.sleep(Duration::from_nanos(HOUR)).await;
+            task_log
+                .borrow_mut()
+                .push((handle.now().as_nanos(), "worked anyway".to_owned()));
+        });
+        drop(worker);
+
+        assert_eq!(executor.run(), Ok(()));
+        assert_eq!(*log.borrow(), entries(&[(HOUR, "worked anyway")]));
+        assert_eq!(executor.handle().now().as_nanos(), HOUR);
+    }
+
+    #[test]
+    fn a_join_abandoned_before_its_task_finished_wakes_nobody() {
+        // The same rule as an abandoned timer, in the joiner's terms: a waker left behind in the
+        // task being waited on would mark a task ready for an answer nothing is waiting for. The
+        // polls of the wait that follows are where that shows up.
+        let polls: Rc<RefCell<Vec<u64>>> = Rc::default();
+        let mut executor = Executor::new();
+        let handle = executor.handle();
+        let task_polls = Rc::clone(&polls);
+
+        let worker_clock = handle.clone();
+        let worker = executor.spawn(async move {
+            worker_clock.sleep(Duration::from_nanos(HOUR)).await;
+        });
+        executor.spawn(async move {
+            let mut joining = Box::pin(worker);
+            let armed = core::future::poll_fn(|cx| Poll::Ready(joining.as_mut().poll(cx))).await;
+            assert!(armed.is_pending(), "the task has not finished yet");
+            drop(joining);
+
+            CountedSleep {
+                sleep: Box::pin(handle.sleep_until(t(2 * HOUR))),
+                handle: handle.clone(),
+                polls: task_polls,
+            }
+            .await;
+        });
+
+        assert_eq!(executor.run(), Ok(()));
+        // A waker left behind would wake this task when the worker finished, and the wait it is
+        // sitting in would be polled a third time, at the hour mark.
+        assert_eq!(*polls.borrow(), [0, 2 * HOUR]);
+    }
+
+    #[test]
+    fn a_join_on_a_task_that_never_finishes_stalls_naming_both() {
+        let log: Log = Log::default();
+        let mut executor = Executor::new();
+
+        let parked = executor.spawn(Park {
+            label: "parked",
+            slot: WakerSlot::default(),
+            log: Rc::clone(&log),
+            handle: executor.handle(),
+            parked: false,
+        });
+        let waited_on = parked.id();
+        let joiner = executor.spawn(async move {
+            parked.await;
+        });
+
+        assert_eq!(
+            executor.run(),
+            Err(ExecutorError::Stalled {
+                pending: vec![waited_on, joiner.id()],
+            })
+        );
     }
 }
