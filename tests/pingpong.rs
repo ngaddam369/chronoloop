@@ -72,13 +72,17 @@ fn different_seeds_write_different_histories() {
         },
     ];
 
-    // Without this, a change that quietly stopped the seed reaching behaviour at all — the delays
+    // Compared on the entries rather than the written form: a recording's first line names its own
+    // seed, so two seeds differ in their text however little their runs differed — an assertion
+    // against `to_string` here would hold even with the engine cut off from the seed entirely.
+    //
+    // Without this case, a change that quietly stopped the seed reaching behaviour — the delays
     // replaced by constants, a generator built from a fixed value — would leave every other case
     // in this file passing.
     for case in cases {
         assert_ne!(
-            history(case.left).to_string(),
-            history(case.right).to_string(),
+            history(case.left).entries(),
+            history(case.right).entries(),
             "{}",
             case.name
         );

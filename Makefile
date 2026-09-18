@@ -19,7 +19,7 @@ test:
 	cargo test --lib --bins --tests
 	cargo test --doc
 
-## bench: run the benchmark suite (no benches until Phase 2)
+## bench: run the benchmark suite (it reports; it never asserts, and it never runs in CI)
 bench:
 	cargo bench
 
@@ -36,10 +36,14 @@ audit:
 ## verify: run the full checklist (fmt → build → lint → test → audit)
 verify: fmt build lint test audit
 
-## local-validation: drive the built binary through the checks CI does not run
-## These are ignored by `make test` on purpose — see tests/local_validation.rs for what belongs here
+## local-validation: the gated pass — every #[ignore]d test, in both profiles
+## The gate is the attribute rather than the file: anything #[ignore]d is skipped by `make test` and
+## by CI, and run here instead, so a check can live beside the thing it is about. The release pass is
+## what turns "identical in debug and in release" into something checked rather than claimed.
+## Targets are named, as everywhere else, so that a bench is never selected.
 local-validation:
-	cargo test --test local_validation -- --ignored
+	cargo test --lib --bins --tests -- --include-ignored
+	cargo test --lib --bins --tests --release -- --include-ignored
 
 ## clean: remove build artifacts
 clean:

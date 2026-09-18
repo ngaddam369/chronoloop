@@ -5,9 +5,13 @@
 //! they are gated behind `#[ignore]` and run by `make local-validation` rather than by CI. They
 //! still compile under an ordinary `cargo test`, which is what keeps them from quietly rotting.
 //!
-//! What belongs here is anything CI cannot be relied on to reproduce, or anything too slow to run on
-//! every push. What does not belong here is the command line's own behaviour with a file it can read
-//! and write — `tests/cli.rs` covers that, and covering it twice would mean two places to update.
+//! What belongs *here* is the world around the binary: real processes, real pipes, real files. What
+//! does not belong here is the command line's own behaviour with a file it can read and write —
+//! `tests/cli.rs` covers that, and covering it twice would mean two places to update.
+//!
+//! Anything else too slow for CI does not have to move into this file. `make local-validation` gates
+//! on the `#[ignore]` attribute rather than on this filename, so a check can sit beside the thing it
+//! is about — the seed sweep in `tests/determinism.rs` is the first one that does.
 
 use std::fs;
 use std::io;
