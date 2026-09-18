@@ -26,7 +26,7 @@ struct Cli {
 }
 
 /// The things chronoloop can be asked to do.
-#[derive(Debug, PartialEq, Eq, Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Run a simulation and write the history it produced.
     Run {
@@ -42,7 +42,7 @@ enum Command {
 }
 
 /// The first place a replayed history stopped matching the one recorded.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum Divergence {
     /// An entry differs from the one recorded in its place.
     Entry {
@@ -224,38 +224,35 @@ mod tests {
         struct Case {
             name: &'static str,
             argv: &'static [&'static str],
-            want: Command,
+            /// What the parsed command carries, as it describes itself.
+            want: &'static str,
         }
         let cases = [
             Case {
                 name: "a run of the smallest seed",
                 argv: &["chronoloop", "run", "--seed", "0"],
-                want: Command::Run { seed: 0 },
+                want: "Run { seed: 0 }",
             },
             Case {
                 name: "a run of the largest seed",
                 argv: &["chronoloop", "run", "--seed", "18446744073709551615"],
-                want: Command::Run { seed: u64::MAX },
+                want: "Run { seed: 18446744073709551615 }",
             },
             Case {
                 name: "a replay of a relative path",
                 argv: &["chronoloop", "replay", "run.history"],
-                want: Command::Replay {
-                    path: PathBuf::from("run.history"),
-                },
+                want: "Replay { path: \"run.history\" }",
             },
             Case {
                 name: "a replay of an absolute path",
                 argv: &["chronoloop", "replay", "/tmp/run.history"],
-                want: Command::Replay {
-                    path: PathBuf::from("/tmp/run.history"),
-                },
+                want: "Replay { path: \"/tmp/run.history\" }",
             },
         ];
         for case in cases {
             let cli =
                 Cli::try_parse_from(case.argv).unwrap_or_else(|e| panic!("{}: {e}", case.name));
-            assert_eq!(cli.command, case.want, "{}", case.name);
+            assert_eq!(format!("{:?}", cli.command), case.want, "{}", case.name);
         }
     }
 
@@ -321,19 +318,20 @@ mod tests {
     #[test]
     fn a_history_that_matches_has_no_divergence() {
         let recording = recording(7);
-        assert_eq!(
-            first_divergence(recording.entries(), recording.entries()),
-            None
-        );
+        assert!(first_divergence(recording.entries(), recording.entries()).is_none());
     }
 
     #[test]
     fn a_divergence_names_the_first_place_the_histories_differ() {
+        // A person reading the report has the file open, so what it says is checked in full, line
+        // number and both entries. The header takes the recording's first line, which is why the
+        // first entry is reported as line 2.
         struct Case {
             name: &'static str,
             recorded: Vec<Entry>,
             replayed: Vec<Entry>,
-            want: Option<Divergence>,
+            /// What the divergence reports, which is what a person reading it is given.
+            want: Option<&'static str>,
         }
         let recorded = || {
             vec![
@@ -363,11 +361,11 @@ mod tests {
                     entry(1, "ping received"),
                     entry(2, "pong sent"),
                 ],
-                want: Some(Divergence::Entry {
-                    index: 0,
-                    recorded: entry(1, "ping sent"),
-                    replayed: entry(1, "ping dropped"),
-                }),
+                want: Some(
+                    "the replay diverged at line 2\n  \
+                     recorded: 0.000000001s ping sent\n  \
+                     replayed: 0.000000001s ping dropped",
+                ),
             },
             Case {
                 name: "a different instant partway through",
@@ -377,20 +375,17 @@ mod tests {
                     entry(1, "ping received"),
                     entry(3, "pong sent"),
                 ],
-                want: Some(Divergence::Entry {
-                    index: 2,
-                    recorded: entry(2, "pong sent"),
-                    replayed: entry(3, "pong sent"),
-                }),
+                want: Some(
+                    "the replay diverged at line 4\n  \
+                     recorded: 0.000000002s pong sent\n  \
+                     replayed: 0.000000003s pong sent",
+                ),
             },
             Case {
                 name: "the replay stopped early",
                 recorded: recorded(),
                 replayed: vec![entry(1, "ping sent"), entry(1, "ping received")],
-                want: Some(Divergence::Length {
-                    recorded: 3,
-                    replayed: 2,
-                }),
+                want: Some("the replay recorded 2 entries where the recording holds 3"),
             },
             Case {
                 name: "the replay ran on",
@@ -401,43 +396,27 @@ mod tests {
                     entry(2, "pong sent"),
                     entry(2, "pong received"),
                 ],
-                want: Some(Divergence::Length {
-                    recorded: 3,
-                    replayed: 4,
-                }),
+                want: Some("the replay recorded 4 entries where the recording holds 3"),
             },
             Case {
                 name: "an entry differs before the lengths do",
                 recorded: recorded(),
                 replayed: vec![entry(1, "ping sent"), entry(9, "ping received")],
-                want: Some(Divergence::Entry {
-                    index: 1,
-                    recorded: entry(1, "ping received"),
-                    replayed: entry(9, "ping received"),
-                }),
+                want: Some(
+                    "the replay diverged at line 3\n  \
+                     recorded: 0.000000001s ping received\n  \
+                     replayed: 0.000000009s ping received",
+                ),
             },
         ];
         for case in cases {
+            let reported = first_divergence(&case.recorded, &case.replayed);
             assert_eq!(
-                first_divergence(&case.recorded, &case.replayed),
+                reported.map(|divergence| divergence.to_string()).as_deref(),
                 case.want,
                 "{}",
                 case.name
             );
         }
-    }
-
-    #[test]
-    fn a_divergence_reports_the_line_the_recording_holds_it_on() {
-        // A person reading the message has the file open, and the header takes the first line.
-        let divergence = Divergence::Entry {
-            index: 0,
-            recorded: entry(1, "ping sent"),
-            replayed: entry(2, "ping sent"),
-        };
-        assert!(
-            divergence.to_string().contains("line 2"),
-            "the first entry is on line 2: {divergence}"
-        );
     }
 }
