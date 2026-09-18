@@ -79,7 +79,7 @@ fn run() -> Year {
     let ended_at = finish(&mut executor);
 
     Year {
-        log: recorder.entries(),
+        log: recorder.finish().expect("every message is one line"),
         ended_at,
         polls: polls.get(),
     }
@@ -132,7 +132,7 @@ fn ties_at_a_day_boundary_go_to_the_timer_that_was_armed_first() {
         let at_midnight: Vec<&Entry> = year
             .log
             .iter()
-            .filter(|recorded| recorded.at.as_nanos() == day * DAY)
+            .filter(|recorded| recorded.at().as_nanos() == day * DAY)
             .collect();
         assert_eq!(
             at_midnight,

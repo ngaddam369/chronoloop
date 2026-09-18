@@ -13,9 +13,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use chronoloop::executor::ExecutorError;
 use chronoloop::history::{Entry, ParseRecordingError, Recording};
-use chronoloop::systems::pingpong;
+use chronoloop::systems::{RunError, pingpong};
 
 /// Deterministic simulation of infrastructure control loops.
 #[derive(Debug, Parser)]
@@ -89,8 +88,8 @@ impl fmt::Display for Divergence {
 /// What went wrong, in the terms of the person who typed the command.
 #[derive(Debug)]
 enum CliError {
-    /// The simulation could not finish.
-    Engine(ExecutorError),
+    /// The run produced no history.
+    Run(RunError),
     /// The recording could not be read.
     Read {
         /// The path that was asked for.
@@ -107,7 +106,7 @@ enum CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Engine(error) => write!(f, "{error}"),
+            Self::Run(error) => write!(f, "{error}"),
             Self::Read { path, source } => write!(f, "cannot read {}: {source}", path.display()),
             Self::Parse(error) => write!(f, "{error}"),
             Self::Diverged(divergence) => write!(f, "{divergence}"),
@@ -118,7 +117,7 @@ impl fmt::Display for CliError {
 impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Engine(error) => Some(error),
+            Self::Run(error) => Some(error),
             Self::Read { source, .. } => Some(source),
             Self::Parse(error) => Some(error),
             Self::Diverged(_) => None,
@@ -126,9 +125,9 @@ impl std::error::Error for CliError {
     }
 }
 
-impl From<ExecutorError> for CliError {
-    fn from(error: ExecutorError) -> Self {
-        Self::Engine(error)
+impl From<RunError> for CliError {
+    fn from(error: RunError) -> Self {
+        Self::Run(error)
     }
 }
 
@@ -217,6 +216,7 @@ mod tests {
     /// An entry, in the shorthand the divergence cases below are written in.
     fn entry(at: u64, message: &str) -> Entry {
         Entry::new(VirtualTime::from_nanos(at), message)
+            .unwrap_or_else(|e| panic!("a test expectation is one line: {e}"))
     }
 
     #[test]

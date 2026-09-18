@@ -53,7 +53,10 @@ fn exchange() -> (Vec<Entry>, u64) {
     });
 
     let ended_at = finish(&mut executor);
-    (recorder.entries(), ended_at)
+    (
+        recorder.finish().expect("every message is one line"),
+        ended_at,
+    )
 }
 
 #[test]

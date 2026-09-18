@@ -16,25 +16,63 @@ use crate::executor::Handle;
 /// The first line of a written recording, up to the seed itself.
 const HEADER: &str = "chronoloop history seed ";
 
+/// Returned when a message is not a single line, and so could not be recorded.
+///
+/// A written entry occupies one line. A newline inside a message would be read back as two entries,
+/// and a carriage return at the end of one is dropped on the way back — either way the history a
+/// file holds would stop being the history that was recorded.
+#[derive(Debug, Clone)]
+pub struct MultilineMessageError {
+    /// The message that was refused.
+    message: String,
+}
+
+impl fmt::Display for MultilineMessageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The message is written in its escaped form, so a line ending shows up as one.
+        write!(
+            f,
+            "a recorded message must be a single line: {:?}",
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for MultilineMessageError {}
+
 /// One thing that happened in a run, stamped with the virtual instant it happened at.
 ///
-/// A message is a single line: it carries no newline, since a written entry occupies one line and a
-/// newline inside the message would be read back as two entries.
+/// A message is a single line, which [`Entry::new`] is where that is settled: an entry that could
+/// not be read back cannot be built, so a run cannot write a history a replay is unable to parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    /// The virtual instant the entry was recorded at.
-    pub at: VirtualTime,
-    /// What happened.
-    pub message: String,
+    at: VirtualTime,
+    message: String,
 }
 
 impl Entry {
     /// Creates an entry recorded at `at`.
-    pub fn new(at: VirtualTime, message: impl Into<String>) -> Self {
-        Self {
-            at,
-            message: message.into(),
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultilineMessageError`] if `message` carries a line ending, since a written entry
+    /// occupies one line.
+    pub fn new(at: VirtualTime, message: impl Into<String>) -> Result<Self, MultilineMessageError> {
+        let message = message.into();
+        if message.contains(['\n', '\r']) {
+            return Err(MultilineMessageError { message });
         }
+        Ok(Self { at, message })
+    }
+
+    /// Returns the virtual instant the entry was recorded at.
+    pub fn at(&self) -> VirtualTime {
+        self.at
+    }
+
+    /// Returns what happened.
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -85,8 +123,19 @@ impl FromStr for Entry {
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let (at, message) = text.split_once(' ').ok_or(ParseEntryError::Malformed)?;
-        Ok(Self::new(at.parse()?, message))
+        let at = at.parse()?;
+        // A line of a written recording carries no line ending of its own, so reading one back
+        // never lands here. Text handed straight to `parse` can, and several lines of it are not
+        // the one entry this reads.
+        Self::new(at, message).map_err(|_| ParseEntryError::Malformed)
     }
+}
+
+/// What a recorder holds: the entries so far, and the first message it had to turn away.
+#[derive(Debug, Default)]
+struct History {
+    entries: Vec<Entry>,
+    refused: Option<MultilineMessageError>,
 }
 
 /// The history a run is writing, shared by every task taking part in it.
@@ -94,7 +143,7 @@ impl FromStr for Entry {
 /// Cloning shares one history rather than copying it, so a task can be handed its own recorder and
 /// the entries still land in one place, in the order the run produced them.
 #[derive(Debug, Clone, Default)]
-pub struct Recorder(Rc<RefCell<Vec<Entry>>>);
+pub struct Recorder(Rc<RefCell<History>>);
 
 impl Recorder {
     /// Creates an empty history.
@@ -106,13 +155,38 @@ impl Recorder {
     ///
     /// The instant is taken from the virtual clock rather than supplied, so an entry cannot be
     /// stamped with an instant the run was never at.
+    ///
+    /// Recording is something a task does in passing, with no way to handle a failure of its own,
+    /// so a message that is not a single line is turned away rather than written: it would produce
+    /// a history nothing could read back. The first one turned away is kept, and [`Self::finish`]
+    /// reports it in place of a history.
     pub fn record(&self, handle: &Handle, message: impl Into<String>) {
-        self.0.borrow_mut().push(Entry::new(handle.now(), message));
+        // The handle's borrow ends with this statement, before the history's begins.
+        let entry = Entry::new(handle.now(), message);
+        let mut history = self.0.borrow_mut();
+        match entry {
+            Ok(entry) => history.entries.push(entry),
+            Err(error) => {
+                if history.refused.is_none() {
+                    history.refused = Some(error);
+                }
+            }
+        }
     }
 
-    /// Returns everything recorded so far, in the order it was recorded.
-    pub fn entries(&self) -> Vec<Entry> {
-        self.0.borrow().clone()
+    /// Returns everything recorded, in the order it was recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MultilineMessageError`] if the run tried to record a message that is not a single
+    /// line, naming the first such message. The entries either side of it are not a history the run
+    /// produced, so they are withheld rather than passed off as one.
+    pub fn finish(&self) -> Result<Vec<Entry>, MultilineMessageError> {
+        let history = self.0.borrow();
+        match &history.refused {
+            Some(error) => Err(error.clone()),
+            None => Ok(history.entries.clone()),
+        }
     }
 }
 
@@ -125,10 +199,11 @@ impl Recorder {
 /// use chronoloop::clock::VirtualTime;
 /// use chronoloop::history::{Entry, Recording};
 ///
-/// let recording = Recording::new(7, vec![Entry::new(VirtualTime::ZERO, "ping sent")]);
+/// let recording = Recording::new(7, vec![Entry::new(VirtualTime::ZERO, "ping sent")?]);
 /// let written = recording.to_string();
 /// assert_eq!(written, "chronoloop history seed 7\n0.000000000s ping sent\n");
 /// assert_eq!(written.parse(), Ok(recording));
+/// # Ok::<(), chronoloop::history::MultilineMessageError>(())
 /// ```
 ///
 /// [`Display`]: fmt::Display
@@ -235,14 +310,17 @@ mod tests {
     use super::*;
     use crate::executor::Executor;
 
+    /// An entry, in the shorthand these tests write their expectations in.
+    fn entry(at: u64, message: &str) -> Entry {
+        Entry::new(VirtualTime::from_nanos(at), message)
+            .unwrap_or_else(|e| panic!("a test expectation is one line: {e}"))
+    }
+
     /// A recording with a couple of entries, used wherever the contents do not matter.
     fn sample() -> Recording {
         Recording::new(
             7,
-            vec![
-                Entry::new(VirtualTime::from_nanos(0), "ping sent"),
-                Entry::new(VirtualTime::from_nanos(1_500_000_000), "pong received"),
-            ],
+            vec![entry(0, "ping sent"), entry(1_500_000_000, "pong received")],
         )
     }
 
@@ -276,15 +354,111 @@ mod tests {
             },
         ];
         for case in cases {
-            let entry = Entry::new(VirtualTime::from_nanos(case.at), case.message);
-            assert_eq!(entry.to_string().parse(), Ok(entry), "{}", case.name);
+            let recorded = entry(case.at, case.message);
+            assert_eq!(
+                recorded.to_string().parse(),
+                Ok(recorded.clone()),
+                "{}",
+                case.name
+            );
         }
     }
 
     #[test]
+    fn a_message_that_would_not_read_back_is_refused() {
+        struct Case {
+            name: &'static str,
+            message: &'static str,
+            one_line: bool,
+        }
+        // A written entry occupies one line. A newline inside a message would be read back as two
+        // entries; a carriage return at the end of one is dropped on the way back, since `lines`
+        // strips it. Either way the history a file holds stops being the history that was recorded.
+        let cases = [
+            Case {
+                name: "an ordinary message",
+                message: "controller 3 reconciled",
+                one_line: true,
+            },
+            Case {
+                name: "empty",
+                message: "",
+                one_line: true,
+            },
+            Case {
+                name: "a newline of its own",
+                message: "\n",
+                one_line: false,
+            },
+            Case {
+                name: "two lines",
+                message: "cannot reach the region:\n  the standby is still catching up",
+                one_line: false,
+            },
+            Case {
+                name: "a trailing newline",
+                message: "gave up\n",
+                one_line: false,
+            },
+            Case {
+                name: "a carriage return",
+                message: "gave up\r",
+                one_line: false,
+            },
+            Case {
+                name: "a windows line ending",
+                message: "gave up\r\nstarted again",
+                one_line: false,
+            },
+        ];
+        for case in cases {
+            let made = Entry::new(VirtualTime::ZERO, case.message);
+            assert_eq!(made.is_ok(), case.one_line, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn refusing_a_message_names_the_message_it_refused() {
+        let error = Entry::new(VirtualTime::ZERO, "gave up\nstarted again")
+            .expect_err("a message of two lines is refused");
+        assert_eq!(
+            error.to_string(),
+            "a recorded message must be a single line: \"gave up\\nstarted again\""
+        );
+    }
+
+    #[test]
+    fn a_refused_message_is_left_out_of_the_history_and_reported_once() {
+        // Recording is something a task does in passing and cannot handle the failure of, so a
+        // message that would make the history unreadable is turned away and kept to be reported
+        // when the run hands its history over — rather than written and found later by a replay
+        // that cannot parse the file at all.
+        let mut executor = Executor::new();
+        let recorder = Recorder::new();
+        let handle = executor.handle();
+        let history = recorder.clone();
+        executor.spawn(async move {
+            history.record(&handle, "started");
+            history.record(&handle, "gave up\nstarted again");
+            history.record(&handle, "and again\nand again");
+            history.record(&handle, "finished");
+        });
+        executor.run().expect("the run finishes");
+
+        let error = recorder.finish().expect_err("a message was refused");
+        assert_eq!(
+            error.to_string(),
+            "a recorded message must be a single line: \"gave up\\nstarted again\"",
+            "the first message refused is the one reported"
+        );
+    }
+
+    #[test]
     fn an_entry_is_written_as_its_instant_then_its_message() {
-        let entry = Entry::new(VirtualTime::from_nanos(1_500_000_000), "ping sent");
-        assert_eq!(entry.to_string(), "1.500000000s ping sent");
+        assert_eq!(
+            entry(1_500_000_000, "ping sent").to_string(),
+            "1.500000000s ping sent"
+        );
     }
 
     #[test]
@@ -343,7 +517,7 @@ mod tests {
             },
             Case {
                 name: "the largest seed",
-                recording: Recording::new(u64::MAX, vec![Entry::new(VirtualTime::ZERO, "done")]),
+                recording: Recording::new(u64::MAX, vec![entry(0, "done")]),
             },
         ];
         for case in cases {
@@ -455,10 +629,10 @@ mod tests {
         executor.run().expect("the run finishes");
 
         assert_eq!(
-            recorder.entries(),
+            recorder.finish().expect("every message is one line"),
             vec![
-                Entry::new(VirtualTime::from_nanos(1_000_000_000), "task 1 ran"),
-                Entry::new(VirtualTime::from_nanos(2_000_000_000), "task 2 ran"),
+                entry(1_000_000_000, "task 1 ran"),
+                entry(2_000_000_000, "task 2 ran"),
             ]
         );
     }
@@ -479,9 +653,10 @@ mod tests {
         executor.run().expect("the run finishes");
 
         let instants: Vec<u64> = recorder
-            .entries()
+            .finish()
+            .expect("every message is one line")
             .iter()
-            .map(|entry| entry.at.as_nanos())
+            .map(|recorded| recorded.at().as_nanos())
             .collect();
         assert_eq!(instants, vec![0, 3_600_000_000_000]);
     }

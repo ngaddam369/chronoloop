@@ -40,7 +40,7 @@ fn run(seed: u64) -> Vec<Entry> {
     }
 
     finish(&mut executor);
-    recorder.entries()
+    recorder.finish().expect("every message is one line")
 }
 
 #[test]

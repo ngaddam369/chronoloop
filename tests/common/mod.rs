@@ -7,6 +7,7 @@ use chronoloop::history::Entry;
 /// An entry of a history, in the shorthand these tests write their expectations in.
 pub fn entry(at: u64, message: impl Into<String>) -> Entry {
     Entry::new(VirtualTime::from_nanos(at), message)
+        .unwrap_or_else(|e| panic!("a test expectation is one line: {e}"))
 }
 
 /// Runs `executor` to completion and returns the instant the run ended at.

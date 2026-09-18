@@ -16,9 +16,10 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::rc::Rc;
 
-use crate::executor::{Executor, ExecutorError};
+use crate::executor::Executor;
 use crate::history::{Recorder, Recording};
 use crate::rng::SeededRng;
+use crate::systems::RunError;
 
 /// The shortest a message may take to go out.
 const MIN_DELAY: Duration = Duration::from_millis(1);
@@ -156,9 +157,9 @@ impl Future for Recv {
 /// assert_eq!(recording.seed(), 7);
 /// assert_eq!(recording.entries().len(), 4);
 /// assert_eq!(recording, chronoloop::systems::pingpong::run(7)?);
-/// # Ok::<(), chronoloop::executor::ExecutorError>(())
+/// # Ok::<(), chronoloop::systems::RunError>(())
 /// ```
-pub fn run(seed: u64) -> Result<Recording, ExecutorError> {
+pub fn run(seed: u64) -> Result<Recording, RunError> {
     let mut executor = Executor::new();
     let recorder = Recorder::new();
     let mut seeds = SeededRng::from_seed(seed);
@@ -192,12 +193,13 @@ pub fn run(seed: u64) -> Result<Recording, ExecutorError> {
     });
 
     executor.run()?;
-    Ok(Recording::new(seed, recorder.entries()))
+    Ok(Recording::new(seed, recorder.finish()?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::Entry;
 
     /// Runs the exchange, failing the test rather than returning an error no case expects.
     fn history(seed: u64) -> Recording {
@@ -206,11 +208,7 @@ mod tests {
 
     /// The messages a recording holds, in order.
     fn messages(recording: &Recording) -> Vec<&str> {
-        recording
-            .entries()
-            .iter()
-            .map(|entry| entry.message.as_str())
-            .collect()
+        recording.entries().iter().map(Entry::message).collect()
     }
 
     #[test]
@@ -241,7 +239,7 @@ mod tests {
             let instants: Vec<u64> = recording
                 .entries()
                 .iter()
-                .map(|entry| entry.at.as_nanos())
+                .map(|entry| entry.at().as_nanos())
                 .collect();
             assert!(
                 instants[0] > 0,
@@ -427,7 +425,10 @@ mod tests {
 
         executor.run().expect("both sends reach a wait");
         assert_eq!(
-            messages(&Recording::new(0, recorder.entries())),
+            messages(&Recording::new(
+                0,
+                recorder.finish().expect("every message is one line")
+            )),
             vec!["one received", "two received"]
         );
     }

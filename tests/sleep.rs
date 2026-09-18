@@ -58,7 +58,7 @@ fn run() -> Vec<Entry> {
     spawn_watchdog(&mut executor, &recorder);
 
     finish(&mut executor);
-    recorder.entries()
+    recorder.finish().expect("every message is one line")
 }
 
 /// Runs the same pair, but under an overall deadline the worker abandons once it is done.
@@ -89,7 +89,10 @@ fn run_under_deadline() -> (Vec<Entry>, u64) {
     spawn_watchdog(&mut executor, &recorder);
 
     let ended_at = finish(&mut executor);
-    (recorder.entries(), ended_at)
+    (
+        recorder.finish().expect("every message is one line"),
+        ended_at,
+    )
 }
 
 /// Runs the same pair, but the worker carries on past the instant its abandoned deadline sat at.
@@ -133,7 +136,7 @@ fn run_past_an_abandoned_deadline() -> (Vec<Entry>, Vec<u64>) {
 
     finish(&mut executor);
     let polls = polls.borrow().clone();
-    (recorder.entries(), polls)
+    (recorder.finish().expect("every message is one line"), polls)
 }
 
 /// Spawns the watchdog that fires once, part way through the worker's retries.

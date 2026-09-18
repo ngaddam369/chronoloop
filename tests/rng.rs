@@ -35,14 +35,14 @@ fn run(seed: u64) -> Vec<Entry> {
     executor
         .run()
         .unwrap_or_else(|e| panic!("run did not finish: {e}"));
-    recorder.entries()
+    recorder.finish().expect("every message is one line")
 }
 
 fn labels_in_order(log: &[Entry]) -> Vec<String> {
     log.iter()
         .map(|entry| {
             entry
-                .message
+                .message()
                 .split(' ')
                 .next()
                 .unwrap_or_default()
@@ -76,7 +76,7 @@ fn randomised_delays_reorder_the_tasks() {
         "random delays must interleave the tasks, not leave them in spawn order"
     );
 
-    let times: Vec<u64> = log.iter().map(|entry| entry.at.as_nanos()).collect();
+    let times: Vec<u64> = log.iter().map(|entry| entry.at().as_nanos()).collect();
     assert!(
         times.windows(2).all(|pair| pair[0] <= pair[1]),
         "virtual time must never go backwards: {times:?}"
