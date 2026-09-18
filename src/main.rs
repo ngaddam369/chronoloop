@@ -8,6 +8,7 @@
 use core::fmt;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -99,6 +100,8 @@ enum CliError {
     },
     /// The file is not a recording.
     Parse(ParseRecordingError),
+    /// The output could not be got out.
+    Write(io::Error),
     /// The replay produced a different history from the one recorded.
     Diverged(Divergence),
 }
@@ -109,6 +112,7 @@ impl fmt::Display for CliError {
             Self::Run(error) => write!(f, "{error}"),
             Self::Read { path, source } => write!(f, "cannot read {}: {source}", path.display()),
             Self::Parse(error) => write!(f, "{error}"),
+            Self::Write(source) => write!(f, "cannot write to standard output: {source}"),
             Self::Diverged(divergence) => write!(f, "{divergence}"),
         }
     }
@@ -118,7 +122,7 @@ impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Run(error) => Some(error),
-            Self::Read { source, .. } => Some(source),
+            Self::Read { source, .. } | Self::Write(source) => Some(source),
             Self::Parse(error) => Some(error),
             Self::Diverged(_) => None,
         }
@@ -186,12 +190,28 @@ fn execute(command: &Command) -> Result<String, CliError> {
     }
 }
 
+/// Writes `output` to `out`, flushing it before returning.
+///
+/// # Errors
+///
+/// Returns [`CliError::Write`] if the output could not be got out — except to a reader that is no
+/// longer there, which is not a failure of the command. Rust leaves `SIGPIPE` ignored, so writing
+/// down a pipe whose far end has closed surfaces here as an error rather than as a signal, and
+/// printing through `print!` turns that error into a panic from the one program whose job is to
+/// report a divergence and nothing else.
+fn emit(output: &str, out: &mut impl Write) -> Result<(), CliError> {
+    let written = out.write_all(output.as_bytes()).and_then(|()| out.flush());
+    match written {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => Err(CliError::Write(error)),
+        _ => Ok(()),
+    }
+}
+
 fn main() -> ExitCode {
-    match execute(&Cli::parse().command) {
-        Ok(output) => {
-            print!("{output}");
-            ExitCode::SUCCESS
-        }
+    let carried_out =
+        execute(&Cli::parse().command).and_then(|output| emit(&output, &mut io::stdout().lock()));
+    match carried_out {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("chronoloop: {error}");
             ExitCode::FAILURE
@@ -294,6 +314,67 @@ mod tests {
         ];
         for case in cases {
             assert!(Cli::try_parse_from(case.argv).is_err(), "{}", case.name);
+        }
+    }
+
+    /// A writer that fails every write and every flush the same way.
+    struct Failing(io::ErrorKind);
+
+    impl Write for Failing {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let _ = buffer;
+            Err(io::Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(self.0))
+        }
+    }
+
+    #[test]
+    fn the_output_is_written_exactly_as_it_was_produced() {
+        // What `run` writes is what `replay` reads, so nothing may be added or dropped on the way
+        // out — not a trailing newline, not a lost final flush.
+        let recording = execute(&Command::Run { seed: 7 }).unwrap_or_else(|e| panic!("{e}"));
+        let mut written = Vec::new();
+        emit(&recording, &mut written).expect("a vector takes every write");
+        assert_eq!(
+            String::from_utf8(written).expect("the output is text"),
+            recording
+        );
+    }
+
+    #[test]
+    fn a_reader_that_stopped_reading_is_not_a_failure_of_the_command() {
+        struct Case {
+            name: &'static str,
+            kind: io::ErrorKind,
+            /// Whether the command can be called done despite the write failing.
+            done: bool,
+        }
+        // Rust ignores SIGPIPE, so a reader that has gone away arrives here as an error rather
+        // than as a signal. A history nobody is left to read is still a history the run produced
+        // correctly; anything else that stopped the output getting out is a failure to report.
+        let cases = [
+            Case {
+                name: "a reader that stopped reading",
+                kind: io::ErrorKind::BrokenPipe,
+                done: true,
+            },
+            Case {
+                name: "a device with no room left",
+                kind: io::ErrorKind::StorageFull,
+                done: false,
+            },
+            Case {
+                name: "a handle that is not open for writing",
+                kind: io::ErrorKind::PermissionDenied,
+                done: false,
+            },
+        ];
+        for case in cases {
+            let emitted = emit("chronoloop history seed 7\n", &mut Failing(case.kind));
+            assert_eq!(emitted.is_ok(), case.done, "{}", case.name);
         }
     }
 
