@@ -1,6 +1,6 @@
 CRATE := chronoloop
 
-.PHONY: build fmt lint test bench audit verify clean
+.PHONY: build fmt lint test bench audit verify local-validation clean
 
 ## build: compile the crate and all its targets
 build:
@@ -35,6 +35,11 @@ audit:
 
 ## verify: run the full checklist (fmt → build → lint → test → audit)
 verify: fmt build lint test audit
+
+## local-validation: drive the built binary through the checks CI does not run
+## These are ignored by `make test` on purpose — see tests/local_validation.rs for what belongs here
+local-validation:
+	cargo test --test local_validation -- --ignored
 
 ## clean: remove build artifacts
 clean:
