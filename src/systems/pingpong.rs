@@ -70,6 +70,11 @@ impl Channel {
 ///
 /// Dropping the wait takes its waker back out of the mailbox, so an abandoned wait cannot leave
 /// behind a waker that marks a task ready for a message nothing is waiting for.
+///
+/// A mailbox holds one waker, which is enough for the handover this module is: the wait that stored
+/// it is the one woken. Several waits of *different* tasks on one channel are not, since the one
+/// registered last is the only one a send can reach. That case wants a waker per waiting task, and
+/// belongs to the general channel a simulated network needs rather than to a private handover.
 struct Recv {
     channel: Channel,
     registered: Option<Waker>,
@@ -108,22 +113,32 @@ impl Future for Recv {
     type Output = &'static str;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // The borrow ends with the statement: nothing may hold it across what follows.
-        let delivered = self.channel.0.borrow_mut().message.take();
+        // One borrow, ending with the statement: nothing may hold it across what follows. Whether
+        // the wait is still armed is the mailbox's answer to give rather than this wait's. Delivery
+        // takes the waker out of the mailbox, and the wait that goes on to take the message need
+        // not be the one that put it there, so a wait's own copy can outlive the registration it
+        // describes — and a wait trusting that copy leaves the mailbox holding nobody.
+        let (delivered, armed) = {
+            let mut mailbox = self.channel.0.borrow_mut();
+            let delivered = mailbox.message.take();
+            let armed = mailbox
+                .waker
+                .as_ref()
+                .is_some_and(|waiting| waiting.will_wake(cx.waker()));
+            (delivered, armed)
+        };
         if let Some(message) = delivered {
             self.disarm();
             return Poll::Ready(message);
         }
-        // Re-register only when the stored waker would not wake this task, so being polled twice
-        // before the message arrives leaves one waker behind rather than replacing a good one.
-        let armed = self
-            .registered
-            .as_ref()
-            .is_some_and(|waker| waker.will_wake(cx.waker()));
+        // Being polled again while the mailbox already holds a waker for this task leaves that one
+        // where it is, rather than replacing a good waker with an equivalent one.
         if !armed {
             self.disarm();
             let waker = cx.waker().clone();
-            self.channel.0.borrow_mut().waker = Some(waker.clone());
+            // The borrow ends with the statement, so the waker it replaces is dropped outside it.
+            let replaced = self.channel.0.borrow_mut().waker.replace(waker.clone());
+            drop(replaced);
             self.registered = Some(waker);
         }
         Poll::Pending
@@ -334,5 +349,86 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    /// Two waits on one channel, polled together, completing once both have taken a message.
+    ///
+    /// Only a real task's waker exercises the path below: two clones of the no-op waker do not
+    /// wake each other, so a wait polled with one always re-registers no matter what it stored.
+    struct TwoWaits {
+        first: Option<Recv>,
+        second: Option<Recv>,
+        taken: Vec<&'static str>,
+    }
+
+    /// Polls the wait in `slot`, taking the wait away once it has its message.
+    fn take(slot: &mut Option<Recv>, cx: &mut Context<'_>) -> Option<&'static str> {
+        let polled = match slot {
+            Some(wait) => Pin::new(wait).poll(cx),
+            None => Poll::Pending,
+        };
+        let Poll::Ready(message) = polled else {
+            return None;
+        };
+        *slot = None;
+        Some(message)
+    }
+
+    impl Future for TwoWaits {
+        type Output = Vec<&'static str>;
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let this = &mut *self;
+            if let Some(message) = take(&mut this.first, cx) {
+                this.taken.push(message);
+            }
+            if let Some(message) = take(&mut this.second, cx) {
+                this.taken.push(message);
+            }
+            if this.first.is_none() && this.second.is_none() {
+                return Poll::Ready(core::mem::take(&mut this.taken));
+            }
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn a_wait_the_message_did_not_go_to_is_woken_by_the_next_send() {
+        // Delivery takes the waker out of the mailbox, and the wait that goes on to consume the
+        // message need not be the one that put it there. A wait judging itself still armed from its
+        // own copy of the waker would leave the mailbox empty, so the next send would wake nobody
+        // and the run would stall with a task still waiting.
+        let mut executor = Executor::new();
+        let channel = Channel::new();
+        let recorder = Recorder::new();
+
+        let handle = executor.handle();
+        let history = recorder.clone();
+        let waits = channel.clone();
+        executor.spawn(async move {
+            let taken = TwoWaits {
+                first: Some(waits.recv()),
+                second: Some(waits.recv()),
+                taken: Vec::new(),
+            }
+            .await;
+            for message in taken {
+                history.record(&handle, format!("{message} received"));
+            }
+        });
+
+        let handle = executor.handle();
+        executor.spawn(async move {
+            handle.sleep(Duration::from_secs(1)).await;
+            channel.send("one");
+            handle.sleep(Duration::from_secs(1)).await;
+            channel.send("two");
+        });
+
+        executor.run().expect("both sends reach a wait");
+        assert_eq!(
+            messages(&Recording::new(0, recorder.entries())),
+            vec!["one received", "two received"]
+        );
     }
 }
