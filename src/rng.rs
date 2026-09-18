@@ -3,8 +3,30 @@
 use core::ops::RangeInclusive;
 use core::time::Duration;
 
-use rand::{Rng, SeedableRng};
+// Brought in unnamed: the draws below go through it, but `Rng` in this module is the capability a
+// system asks for, not the trait the generator happens to be built on.
+use rand::Rng as _;
+use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+
+/// What a system may ask the simulation for when it needs a random choice.
+///
+/// A system under test names this capability rather than reaching for a generator of its own, so
+/// its choices can only ever come from the run's seed. Every draw is an integer one: no
+/// floating-point rounding sits between a seed and a decision.
+pub trait Rng {
+    /// Draws the next 64-bit value.
+    fn next_u64(&mut self) -> u64;
+
+    /// Draws a value within `bounds`, both ends included.
+    fn range(&mut self, bounds: RangeInclusive<u64>) -> u64;
+
+    /// Draws `true` with odds of `numerator` in `denominator`.
+    fn chance(&mut self, numerator: u32, denominator: u32) -> bool;
+
+    /// Draws a duration within `bounds`, both ends included.
+    fn duration_in(&mut self, bounds: RangeInclusive<Duration>) -> Duration;
+}
 
 /// A run's random choices, drawn from its seed and nothing else.
 ///
@@ -12,7 +34,7 @@ use rand_chacha::ChaCha8Rng;
 /// pure function of its seed:
 ///
 /// ```
-/// use chronoloop::rng::SeededRng;
+/// use chronoloop::rng::{Rng, SeededRng};
 ///
 /// let mut first = SeededRng::from_seed(7);
 /// let mut second = SeededRng::from_seed(7);
@@ -35,44 +57,40 @@ impl SeededRng {
     }
 
     /// Returns the seed this generator was built from, which is what a repro records.
+    ///
+    /// This is not part of [`Rng`]: a system draws from the seed without ever being told what it
+    /// was, and the seed is what the run around it records.
     pub fn seed(&self) -> u64 {
         self.seed
     }
+}
 
-    /// Draws the next 64-bit value.
-    pub fn next_u64(&mut self) -> u64 {
+impl Rng for SeededRng {
+    fn next_u64(&mut self) -> u64 {
         self.inner.random()
     }
 
-    /// Draws a value within `bounds`, both ends included.
-    ///
     /// # Panics
     ///
     /// Panics if the range is back to front, in the same way indexing past the end of a slice does.
-    pub fn range(&mut self, bounds: RangeInclusive<u64>) -> u64 {
+    fn range(&mut self, bounds: RangeInclusive<u64>) -> u64 {
         self.inner.random_range(bounds)
     }
 
-    /// Draws `true` with odds of `numerator` in `denominator`.
-    ///
-    /// The odds are integers, so no floating-point rounding sits between a seed and a decision.
-    ///
     /// # Panics
     ///
     /// Panics if `denominator` is zero or `numerator` exceeds it.
-    pub fn chance(&mut self, numerator: u32, denominator: u32) -> bool {
+    fn chance(&mut self, numerator: u32, denominator: u32) -> bool {
         self.inner.random_ratio(numerator, denominator)
     }
 
-    /// Draws a duration within `bounds`, both ends included.
-    ///
     /// Durations are drawn in nanoseconds and capped at the end of virtual time, matching what
     /// sleeping on the virtual clock can represent.
     ///
     /// # Panics
     ///
     /// Panics if the range is back to front.
-    pub fn duration_in(&mut self, bounds: RangeInclusive<Duration>) -> Duration {
+    fn duration_in(&mut self, bounds: RangeInclusive<Duration>) -> Duration {
         let low = nanos_of(*bounds.start());
         let high = nanos_of(*bounds.end());
         Duration::from_nanos(self.range(low..=high))

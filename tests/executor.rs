@@ -3,7 +3,7 @@
 use core::cell::RefCell;
 use std::rc::Rc;
 
-use chronoloop::clock::VirtualTime;
+use chronoloop::clock::{Clock, VirtualTime};
 use chronoloop::executor::Executor;
 use chronoloop::history::{Entry, Recorder};
 

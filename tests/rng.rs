@@ -4,12 +4,21 @@ use core::cell::RefCell;
 use core::time::Duration;
 use std::rc::Rc;
 
+use chronoloop::clock::Clock;
 use chronoloop::executor::Executor;
 use chronoloop::history::{Entry, Recorder};
-use chronoloop::rng::SeededRng;
+use chronoloop::rng::{Rng, SeededRng};
 
 const LABELS: [&str; 3] = ["alpha", "beta", "gamma"];
 const STEPS: u32 = 3;
+
+/// How long a step waits, drawn through the capability rather than from a generator it named.
+///
+/// A system that takes its randomness this way has no way to reach the machine's entropy, which is
+/// what keeps a run a function of its seed.
+fn delay<R: Rng>(rng: &mut R) -> Duration {
+    rng.duration_in(Duration::from_millis(1)..=Duration::from_millis(100))
+}
 
 /// Runs three tasks whose delays all come from one generator, and returns what they logged.
 fn run(seed: u64) -> Vec<Entry> {
@@ -23,10 +32,8 @@ fn run(seed: u64) -> Vec<Entry> {
         let task_rng = Rc::clone(&rng);
         executor.spawn(async move {
             for step in 0..STEPS {
-                let delay = task_rng
-                    .borrow_mut()
-                    .duration_in(Duration::from_millis(1)..=Duration::from_millis(100));
-                handle.sleep(delay).await;
+                let waited = delay(&mut *task_rng.borrow_mut());
+                handle.sleep(waited).await;
                 history.record(&handle, format!("{label} step {step}"));
             }
         });

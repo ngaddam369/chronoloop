@@ -2,9 +2,10 @@
 
 use core::time::Duration;
 
+use chronoloop::clock::Clock;
 use chronoloop::executor::Executor;
 use chronoloop::history::{Entry, Recorder};
-use chronoloop::rng::SeededRng;
+use chronoloop::rng::{Rng, SeededRng};
 
 mod common;
 

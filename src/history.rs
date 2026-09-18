@@ -10,8 +10,7 @@ use core::fmt;
 use core::str::FromStr;
 use std::rc::Rc;
 
-use crate::clock::{ParseVirtualTimeError, VirtualTime};
-use crate::executor::Handle;
+use crate::clock::{Clock, ParseVirtualTimeError, VirtualTime};
 
 /// The first line of a written recording, up to the seed itself.
 const HEADER: &str = "chronoloop history seed ";
@@ -151,18 +150,18 @@ impl Recorder {
         Self::default()
     }
 
-    /// Records `message` at the instant `handle` has reached.
+    /// Records `message` at the instant `clock` has reached.
     ///
-    /// The instant is taken from the virtual clock rather than supplied, so an entry cannot be
-    /// stamped with an instant the run was never at.
+    /// The instant is taken from the clock rather than supplied, so an entry cannot be stamped with
+    /// an instant the run was never at.
     ///
     /// Recording is something a task does in passing, with no way to handle a failure of its own,
     /// so a message that is not a single line is turned away rather than written: it would produce
     /// a history nothing could read back. The first one turned away is kept, and [`Self::finish`]
     /// reports it in place of a history.
-    pub fn record(&self, handle: &Handle, message: impl Into<String>) {
-        // The handle's borrow ends with this statement, before the history's begins.
-        let entry = Entry::new(handle.now(), message);
+    pub fn record(&self, clock: &impl Clock, message: impl Into<String>) {
+        // The clock's borrow ends with this statement, before the history's begins.
+        let entry = Entry::new(clock.now(), message);
         let mut history = self.0.borrow_mut();
         match entry {
             Ok(entry) => history.entries.push(entry),
@@ -640,7 +639,7 @@ mod tests {
     #[test]
     fn an_entry_is_stamped_with_the_instant_the_run_has_reached() {
         // The instant comes from the virtual clock and can come from nowhere else, which is why
-        // recording takes a handle rather than an instant a caller chose.
+        // recording takes a clock rather than an instant a caller chose.
         let mut executor = Executor::new();
         let recorder = Recorder::new();
         let handle = executor.handle();

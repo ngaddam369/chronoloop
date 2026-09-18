@@ -42,13 +42,17 @@
 //! random choice drawn from a [`SeededRng`]; [`pingpong`] is a two-task exchange over that clock,
 //! and its [`Recording`] can be written to a file and replayed against a later run of the engine.
 //!
-//! The content-addressed state history, the fault schedules, and the shrinking built on top of them
-//! are not here yet.
+//! Time and randomness are already capabilities a system asks for rather than reaches for: a system
+//! written against [`Clock`] and [`Rng`] can wait, arm a deadline and draw a delay, and has no way
+//! to get at the machine's clock or its entropy. The simulated network, the content-addressed state
+//! history, the fault schedules, and the shrinking built on top of them are not here yet.
 //!
 //! [`VirtualClock`]: clock::VirtualClock
 //! [`EventQueue`]: event::EventQueue
 //! [`Executor`]: executor::Executor
 //! [`SeededRng`]: rng::SeededRng
+//! [`Clock`]: clock::Clock
+//! [`Rng`]: rng::Rng
 //! [`pingpong`]: systems::pingpong
 //! [`Recording`]: history::Recording
 

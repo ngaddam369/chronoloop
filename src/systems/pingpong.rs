@@ -16,9 +16,10 @@ use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::rc::Rc;
 
+use crate::clock::Clock;
 use crate::executor::Executor;
 use crate::history::{Recorder, Recording};
-use crate::rng::SeededRng;
+use crate::rng::{Rng, SeededRng};
 use crate::systems::RunError;
 
 /// The shortest a message may take to go out.
@@ -146,6 +147,39 @@ impl Future for Recv {
     }
 }
 
+/// Opens the exchange: wait, send, then wait for the answer.
+///
+/// Written against the capabilities alone — it can ask the simulation for the time and for a delay,
+/// and it has no way to reach a real clock or the machine's entropy.
+async fn opening<C: Clock, R: Rng>(
+    clock: &C,
+    rng: &mut R,
+    history: &Recorder,
+    outgoing: &Channel,
+    awaited: &Channel,
+) {
+    clock.sleep(rng.duration_in(MIN_DELAY..=MAX_DELAY)).await;
+    outgoing.send("ping");
+    history.record(clock, "ping sent");
+    let answer = awaited.recv().await;
+    history.record(clock, format!("{answer} received"));
+}
+
+/// Answers the exchange: wait for the message, wait again, then reply.
+async fn answering<C: Clock, R: Rng>(
+    clock: &C,
+    rng: &mut R,
+    history: &Recorder,
+    incoming: &Channel,
+    outgoing: &Channel,
+) {
+    let message = incoming.recv().await;
+    history.record(clock, format!("{message} received"));
+    clock.sleep(rng.duration_in(MIN_DELAY..=MAX_DELAY)).await;
+    outgoing.send("pong");
+    history.record(clock, "pong sent");
+}
+
 /// Runs the exchange under `seed` and returns the history it wrote.
 ///
 /// The same seed always writes the same history, which is what makes a recording of one run enough
@@ -168,28 +202,20 @@ pub fn run(seed: u64) -> Result<Recording, RunError> {
 
     // Each task draws from its own generator, seeded from the run's. Sharing one generator would
     // make a task's delays depend on how often the other task drew.
-    let handle = executor.handle();
+    let clock = executor.handle();
     let history = recorder.clone();
     let mut rng = SeededRng::from_seed(seeds.next_u64());
     let outgoing = request.clone();
     let awaited = reply.clone();
     executor.spawn(async move {
-        handle.sleep(rng.duration_in(MIN_DELAY..=MAX_DELAY)).await;
-        outgoing.send("ping");
-        history.record(&handle, "ping sent");
-        let answer = awaited.recv().await;
-        history.record(&handle, format!("{answer} received"));
+        opening(&clock, &mut rng, &history, &outgoing, &awaited).await;
     });
 
-    let handle = executor.handle();
+    let clock = executor.handle();
     let history = recorder.clone();
     let mut rng = SeededRng::from_seed(seeds.next_u64());
     executor.spawn(async move {
-        let message = request.recv().await;
-        history.record(&handle, format!("{message} received"));
-        handle.sleep(rng.duration_in(MIN_DELAY..=MAX_DELAY)).await;
-        reply.send("pong");
-        history.record(&handle, "pong sent");
+        answering(&clock, &mut rng, &history, &request, &reply).await;
     });
 
     executor.run()?;

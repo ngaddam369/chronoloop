@@ -5,13 +5,12 @@ use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Wake;
 
-use crate::clock::{ClockError, VirtualClock, VirtualTime};
+use crate::clock::{Clock, ClockError, VirtualClock, VirtualTime};
 use crate::event::{EventId, EventQueue};
 
 /// Identifies a task, assigned in spawn order.
@@ -41,11 +40,6 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// Returns the current virtual instant.
-    pub fn now(&self) -> VirtualTime {
-        self.shared.borrow().clock.now()
-    }
-
     /// Schedules `waker` to be woken once the simulation reaches the instant `at`.
     ///
     /// Returns the identifier that [`Handle::cancel_wake`] takes to call the wake-up off again.
@@ -62,40 +56,16 @@ impl Handle {
         let cancelled = self.shared.borrow_mut().queue.cancel(id);
         drop(cancelled);
     }
+}
 
-    /// Returns a future that completes once `duration` of virtual time has gone by.
-    ///
-    /// Waiting costs no real time: the clock jumps to the deadline once nothing else can run. A
-    /// duration reaching beyond the end of virtual time is capped there.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use core::time::Duration;
-    /// use chronoloop::executor::{Executor, ExecutorError};
-    ///
-    /// let mut executor = Executor::new();
-    /// let handle = executor.handle();
-    /// executor.spawn(async move {
-    ///     handle.sleep(Duration::from_secs(3600)).await;
-    /// });
-    /// executor.run()?;
-    ///
-    /// assert_eq!(executor.handle().now().to_string(), "3600.000000000s");
-    /// # Ok::<(), ExecutorError>(())
-    /// ```
-    pub fn sleep(&self, duration: Duration) -> Sleep {
-        let deadline = self
-            .now()
-            .checked_add(duration)
-            .unwrap_or(VirtualTime::from_nanos(u64::MAX));
-        self.sleep_until(deadline)
+impl Clock for Handle {
+    type Sleep = Sleep;
+
+    fn now(&self) -> VirtualTime {
+        self.shared.borrow().clock.now()
     }
 
-    /// Returns a future that completes once the simulation reaches `deadline`.
-    ///
-    /// A deadline the simulation has already passed completes on the first poll.
-    pub fn sleep_until(&self, deadline: VirtualTime) -> Sleep {
+    fn sleep_until(&self, deadline: VirtualTime) -> Sleep {
         Sleep {
             handle: self.clone(),
             deadline,
@@ -104,7 +74,7 @@ impl Handle {
     }
 }
 
-/// A wait on the virtual clock, created by [`Handle::sleep`] or [`Handle::sleep_until`].
+/// A wait on the virtual clock, created by [`Clock::sleep`] or [`Clock::sleep_until`].
 ///
 /// Dropping a wait takes its timer back out of the queue. An abandoned wait therefore leaves no
 /// trace in the run: it cannot wake the task that walked away from it, and it cannot move the
@@ -370,6 +340,8 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
+    use core::time::Duration;
+
     use super::*;
 
     const HOUR: u64 = 3600 * 1_000_000_000;

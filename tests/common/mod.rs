@@ -1,6 +1,6 @@
 //! What every integration test needs: a way to finish a run, and a way to spell what it recorded.
 
-use chronoloop::clock::VirtualTime;
+use chronoloop::clock::{Clock, VirtualTime};
 use chronoloop::executor::Executor;
 use chronoloop::history::Entry;
 

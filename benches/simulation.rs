@@ -17,8 +17,9 @@ use core::time::Duration;
 use std::rc::Rc;
 use std::time::Instant;
 
+use chronoloop::clock::Clock;
 use chronoloop::executor::{Executor, Handle};
-use chronoloop::rng::SeededRng;
+use chronoloop::rng::{Rng, SeededRng};
 
 /// The seed every figure this bench prints is reproducible from.
 const SEED: u64 = 20_260_917;

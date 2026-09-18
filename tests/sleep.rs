@@ -7,6 +7,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use std::rc::Rc;
 
+use chronoloop::clock::Clock;
 use chronoloop::executor::{Executor, Handle, Sleep};
 use chronoloop::history::{Entry, Recorder};
 

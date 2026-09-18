@@ -1,7 +1,10 @@
 //! Virtual time: the only notion of time a simulation has.
 
 use core::fmt;
+use core::future::Future;
+use core::pin::Pin;
 use core::str::FromStr;
+use core::task::{Context, Poll};
 use core::time::Duration;
 
 /// Nanoseconds in a second, the scale [`VirtualTime`] is both written and read at.
@@ -187,9 +190,155 @@ impl VirtualClock {
     }
 }
 
+/// What a system may ask the simulation about time.
+///
+/// A system under test names this capability rather than reaching for a clock of its own: there is
+/// no way to get the machine's time through it, so a run of that system cannot depend on anything
+/// but its own schedule. Everything a simulation offers is here — the instant it has reached, a
+/// wait until a later one, and a deadline around work that may not come back.
+pub trait Clock {
+    /// The wait this clock hands back.
+    type Sleep: Future<Output = ()> + Unpin;
+
+    /// Returns the current instant.
+    fn now(&self) -> VirtualTime;
+
+    /// Returns a future that completes once the simulation reaches `deadline`.
+    ///
+    /// A deadline the simulation has already passed completes on the first poll.
+    fn sleep_until(&self, deadline: VirtualTime) -> Self::Sleep;
+
+    /// Returns a future that completes once `duration` of simulated time has gone by.
+    ///
+    /// Waiting costs no real time: the clock jumps to the deadline once nothing else can run. A
+    /// duration reaching beyond the end of virtual time is capped there.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use chronoloop::clock::Clock;
+    /// use chronoloop::executor::{Executor, ExecutorError};
+    ///
+    /// let mut executor = Executor::new();
+    /// let handle = executor.handle();
+    /// executor.spawn(async move {
+    ///     handle.sleep(Duration::from_secs(3600)).await;
+    /// });
+    /// executor.run()?;
+    ///
+    /// assert_eq!(executor.handle().now().to_string(), "3600.000000000s");
+    /// # Ok::<(), ExecutorError>(())
+    /// ```
+    fn sleep(&self, duration: Duration) -> Self::Sleep {
+        let deadline = self
+            .now()
+            .checked_add(duration)
+            .unwrap_or(VirtualTime::from_nanos(u64::MAX));
+        self.sleep_until(deadline)
+    }
+
+    /// Returns a future that runs `future`, giving up on it once `duration` has gone by.
+    ///
+    /// This is the move a control loop makes on every pass: arm a deadline, do something that may
+    /// not come back, and call the deadline off when the work lands first. Both halves are dropped
+    /// as soon as one of them wins, so the loser takes its own wait back out of the queue.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use chronoloop::clock::Clock;
+    /// use chronoloop::executor::{Executor, ExecutorError};
+    ///
+    /// let mut executor = Executor::new();
+    /// let handle = executor.handle();
+    /// let working = handle.clone();
+    /// executor.spawn(async move {
+    ///     let outcome = handle
+    ///         .timeout(Duration::from_secs(10), async move {
+    ///             working.sleep(Duration::from_secs(60)).await;
+    ///         })
+    ///         .await;
+    ///     assert!(outcome.is_err());
+    /// });
+    /// executor.run()?;
+    ///
+    /// // The deadline fell at ten seconds, and the minute of work it gave up on left nothing
+    /// // behind that could carry the clock any further.
+    /// assert_eq!(executor.handle().now().to_string(), "10.000000000s");
+    /// # Ok::<(), ExecutorError>(())
+    /// ```
+    fn timeout<F: Future>(&self, duration: Duration, future: F) -> Timeout<Self::Sleep, F>
+    where
+        Self: Sized,
+    {
+        Timeout {
+            deadline: self.sleep(duration),
+            work: Box::pin(future),
+        }
+    }
+}
+
+/// Returned by [`Clock::timeout`] when the deadline arrived before the work finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Elapsed;
+
+impl fmt::Display for Elapsed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the deadline passed before the work finished")
+    }
+}
+
+impl std::error::Error for Elapsed {}
+
+/// A deadline around a future, created by [`Clock::timeout`].
+///
+/// The work is polled first and the deadline second. Work that becomes ready at the very instant
+/// its deadline fires has therefore finished in time — a tie settled by a fixed rule rather than by
+/// which of the two the simulation happened to wake first, which is what makes the answer the same
+/// on every replay.
+///
+/// Dropping this drops both halves, so whichever of them lost the race takes its own wait back out
+/// of the queue. An abandoned deadline cannot go on to move the clock to an instant nothing in the
+/// simulation is waiting for.
+///
+/// The work is held behind a `Box`, allocated once when the timeout is created and never again.
+/// Reaching a pinned field through a pinned struct cannot be written without `unsafe`, which this
+/// crate forbids outright; one allocation per deadline is the price of that, and it is paid where a
+/// deadline is armed rather than on every poll.
+pub struct Timeout<S, F> {
+    deadline: S,
+    work: Pin<Box<F>>,
+}
+
+impl<S, F> fmt::Debug for Timeout<S, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Timeout").finish_non_exhaustive()
+    }
+}
+
+impl<S: Future<Output = ()> + Unpin, F: Future> Future for Timeout<S, F> {
+    type Output = Result<F::Output, Elapsed>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if let Poll::Ready(output) = this.work.as_mut().poll(cx) {
+            return Poll::Ready(Ok(output));
+        }
+        Pin::new(&mut this.deadline).poll(cx).map(|()| Err(Elapsed))
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use core::cell::RefCell;
+    use std::rc::Rc;
+
     use super::*;
+    use crate::executor::{Executor, Handle};
+
+    const DAY: u64 = 24 * 3600 * NANOS_PER_SEC;
 
     #[test]
     fn new_clock_starts_at_zero() {
@@ -453,5 +602,137 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    /// Runs `body`, built around a handle to the simulation, as that simulation's only task.
+    ///
+    /// Returns what the task produced together with the instant the run ended at. The second is
+    /// what shows up a timer nobody called off: a run ends where its work ended, so a wait left
+    /// armed after the thing waiting for it walked away carries the clock somewhere the work never
+    /// reached.
+    fn simulate<T, F>(body: impl FnOnce(Handle) -> F) -> (T, u64)
+    where
+        T: 'static,
+        F: Future<Output = T> + 'static,
+    {
+        let mut executor = Executor::new();
+        let outcome: Rc<RefCell<Option<T>>> = Rc::default();
+        let slot = Rc::clone(&outcome);
+        let future = body(executor.handle());
+        executor.spawn(async move {
+            *slot.borrow_mut() = Some(future.await);
+        });
+        executor
+            .run()
+            .unwrap_or_else(|e| panic!("run did not finish: {e}"));
+        let ended_at = executor.handle().now().as_nanos();
+        let produced = outcome
+            .borrow_mut()
+            .take()
+            .expect("the only task of the run finished");
+        (produced, ended_at)
+    }
+
+    /// The work a timeout is put around: a wait that ends at an instant, or one that never does.
+    fn work(handle: &Handle, done_at: Option<u64>) -> Pin<Box<dyn Future<Output = ()>>> {
+        match done_at {
+            Some(at) => Box::pin(handle.sleep_until(VirtualTime::from_nanos(at))),
+            None => Box::pin(core::future::pending()),
+        }
+    }
+
+    #[test]
+    fn a_timeout_resolves_to_whichever_of_the_work_and_the_deadline_comes_first() {
+        struct Case {
+            name: &'static str,
+            /// The instant the work finishes at, or `None` if it never finishes.
+            work_done_at: Option<u64>,
+            /// How long the work is given.
+            limit: u64,
+            want: Result<(), Elapsed>,
+            /// Where the run ends, which is where the surviving wait ended. Whichever of the two
+            /// lost the race is dropped, so its timer must leave no instant behind it.
+            want_ended_at: u64,
+        }
+        let cases = [
+            Case {
+                name: "the work finishes first",
+                work_done_at: Some(10),
+                limit: DAY,
+                want: Ok(()),
+                want_ended_at: 10,
+            },
+            Case {
+                name: "the deadline comes first",
+                work_done_at: Some(2 * DAY),
+                limit: 50,
+                want: Err(Elapsed),
+                want_ended_at: 50,
+            },
+            Case {
+                name: "the work finishes at the very instant the deadline fires",
+                work_done_at: Some(50),
+                limit: 50,
+                want: Ok(()),
+                want_ended_at: 50,
+            },
+            Case {
+                name: "work that never finishes",
+                work_done_at: None,
+                limit: 50,
+                want: Err(Elapsed),
+                want_ended_at: 50,
+            },
+            Case {
+                name: "no time at all, and work that wanted none",
+                work_done_at: Some(0),
+                limit: 0,
+                want: Ok(()),
+                want_ended_at: 0,
+            },
+            Case {
+                name: "no time at all, and work that wanted some",
+                work_done_at: Some(10),
+                limit: 0,
+                want: Err(Elapsed),
+                want_ended_at: 0,
+            },
+        ];
+
+        for case in cases {
+            let (outcome, ended_at) = simulate(|handle| {
+                let waiting = work(&handle, case.work_done_at);
+                handle.timeout(Duration::from_nanos(case.limit), waiting)
+            });
+            assert_eq!(outcome, case.want, "{}", case.name);
+            assert_eq!(
+                ended_at, case.want_ended_at,
+                "{}: the run ends where its work ended",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_timeout_hands_back_what_the_work_produced() {
+        // The work's own output travels through, so a timeout wraps a value-producing call rather
+        // than only a wait.
+        let (outcome, ended_at) = simulate(|handle| {
+            let clock = handle.clone();
+            handle.timeout(Duration::from_nanos(DAY), async move {
+                clock.sleep(Duration::from_nanos(10)).await;
+                "reconciled"
+            })
+        });
+        assert_eq!(outcome, Ok("reconciled"));
+        assert_eq!(ended_at, 10);
+    }
+
+    #[test]
+    fn a_deadline_that_expired_says_so() {
+        assert_eq!(
+            Elapsed.to_string(),
+            "the deadline passed before the work finished"
+        );
     }
 }
