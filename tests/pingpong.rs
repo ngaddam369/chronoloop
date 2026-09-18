@@ -33,10 +33,10 @@ fn a_recorded_history_replays_unchanged() {
     // or if the written form ever stops being what `replay` can read.
     let recorded = "\
 chronoloop history seed 20260917
-1.334140636s ping sent
-1.334140636s ping received
-3.114474183s pong sent
-3.114474183s pong received
+1.780333547s ping sent
+1.802570620s ping received
+2.359432095s pong sent
+2.389402930s pong received
 ";
 
     assert_eq!(history(RECORDED_SEED).to_string(), recorded);

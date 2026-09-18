@@ -42,9 +42,11 @@
 //! random choice drawn from a [`SeededRng`]; [`pingpong`] is a two-task exchange over that clock,
 //! and its [`Recording`] can be written to a file and replayed against a later run of the engine.
 //!
-//! Time and randomness are already capabilities a system asks for rather than reaches for: a system
-//! written against [`Clock`] and [`Rng`] can wait, arm a deadline and draw a delay, and has no way
-//! to get at the machine's clock or its entropy. The simulated network, the content-addressed state
+//! Time, randomness and the wire are already capabilities a system asks for rather than reaches
+//! for: written against [`Clock`], [`Rng`] and [`Network`], it can wait, arm a deadline, draw a
+//! delay and talk to another node, and it has no way to get at the machine's clock, its entropy or
+//! a socket. What its messages go through is a [`VirtualNetwork`], where latency, loss, duplication
+//! and partitions all come from the same seed as everything else. The content-addressed state
 //! history, the fault schedules, and the shrinking built on top of them are not here yet.
 //!
 //! [`VirtualClock`]: clock::VirtualClock
@@ -53,6 +55,8 @@
 //! [`SeededRng`]: rng::SeededRng
 //! [`Clock`]: clock::Clock
 //! [`Rng`]: rng::Rng
+//! [`Network`]: net::Network
+//! [`VirtualNetwork`]: net::VirtualNetwork
 //! [`pingpong`]: systems::pingpong
 //! [`Recording`]: history::Recording
 
@@ -60,5 +64,6 @@ pub mod clock;
 pub mod event;
 pub mod executor;
 pub mod history;
+pub mod net;
 pub mod rng;
 pub mod systems;
