@@ -22,12 +22,13 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use core::time::Duration;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use crate::clock::{Clock, VirtualTime};
 use crate::event::EventId;
 use crate::executor::Handle;
+use crate::fault::FaultSchedule;
 use crate::rng::Rng;
 
 /// The shortest an ordinary link takes, when nothing says otherwise.
@@ -43,6 +44,17 @@ const DEFAULT_MAX_LATENCY: Duration = Duration::from_millis(50);
 /// fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(u64);
+
+impl NodeId {
+    /// Names the node a network hands out `index`th.
+    ///
+    /// Crate-private on purpose: reading a fault schedule back from a file has to be able to name
+    /// the node a fault is about, and that parser is the only caller. From outside,
+    /// [`VirtualNetwork::add_node`] is still the only source of an address.
+    pub(crate) fn from_index(index: u64) -> Self {
+        Self(index)
+    }
+}
 
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -387,12 +399,12 @@ enum Sent {
     Twice(VirtualTime, VirtualTime),
 }
 
-/// The links between nodes, which directions are cut, and the run's share of its seed.
+/// The links between nodes, the faults the run was given, and its share of the seed.
 #[derive(Debug)]
 struct Wire<R> {
     default_link: Link,
     links: BTreeMap<(NodeId, NodeId), Link>,
-    partitioned: BTreeSet<(NodeId, NodeId)>,
+    faults: FaultSchedule,
     rng: R,
 }
 
@@ -403,7 +415,7 @@ impl<R: Rng> Wire<R> {
     /// then the duplicate's own delay. A change to it changes every history the engine has ever
     /// recorded, so it is a decision rather than an implementation detail.
     fn send(&mut self, from: NodeId, to: NodeId, now: VirtualTime) -> Sent {
-        if self.partitioned.contains(&(from, to)) {
+        if self.faults.partitioned(from, to, now) {
             return Sent::Nothing;
         }
         let link = self
@@ -411,7 +423,12 @@ impl<R: Rng> Wire<R> {
             .get(&(from, to))
             .unwrap_or(&self.default_link)
             .clone();
-        if link.loss.draw(&mut self.rng) {
+        // A fault says what the odds are while it lasts; the link says what they are otherwise.
+        // Either way the draw happens, so injecting one cannot change how much of the seed a send
+        // consumes — a run under faults would otherwise diverge from one without for reasons that
+        // have nothing to do with the faults.
+        let loss = self.faults.loss(from, to, now).unwrap_or(link.loss);
+        if loss.draw(&mut self.rng) {
             return Sent::Nothing;
         }
         let first = landing(now, &link, &mut self.rng);
@@ -442,16 +459,6 @@ pub struct VirtualNetwork<M, R> {
     wire: Rc<RefCell<Wire<R>>>,
 }
 
-impl<M, R> Clone for VirtualNetwork<M, R> {
-    fn clone(&self) -> Self {
-        Self {
-            clock: self.clock.clone(),
-            inboxes: Rc::clone(&self.inboxes),
-            wire: Rc::clone(&self.wire),
-        }
-    }
-}
-
 impl<M, R: fmt::Debug> fmt::Debug for VirtualNetwork<M, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VirtualNetwork")
@@ -469,7 +476,7 @@ impl<M, R> VirtualNetwork<M, R> {
             wire: Rc::new(RefCell::new(Wire {
                 default_link: Link::default(),
                 links: BTreeMap::new(),
-                partitioned: BTreeSet::new(),
+                faults: FaultSchedule::default(),
                 rng,
             })),
         }
@@ -498,18 +505,19 @@ impl<M, R> VirtualNetwork<M, R> {
         self.wire.borrow_mut().links.insert((from, to), link);
     }
 
-    /// Stops the direction from `from` to `to` carrying anything.
+    /// Gives the run `faults` to meet, in place of whatever it was given before.
     ///
-    /// A partition is what a link does to a send, not to what has already left: a message that got
-    /// away before this still lands. Cutting a link both ways takes two calls, since a failure that
-    /// cuts only one direction is real and worth being able to say.
-    pub fn partition(&self, from: NodeId, to: NodeId) {
-        self.wire.borrow_mut().partitioned.insert((from, to));
-    }
-
-    /// Lets the direction from `from` to `to` carry again.
-    pub fn heal(&self, from: NodeId, to: NodeId) {
-        self.wire.borrow_mut().partitioned.remove(&(from, to));
+    /// This takes nodes rather than making them, so it comes after they have been added — a fault
+    /// names the link it is about, and an address only exists once [`Self::add_node`] has handed one
+    /// out. A fault naming a node this network does not have applies to nothing, in the same way a
+    /// message addressed to one goes nowhere.
+    ///
+    /// The wire asks the schedule what is true at the instant it is sending, so the faults cost the
+    /// run nothing and show up in its history only through what they did to its messages. A
+    /// partition is therefore what a link does to a send rather than to what has already left: a
+    /// message that got away before an outage began still lands.
+    pub fn set_faults(&self, faults: FaultSchedule) {
+        self.wire.borrow_mut().faults = faults;
     }
 }
 
@@ -711,9 +719,17 @@ mod tests {
 
     use super::*;
     use crate::executor::Executor;
+    use crate::fault::{Fault, FaultSchedule, Window};
     use crate::rng::SeededRng;
 
     const MILLIS: u64 = 1_000_000;
+    const SECOND: u64 = 1000 * MILLIS;
+
+    /// A window from one instant to another, failing the test rather than returning an error.
+    fn span(start: u64, end: u64) -> Window {
+        Window::new(VirtualTime::from_nanos(start), VirtualTime::from_nanos(end))
+            .unwrap_or_else(|e| panic!("a test window is sound: {e}"))
+    }
 
     /// A generator whose draws are written down in advance, so a link's behaviour is exact.
     ///
@@ -920,7 +936,9 @@ mod tests {
     }
 
     #[test]
-    fn a_partitioned_link_carries_nothing_and_a_heal_resumes_it() {
+    fn a_partitioned_link_carries_nothing_until_the_outage_is_over() {
+        const OUTAGE_SECS: u64 = 2;
+
         let mut executor = Executor::new();
         let network = VirtualNetwork::new(executor.handle(), SeededRng::from_seed(7))
             .with_default_link(ordinary());
@@ -928,26 +946,64 @@ mod tests {
         let bob = network.add_node();
         let log = Log::default();
 
+        network.set_faults(FaultSchedule::new(vec![Fault::Partition {
+            from: alice.id(),
+            to: bob.id(),
+            during: span(0, OUTAGE_SECS * SECOND),
+        }]));
+
+        // The collector outlasts the outage on purpose: a patience shorter than it would give up
+        // before the link came back, and the empty log would look like a partition that stuck.
         spawn_collector(&mut executor, bob.clone(), Duration::from_secs(5), &log);
 
         let clock = executor.handle();
-        let healing = network.clone();
         let sender = alice.clone();
         let receiver = bob.id();
-        // The collector outlasts the heal on purpose: a patience shorter than the outage would give
-        // up before the link came back, and the empty log would look like a partition that stuck.
         executor.spawn(async move {
-            healing.partition(sender.id(), receiver);
             sender.send(receiver, "while the link is down");
-            clock.sleep(Duration::from_secs(2)).await;
-            healing.heal(sender.id(), receiver);
+            clock.sleep(Duration::from_secs(OUTAGE_SECS)).await;
             sender.send(receiver, "once it is back");
         });
         finish(&mut executor);
 
         let taken = log.borrow();
-        assert_eq!(taken.len(), 1, "only the send after the heal got through");
+        assert_eq!(taken.len(), 1, "only the send after the outage got through");
         assert_eq!(taken[0].2, "once it is back");
+    }
+
+    #[test]
+    fn a_link_that_is_reliable_of_itself_drops_what_it_carries_while_a_fault_says_so() {
+        let mut executor = Executor::new();
+        let network = VirtualNetwork::new(executor.handle(), SeededRng::from_seed(7))
+            .with_default_link(ordinary());
+        let alice = network.add_node();
+        let bob = network.add_node();
+        let log = Log::default();
+
+        // The link itself loses nothing. Everything below is the fault's doing, and it stops being
+        // its doing the instant the window closes.
+        network.set_faults(FaultSchedule::new(vec![Fault::Loss {
+            from: alice.id(),
+            to: bob.id(),
+            during: span(0, SECOND),
+            odds: Odds::always(),
+        }]));
+
+        spawn_collector(&mut executor, bob.clone(), Duration::from_secs(5), &log);
+
+        let clock = executor.handle();
+        let sender = alice.clone();
+        let receiver = bob.id();
+        executor.spawn(async move {
+            sender.send(receiver, "swallowed");
+            clock.sleep(Duration::from_secs(1)).await;
+            sender.send(receiver, "carried");
+        });
+        finish(&mut executor);
+
+        let taken = log.borrow();
+        assert_eq!(taken.len(), 1, "only the send after the window got through");
+        assert_eq!(taken[0].2, "carried");
     }
 
     #[test]
@@ -962,17 +1018,16 @@ mod tests {
         let bob = network.add_node();
         let log = Log::default();
 
+        // The outage opens ten milliseconds in, by which time the message has been on the wire for
+        // ten milliseconds and has seventy left to go.
+        network.set_faults(FaultSchedule::new(vec![Fault::Partition {
+            from: alice.id(),
+            to: bob.id(),
+            during: Window::forever_from(VirtualTime::from_nanos(10 * MILLIS)),
+        }]));
+
         spawn_collector(&mut executor, bob.clone(), Duration::from_secs(1), &log);
         alice.send(bob.id(), "already gone");
-
-        let clock = executor.handle();
-        let cutting = network.clone();
-        let from = alice.id();
-        let to = bob.id();
-        executor.spawn(async move {
-            clock.sleep(Duration::from_millis(10)).await;
-            cutting.partition(from, to);
-        });
         finish(&mut executor);
 
         assert_eq!(*log.borrow(), [(80 * MILLIS, alice.id(), "already gone")]);
@@ -990,7 +1045,11 @@ mod tests {
         let heard_by_alice = Log::default();
         let heard_by_bob = Log::default();
 
-        network.partition(alice.id(), bob.id());
+        network.set_faults(FaultSchedule::new(vec![Fault::Partition {
+            from: alice.id(),
+            to: bob.id(),
+            during: Window::forever_from(VirtualTime::ZERO),
+        }]));
         spawn_collector(
             &mut executor,
             alice.clone(),

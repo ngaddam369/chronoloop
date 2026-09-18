@@ -9,7 +9,9 @@ use core::ops::RangeInclusive;
 use core::time::Duration;
 
 use chronoloop::clock::Clock;
+use chronoloop::clock::VirtualTime;
 use chronoloop::executor::Executor;
+use chronoloop::fault::{Fault, FaultSchedule, Window};
 use chronoloop::history::{Entry, Recorder};
 use chronoloop::net::{Link, Network, NodeId, Odds, VirtualNetwork};
 use chronoloop::rng::{Rng, SeededRng};
@@ -189,11 +191,12 @@ where
     }
 }
 
-/// What a client recorded talking to a server over a link the test sets up through `wire`.
+/// What a client recorded talking to a server over a link that loses at `loss`, under the faults
+/// `trouble` asks for once the two nodes have addresses to be named by.
 fn request_with_retries(
     seed: u64,
     loss: Odds,
-    wire: impl FnOnce(&VirtualNetwork<&'static str, SeededRng>, NodeId, NodeId, &mut Executor),
+    trouble: impl FnOnce(NodeId, NodeId) -> FaultSchedule,
 ) -> Vec<Entry> {
     const PATIENCE: Duration = Duration::from_secs(3);
     const ATTEMPTS: u32 = 8;
@@ -211,7 +214,7 @@ fn request_with_retries(
     // Only the way out is unreliable. A link is one direction, so saying that is saying exactly
     // that — the answers come back over a link of their own, which this leaves alone.
     network.set_link(from, to, Link::default().with_loss(loss));
-    wire(&network, from, to, &mut executor);
+    network.set_faults(trouble(from, to));
 
     let clock = executor.handle();
     let history = recorder.clone();
@@ -235,7 +238,7 @@ fn a_request_the_wire_swallows_is_tried_again_until_it_lands() {
     // Seed 3 is a seed on which the link does lose the first request: a seed on which it happened
     // to lose none would pass this file without the retry ever running.
     let loss = Odds::new(1, 2).expect("one in two is ordinary odds");
-    let log = request_with_retries(3, loss, |_, _, _, _| {});
+    let log = request_with_retries(3, loss, |_, _| FaultSchedule::default());
 
     let said: Vec<&str> = log.iter().map(Entry::message).collect();
     assert!(
@@ -261,14 +264,17 @@ fn a_partition_stalls_an_exchange_and_a_heal_resumes_it() {
 
     // Nothing is lost at random here: the link carries perfectly, and the only thing stopping the
     // request is the partition. What the client does about it is retry until the wire comes back.
-    let log = request_with_retries(1, Odds::never(), |network, from, to, executor| {
-        network.partition(from, to);
-        let clock = executor.handle();
-        let healing = network.clone();
-        executor.spawn(async move {
-            clock.sleep(Duration::from_secs(HEALS_AT)).await;
-            healing.heal(from, to);
-        });
+    let log = request_with_retries(1, Odds::never(), |from, to| {
+        let outage = Window::new(
+            VirtualTime::ZERO,
+            VirtualTime::from_nanos(HEALS_AT * SECOND),
+        )
+        .expect("an outage that ends after it began");
+        FaultSchedule::new(vec![Fault::Partition {
+            from,
+            to,
+            during: outage,
+        }])
     });
 
     let landed = log

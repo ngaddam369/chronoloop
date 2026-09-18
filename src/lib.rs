@@ -48,8 +48,9 @@
 //! a socket. What its messages go through is a [`VirtualNetwork`], where latency, loss, duplication
 //! and partitions all come from the same seed as everything else. A running task can start another
 //! and wait for what it produces, with identifiers handed out in spawn order rather than taken from
-//! an address. The content-addressed state history, the fault schedules, and the shrinking built on
-//! top of them are not here yet.
+//! an address. The trouble a run is put through is a [`FaultSchedule`] — a value written to a file
+//! and read back, rather than a method called on a network — which is what the shrinking will
+//! reduce. The content-addressed state history and that shrinking are not here yet.
 //!
 //! [`VirtualClock`]: clock::VirtualClock
 //! [`EventQueue`]: event::EventQueue
@@ -59,12 +60,14 @@
 //! [`Rng`]: rng::Rng
 //! [`Network`]: net::Network
 //! [`VirtualNetwork`]: net::VirtualNetwork
+//! [`FaultSchedule`]: fault::FaultSchedule
 //! [`pingpong`]: systems::pingpong
 //! [`Recording`]: history::Recording
 
 pub mod clock;
 pub mod event;
 pub mod executor;
+pub mod fault;
 pub mod history;
 pub mod net;
 pub mod rng;
