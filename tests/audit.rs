@@ -19,15 +19,21 @@
 //! forbidden spelling is written out below as a literal, so without the skip the audit would be its
 //! own first violation. That is asserted rather than assumed.
 //!
-//! On one rule this is deliberately stricter than the rule itself. A seed sweep is entitled to real
-//! threads — each seed is an independent single-threaded run, and nothing about that makes a
-//! history depend on how the operating system interleaved them — but the four thread spellings
+//! In two places this is deliberately stricter than the rule it enforces. A seed sweep is entitled
+//! to real threads — each seed is an independent single-threaded run, and nothing about that makes
+//! a history depend on how the operating system interleaved them — but the four thread spellings
 //! below are forbidden in every file the scan reads, sweeps included. A scan cannot tell a sweep
 //! from a simulation; the exemption would have to be a file's name, and a file's name is a poor
 //! account of what the code in it does. It is the same argument that forbids `HashMap` in all of
 //! `src/` rather than only where a simulation can see it. When a sweep here wants threads, this is
 //! the decision to re-open — visibly, in a commit that says which file is being trusted and why,
 //! rather than by widening a needle until the build goes quiet.
+//!
+//! The other is `UNIX_EPOCH`, which is a constant and reads nothing: an instant rendered against it
+//! is as deterministic as the instant was. What reaches the machine is an elapsed or a duration
+//! measured from it, and a scan cannot tell one from the other, so the name is forbidden outright.
+//! A simulation has no call for the wall clock's origin either way — a recorded instant is a
+//! `VirtualTime`, which carries its own.
 //!
 //! A match counts wherever it falls, comments included. Stripping them first would need a
 //! heuristic that is wrong about `//` inside a string literal, and would give a violation a place
@@ -70,7 +76,7 @@ const NO_ADDRESSES: &str = "no address reaches state, a hash, or a history";
 ///
 /// A `static` rather than a `const`, because a `const` is inlined at each use and a reference taken
 /// to one points at a temporary; the reports below outlive the scan that produced them.
-static RULES: [Rule; 23] = [
+static RULES: [Rule; 25] = [
     Rule {
         needle: "Instant::now",
         jewel: VIRTUAL_TIME,
@@ -86,8 +92,9 @@ static RULES: [Rule; 23] = [
     Rule {
         needle: "UNIX_EPOCH",
         jewel: VIRTUAL_TIME,
-        why: "reaches the same wall clock without naming it — an elapsed since the epoch, or a \
-              duration since it, is the machine's answer rather than the run's",
+        why: "names the wall clock's own origin, which an elapsed or a duration since it is the \
+              machine's answer measured against; forbidden outright rather than only where it is \
+              read, because a scan cannot tell the two apart",
     },
     Rule {
         needle: "thread::sleep",
@@ -160,9 +167,20 @@ static RULES: [Rule; 23] = [
               not a function of the seed",
     },
     Rule {
+        needle: "as_ptr_range",
+        jewel: NO_ADDRESSES,
+        why: "hands out two addresses at once, as the ends of a range; a longer name that the \
+              needle above deliberately does not claim, so it has to be named here",
+    },
+    Rule {
         needle: "as_mut_ptr",
         jewel: NO_ADDRESSES,
         why: "the same address, from the buffer's other accessor",
+    },
+    Rule {
+        needle: "as_mut_ptr_range",
+        jewel: NO_ADDRESSES,
+        why: "the same range, through pointers that could also write",
     },
     Rule {
         needle: "as *const",
@@ -213,7 +231,7 @@ struct Violation {
 /// spelling — it is the same trap as an assertion whose two sides come from one run. Each of these
 /// is a line someone could plausibly write, and each breaks exactly one rule, which is also how a
 /// needle broad enough to swallow its neighbours gets caught.
-static VIOLATIONS: [Violation; 23] = [
+static VIOLATIONS: [Violation; 25] = [
     Violation {
         name: "the machine's monotonic clock",
         source: "    let started = std::time::Instant::now();",
@@ -295,9 +313,19 @@ static VIOLATIONS: [Violation; 23] = [
         needle: "as_ptr",
     },
     Violation {
+        name: "a pair of addresses, taken as a range",
+        source: "    let bounds = slice.as_ptr_range();",
+        needle: "as_ptr_range",
+    },
+    Violation {
         name: "an identity taken from an address that can be written through",
         source: "    let identity = buffer.as_mut_ptr() as usize;",
         needle: "as_mut_ptr",
+    },
+    Violation {
+        name: "the same range, through pointers that can write",
+        source: "    let bounds = buffer.as_mut_ptr_range();",
+        needle: "as_mut_ptr_range",
     },
     Violation {
         name: "an address taken by a cast",
@@ -342,9 +370,10 @@ struct Boundary {
     caught: &'static [&'static str],
 }
 
-/// The pairs that make the distinction worth drawing: a forbidden spelling, and a longer name that
-/// merely starts with it.
-static BOUNDARIES: [Boundary; 6] = [
+/// The pairs that make the distinction worth drawing: a forbidden spelling, and a longer name it
+/// sits inside — at the front of one, where the longer name is something else, and at the end of
+/// one, where the longer name is the forbidden thing wearing a prefix.
+static BOUNDARIES: [Boundary; 8] = [
     Boundary {
         name: "the generator a run may not have",
         source: "    let delay: u64 = rand::rng().random_range(1..=100);",
@@ -356,6 +385,11 @@ static BOUNDARIES: [Boundary; 6] = [
         caught: &[],
     },
     Boundary {
+        name: "an unordered map wearing a prefix, which is still that map",
+        source: "    let counts: AHashMap<NodeId, u64> = AHashMap::default();",
+        caught: &["HashMap"],
+    },
+    Boundary {
         name: "an address, where the needle is the whole name",
         source: "    let identity = Rc::as_ptr(&shared) as usize;",
         caught: &["as_ptr"],
@@ -364,6 +398,11 @@ static BOUNDARIES: [Boundary; 6] = [
         name: "the accessor beside it, which no shorter needle may claim",
         source: "    let identity = buffer.as_mut_ptr() as usize;",
         caught: &["as_mut_ptr"],
+    },
+    Boundary {
+        name: "the range accessor, which is a longer name and so needs one of its own",
+        source: "    let bounds = buffer.as_ptr_range();",
+        caught: &["as_ptr_range"],
     },
     Boundary {
         name: "a raw borrow through a pointer that can write",
@@ -390,6 +429,14 @@ fn continues_a_name(c: char) -> bool {
 /// character therefore counts only where the next character does not continue that name. One
 /// ending in punctuation — `thread::{`, `as *mut`, `addr_of!`, `{:p}` — has no name to continue and
 /// counts wherever it falls, which is what keeps `use std::thread::{sleep, spawn};` caught.
+///
+/// Only that end is guarded, and the asymmetry is the point rather than half a job. A needle that
+/// begins a longer name is usually a different thing — a path carrying on into somewhere else,
+/// which is the case above. A needle that *ends* one is usually the forbidden thing wearing a
+/// prefix: `AHashMap` is a map whose order comes from the operating system, and anything named
+/// `..._as_ptr` or `..._thread_rng` is a wrapper around the call it is named after. Guarding the
+/// leading side would buy one contrived false positive at the cost of missing those, so it is left
+/// alone; the case below holds that decision up.
 fn names(line: &str, needle: &str) -> bool {
     let bounded = needle.ends_with(continues_a_name);
     line.match_indices(needle).any(|(at, _)| {
@@ -434,12 +481,29 @@ fn self_path() -> PathBuf {
     }
 }
 
+/// `path` with every link on it resolved, or `path` itself where it cannot be.
+///
+/// Falling back rather than failing: a link naming a file that is not there resolves to nothing,
+/// and a walk that panics on one would be stopped by a piece of debris in `target/` that has no
+/// bearing on what the engine says.
+fn resolved(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// `path` as a reader would name it, rather than from the root of the filesystem.
 fn relative(path: &Path) -> &Path {
     path.strip_prefix(root()).unwrap_or(path)
 }
 
-/// Adds every Rust file at or under `dir` to `found`, leaving out `skip`.
+/// Adds every Rust file at or under `dir` to `found`, leaving out `skip`, which arrives resolved.
+///
+/// `skip` is compared against what each file *is* rather than against the name the walk arrived by,
+/// or a link to it under another name would be read — and the file this scan leaves out is the one
+/// every forbidden spelling is written in, so reading it under an alias reports the whole table
+/// against the wrong file. `found` keeps the walked name rather than the resolved one, because
+/// every path in this file is spelled relative to the crate root, which is itself unresolved: a
+/// checkout reached through a link would otherwise report violations from the root of the
+/// filesystem instead.
 ///
 /// `seen` holds the directories already walked, under the path each one really is. A symbolic link
 /// pointing back up the tree sends the walk round again: measured here, the same source was read
@@ -462,7 +526,7 @@ fn collect(dir: &Path, skip: &Path, seen: &mut BTreeSet<PathBuf>, found: &mut Ve
         let path = entry.path();
         if path.is_dir() {
             collect(&path, skip, seen, found);
-        } else if path.extension().is_some_and(|kind| kind == "rs") && path != skip {
+        } else if path.extension().is_some_and(|kind| kind == "rs") && resolved(&path) != *skip {
             found.push(path);
         }
     }
@@ -470,7 +534,7 @@ fn collect(dir: &Path, skip: &Path, seen: &mut BTreeSet<PathBuf>, found: &mut Ve
 
 /// Every Rust file the scan reads, in an order that does not come from the filesystem.
 fn sources() -> Vec<PathBuf> {
-    let skip = self_path();
+    let skip = resolved(&self_path());
     let mut seen = BTreeSet::new();
     let mut found = Vec::new();
     for dir in SCANNED {
@@ -669,19 +733,30 @@ fn the_walk_reads_a_tree_that_points_back_at_itself() {
     // walk that declines to look at anything a link names.
     let linked = planted.join("linked.rs");
     symlink(&real, &linked).unwrap_or_else(|e| panic!("could not link {}: {e}", linked.display()));
+    // And a link to the one file the scan leaves out, under a name that is not the one the skip is
+    // spelled as. What a file is has to settle that, rather than what this walk happened to call it
+    // — otherwise the audit reads itself under an alias and reports every needle in the table
+    // against the file they are all written in.
+    let mirror = planted.join("mirror.rs");
+    symlink(self_path(), &mirror)
+        .unwrap_or_else(|e| panic!("could not link {}: {e}", mirror.display()));
 
     let mut seen = BTreeSet::new();
     let mut found = Vec::new();
-    collect(&planted, &self_path(), &mut seen, &mut found);
+    collect(&planted, &resolved(&self_path()), &mut seen, &mut found);
     found.sort();
+
+    // Cleared before the assertion rather than after it: a failing assertion is exactly when the
+    // link pointing back up the tree must not be left lying in `target/`, where the next thing to
+    // walk it following links goes round until the kernel stops it.
+    clear(&planted);
 
     assert_eq!(
         found,
         vec![real, linked],
-        "the source under the loop is read once, and so is the file a link names"
+        "the source under the loop is read once, the file a link names is read, and the skipped \
+         file stays skipped under a name it does not have"
     );
-
-    clear(&planted);
 }
 
 /// Removes `dir` and everything under it, and says so rather than swallowing a failure.
