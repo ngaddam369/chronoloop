@@ -38,7 +38,7 @@
 //! # Status
 //!
 //! What works today is the deterministic core and one system running on it. A run is driven by a
-//! [`VirtualClock`] over a [`EventQueue`], polled by a single-threaded [`Executor`], with every
+//! [`VirtualClock`] over an [`EventQueue`], polled by a single-threaded [`Executor`], with every
 //! random choice drawn from a [`SeededRng`]; [`pingpong`] is a two-task exchange over that clock,
 //! and its [`Recording`] can be written to a file and replayed against a later run of the engine.
 //!
