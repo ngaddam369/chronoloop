@@ -53,8 +53,10 @@
 //! reduce. And the state a run leaves behind is now content-addressed: a [`World`] of named
 //! resources hands back a tree of [`Snapshot`] nodes whose branches hash over their children's
 //! hashes, so two states are the same state exactly when they answer to one [`StateHash`], and
-//! a part of the world that did not change keeps the name it had. The store that keeps those
-//! states, the trace that scrubs through them, and the shrinking are not here yet.
+//! a part of the world that did not change keeps the name it had. A [`StateStore`] takes that up:
+//! it keeps each node once under the name it answers to, with a branch naming its children rather
+//! than holding them, so a run costs what it changed rather than a copy of the world per step. The
+//! trace that scrubs through those states, and the shrinking, are not here yet.
 //!
 //! [`VirtualClock`]: clock::VirtualClock
 //! [`EventQueue`]: event::EventQueue
@@ -67,6 +69,7 @@
 //! [`FaultSchedule`]: fault::FaultSchedule
 //! [`pingpong`]: systems::pingpong
 //! [`Recording`]: history::Recording
+//! [`StateStore`]: store::StateStore
 //! [`World`]: world::World
 //! [`Snapshot`]: world::Snapshot
 //! [`StateHash`]: world::StateHash
@@ -78,5 +81,6 @@ pub mod fault;
 pub mod history;
 pub mod net;
 pub mod rng;
+pub mod store;
 pub mod systems;
 pub mod world;
