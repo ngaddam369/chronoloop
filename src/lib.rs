@@ -50,7 +50,11 @@
 //! and wait for what it produces, with identifiers handed out in spawn order rather than taken from
 //! an address. The trouble a run is put through is a [`FaultSchedule`] — a value written to a file
 //! and read back, rather than a method called on a network — which is what the shrinking will
-//! reduce. The content-addressed state history and that shrinking are not here yet.
+//! reduce. And the state a run leaves behind is now content-addressed: a [`World`] of named
+//! resources hands back a tree of [`Snapshot`] nodes whose branches hash over their children's
+//! hashes, so two states are the same state exactly when they answer to one [`StateHash`], and
+//! a part of the world that did not change keeps the name it had. The store that keeps those
+//! states, the trace that scrubs through them, and the shrinking are not here yet.
 //!
 //! [`VirtualClock`]: clock::VirtualClock
 //! [`EventQueue`]: event::EventQueue
@@ -63,6 +67,9 @@
 //! [`FaultSchedule`]: fault::FaultSchedule
 //! [`pingpong`]: systems::pingpong
 //! [`Recording`]: history::Recording
+//! [`World`]: world::World
+//! [`Snapshot`]: world::Snapshot
+//! [`StateHash`]: world::StateHash
 
 pub mod clock;
 pub mod event;
@@ -72,3 +79,4 @@ pub mod history;
 pub mod net;
 pub mod rng;
 pub mod systems;
+pub mod world;

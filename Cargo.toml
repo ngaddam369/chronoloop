@@ -35,6 +35,12 @@ clap = { version = "4", default-features = false, features = [
 rand = { version = "0.9", default-features = false }
 rand_chacha = { version = "0.9", default-features = false }
 
+# `default-features = false` drops the `std` feature, which only adds an `io::Write` impl this crate
+# has no use for; `pure` selects the portable Rust implementation over the assembly one, which takes
+# a C compiler, `cc`, `libc` and runtime CPU detection out of the build. This crate hashes small
+# state trees rather than gigabytes, so the throughput that buys is worth none of it.
+blake3 = { version = "1", default-features = false, features = ["pure"] }
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
