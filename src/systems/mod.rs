@@ -7,8 +7,10 @@ use core::fmt;
 
 use crate::executor::ExecutorError;
 use crate::history::MultilineMessageError;
+use crate::world::NameError;
 
 pub mod pingpong;
+pub mod ring;
 
 /// Why a system's run produced no history.
 #[derive(Debug)]
@@ -18,6 +20,8 @@ pub enum RunError {
     Engine(ExecutorError),
     /// The run tried to record something that could not be read back.
     Message(MultilineMessageError),
+    /// The run tried to call a part of its world something that is not a name.
+    Name(NameError),
 }
 
 impl fmt::Display for RunError {
@@ -25,6 +29,7 @@ impl fmt::Display for RunError {
         match self {
             Self::Engine(error) => write!(f, "{error}"),
             Self::Message(error) => write!(f, "{error}"),
+            Self::Name(error) => write!(f, "{error}"),
         }
     }
 }
@@ -34,6 +39,7 @@ impl std::error::Error for RunError {
         match self {
             Self::Engine(error) => Some(error),
             Self::Message(error) => Some(error),
+            Self::Name(error) => Some(error),
         }
     }
 }
@@ -47,5 +53,11 @@ impl From<ExecutorError> for RunError {
 impl From<MultilineMessageError> for RunError {
     fn from(error: MultilineMessageError) -> Self {
         Self::Message(error)
+    }
+}
+
+impl From<NameError> for RunError {
+    fn from(error: NameError) -> Self {
+        Self::Name(error)
     }
 }

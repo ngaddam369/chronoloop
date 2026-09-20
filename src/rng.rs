@@ -63,6 +63,31 @@ impl SeededRng {
     pub fn seed(&self) -> u64 {
         self.seed
     }
+
+    /// Returns a generator of `seed` standing exactly where this one stands.
+    ///
+    /// The key changes and the place in the stream does not: the new generator has consumed as much
+    /// of its own sequence as this one has of its. That is what lets a run change seed partway
+    /// through and still be the run it was up to that point — reseeding to the seed it already has
+    /// draws precisely what carrying on would have drawn, so a change of seed that changes nothing
+    /// costs nothing and is not a case written in by hand:
+    ///
+    /// ```
+    /// use chronoloop::rng::{Rng, SeededRng};
+    ///
+    /// let mut rng = SeededRng::from_seed(7);
+    /// let _ = rng.next_u64();
+    ///
+    /// let mut carried_on = rng.clone();
+    /// let mut reseeded = rng.reseeded(7);
+    /// assert_eq!(reseeded.next_u64(), carried_on.next_u64());
+    /// ```
+    #[must_use]
+    pub fn reseeded(&self, seed: u64) -> Self {
+        let mut inner = ChaCha8Rng::seed_from_u64(seed);
+        inner.set_word_pos(self.inner.get_word_pos());
+        Self { seed, inner }
+    }
 }
 
 impl Rng for SeededRng {
@@ -314,5 +339,80 @@ mod tests {
         let from_original: Vec<u64> = (0..DRAWS).map(|_| rng.next_u64()).collect();
         let from_copy: Vec<u64> = (0..DRAWS).map(|_| copy.next_u64()).collect();
         assert_eq!(from_original, from_copy);
+    }
+
+    #[test]
+    fn reseeding_keeps_its_place_in_the_stream() {
+        // What a fork rests on. Replacing the key without moving back to the start of the stream is
+        // what makes a fork to the seed the run already had draw exactly what the run would have
+        // drawn — so the property is the cipher's rather than a case written into the fork.
+        //
+        // The positions below straddle a block: the generator yields sixteen 32-bit words at a
+        // time, so eight draws land on a boundary and the others do not.
+        struct Case {
+            name: &'static str,
+            drawn: usize,
+        }
+        let cases = [
+            Case {
+                name: "nothing drawn yet",
+                drawn: 0,
+            },
+            Case {
+                name: "partway into the first block",
+                drawn: 3,
+            },
+            Case {
+                name: "exactly a block",
+                drawn: 8,
+            },
+            Case {
+                name: "several blocks and a little",
+                drawn: 37,
+            },
+        ];
+        for case in cases {
+            let mut rng = SeededRng::from_seed(42);
+            for _ in 0..case.drawn {
+                let _ = rng.next_u64();
+            }
+
+            let mut carried_on = rng.clone();
+            let mut same = rng.reseeded(42);
+            let mut other = rng.reseeded(43);
+            // Reached by drawing forward rather than by seeking, so the two sides of the assertion
+            // below do not both come from the code under test.
+            let mut elsewhere = SeededRng::from_seed(43);
+            for _ in 0..case.drawn {
+                let _ = elsewhere.next_u64();
+            }
+
+            let expected: Vec<u64> = (0..DRAWS).map(|_| carried_on.next_u64()).collect();
+            let from_same: Vec<u64> = (0..DRAWS).map(|_| same.next_u64()).collect();
+            let from_other: Vec<u64> = (0..DRAWS).map(|_| other.next_u64()).collect();
+            let from_elsewhere: Vec<u64> = (0..DRAWS).map(|_| elsewhere.next_u64()).collect();
+
+            assert_eq!(
+                from_same, expected,
+                "{}: reseeding to the seed it already has changes nothing",
+                case.name
+            );
+            assert_eq!(
+                from_other, from_elsewhere,
+                "{}: another seed carries on from where this one stood",
+                case.name
+            );
+            assert_ne!(
+                from_other, expected,
+                "{}: another seed draws another sequence",
+                case.name
+            );
+            assert_eq!(
+                rng.reseeded(43).seed(),
+                43,
+                "{}: a reseeded generator answers to its new seed",
+                case.name
+            );
+        }
     }
 }

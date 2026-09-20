@@ -12,7 +12,7 @@
 //! # What a trace names, and what it does not hold
 //!
 //! The states themselves are not in it. A trace holds their **names**, which are addresses into a
-//! [`crate::store::StateStore`] or into a re-run of the seed the trace's header carries. So a trace
+//! [`crate::store::StateStore`] or into a re-run of what the trace's header and fork line name. So a trace
 //! read back out of a file can say what changed and when, and needs the store beside it to hand back
 //! a world. That is what the form is: an index, not a copy.
 //!
@@ -29,6 +29,19 @@
 //! the hash sits between the instant and the message rather than at the end of the line — the same
 //! discipline the state encoding in [`crate::world`] follows.
 //!
+//! A run that changed seed partway through says so on a line of its own under the header, and a run
+//! that did not writes nothing there:
+//!
+//! ```text
+//! chronoloop trace seed 7
+//! forked at 0.412881003s to seed 99
+//! step 0 0.000000000s 3f2a…c19 opener sent ping
+//! ```
+//!
+//! The header still names the seed the run started from, because up to that instant that is the run
+//! this was. What the fork adds is the rest of what it takes to produce these steps again — without
+//! it the file would name a run it is not, which is the one thing a header exists to prevent.
+//!
 //! **A step's number is written even though the line's position already gives it.** It is a checked
 //! redundancy rather than a second source of truth: reading a trace refuses one whose numbers do not
 //! run from zero, so a file that lost a line in the middle is turned away rather than quietly
@@ -43,11 +56,18 @@ use core::fmt;
 use core::str::FromStr;
 
 use crate::clock::{ParseVirtualTimeError, VirtualTime};
+use crate::fork::Fork;
 use crate::history::Entry;
 use crate::world::{ParseStateHashError, StateHash};
 
 /// The first line of a written trace, up to the seed itself.
 const HEADER: &str = "chronoloop trace seed ";
+
+/// What the line naming a fork opens with, before the instant the run changed seed at.
+const FORKED_AT: &str = "forked at ";
+
+/// What separates a fork's instant from the seed the run went on with.
+const TO_SEED: &str = " to seed ";
 
 /// What every record of a written trace opens with, before the step's own number.
 const STEP: &str = "step ";
@@ -193,18 +213,44 @@ fn count<T: FromStr>(text: &str) -> Option<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trace {
     seed: u64,
+    fork: Option<Fork>,
     steps: Vec<Step>,
 }
 
 impl Trace {
     /// Creates a trace of `steps`, produced by `seed`, in the order the run took them.
     pub fn new(seed: u64, steps: Vec<Step>) -> Self {
-        Self { seed, steps }
+        Self {
+            seed,
+            fork: None,
+            steps,
+        }
     }
 
-    /// Returns the seed the run was given, which is all that is needed to run it again.
+    /// Creates a trace of a run of `seed` that drew from `fork`'s seed after `fork`'s instant.
+    ///
+    /// The header still names the seed the run started from, because that is the run this one was
+    /// until the fork; what the fork adds is the rest of what it takes to produce these steps
+    /// again. A trace that left it out would name a run it is not.
+    pub fn forked(seed: u64, fork: Fork, steps: Vec<Step>) -> Self {
+        Self {
+            seed,
+            fork: Some(fork),
+            steps,
+        }
+    }
+
+    /// Returns the seed the run was given, which is what it started out drawing from.
+    ///
+    /// For a run that never forked that is the whole of what produces it again. For one that did,
+    /// [`Self::fork`] is the rest.
     pub fn seed(&self) -> u64 {
         self.seed
+    }
+
+    /// Returns where the run stopped drawing from its own seed, or `None` if it never did.
+    pub fn fork(&self) -> Option<Fork> {
+        self.fork
     }
 
     /// Returns the steps the run took, in order. The first of them is step zero.
@@ -225,6 +271,9 @@ impl Trace {
 impl fmt::Display for Trace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "{HEADER}{}", self.seed)?;
+        if let Some(fork) = self.fork {
+            writeln!(f, "{FORKED_AT}{}{TO_SEED}{}", fork.at(), fork.seed())?;
+        }
         for (number, step) in self.steps.iter().enumerate() {
             writeln!(f, "{STEP}{number} {step}")?;
         }
@@ -242,6 +291,8 @@ pub enum ParseTraceError {
     MissingHeader,
     /// The first line does not name the seed the way a trace's header does.
     BadHeader,
+    /// The line after the header opens like a fork but does not name one.
+    BadFork,
     /// A line does not open with the number a step is written with.
     Unnumbered {
         /// Which line it was, counting the header as line 1.
@@ -270,6 +321,11 @@ impl fmt::Display for ParseTraceError {
         match self {
             Self::MissingHeader => write!(f, "a trace is empty and names no seed"),
             Self::BadHeader => write!(f, "expected a first line reading \"{HEADER}<seed>\""),
+            Self::BadFork => write!(
+                f,
+                "line 2: expected \"{FORKED_AT}<instant>{TO_SEED}<seed>\", such as \
+                 \"{FORKED_AT}1.500000000s{TO_SEED}99\""
+            ),
             Self::Unnumbered { line } => {
                 write!(f, "line {line}: expected a step numbered \"{STEP}<n>\"")
             }
@@ -291,6 +347,7 @@ impl std::error::Error for ParseTraceError {
         match self {
             Self::MissingHeader
             | Self::BadHeader
+            | Self::BadFork
             | Self::Unnumbered { .. }
             | Self::OutOfSequence { .. } => None,
             Self::BadStep { source, .. } => Some(source),
@@ -309,10 +366,21 @@ impl FromStr for Trace {
             .and_then(count)
             .ok_or(ParseTraceError::BadHeader)?;
 
+        // A fork is written on its own line straight after the header, and only a run that forked
+        // has one. Whether it is there settles which line the first step falls on.
+        let records: Vec<&str> = lines.collect();
+        let (fork, records) = match records.split_first() {
+            Some((first, rest)) if first.starts_with(FORKED_AT) => (
+                Some(read_fork(first).ok_or(ParseTraceError::BadFork)?),
+                rest,
+            ),
+            _ => (None, records.as_slice()),
+        };
+        let first_step = if fork.is_some() { 3 } else { 2 };
+
         let mut steps = Vec::new();
-        for (offset, text) in lines.enumerate() {
-            // The header is line 1 and the first step is line 2.
-            let line = offset + 2;
+        for (offset, text) in records.iter().enumerate() {
+            let line = offset + first_step;
             let (number, record) = text
                 .strip_prefix(STEP)
                 .and_then(|numbered| numbered.split_once(' '))
@@ -333,8 +401,14 @@ impl FromStr for Trace {
                     .map_err(|source| ParseTraceError::BadStep { line, source })?,
             );
         }
-        Ok(Self::new(seed, steps))
+        Ok(Self { seed, fork, steps })
     }
+}
+
+/// Reads the line a forked trace names its fork on, or nothing if that is not what it is.
+fn read_fork(text: &str) -> Option<Fork> {
+    let (at, seed) = text.strip_prefix(FORKED_AT)?.split_once(TO_SEED)?;
+    Some(Fork::new(at.parse().ok()?, count(seed)?))
 }
 
 #[cfg(test)]
@@ -375,6 +449,44 @@ mod tests {
                 ),
             ],
         )
+    }
+
+    #[test]
+    fn a_forked_trace_says_where_it_stopped_being_the_run_it_names() {
+        // A trace's header is what a later run is built from, so a run that changed seed partway
+        // through has to say so or the file claims to be a run it is not. Pinned as a literal, for
+        // the reason the case below is.
+        let trace = Trace::forked(
+            7,
+            Fork::new(VirtualTime::from_nanos(3 * SECOND), 99),
+            sample().steps().to_vec(),
+        );
+        assert_eq!(
+            trace.to_string(),
+            "chronoloop trace seed 7\n\
+             forked at 3.000000000s to seed 99\n\
+             step 0 0.000000000s \
+             a06ce3f2f48a440ef815cf23196dd9db4915cd40a6ec60cc40a5d333d0d0e1a2 \
+             provisioning began\n\
+             step 1 3.000000000s \
+             079b29cd856e4a9dca5a9ce45edf71f91270b3cef2d383c22dd17da037b5c402 \
+             the standby caught up\n"
+        );
+        assert_eq!(trace.to_string().parse(), Ok(trace));
+    }
+
+    #[test]
+    fn a_trace_that_names_no_fork_is_the_run_its_seed_produces() {
+        assert_eq!(sample().fork(), None);
+        assert_eq!(
+            sample()
+                .to_string()
+                .lines()
+                .nth(1)
+                .map(|line| line.split(' ').next().unwrap_or_default()),
+            Some("step"),
+            "an unforked trace writes no line between the header and its first step"
+        );
     }
 
     #[test]
@@ -550,6 +662,59 @@ mod tests {
                 want: ParseTraceError::BadHeader,
             },
         ]);
+    }
+
+    #[test]
+    fn reading_a_trace_rejects_a_fork_line_it_could_not_have_written() {
+        // A line that opens like a fork is read as one rather than falling through to be read as a
+        // step: what is wrong with it is that it does not name a fork, and saying it is an
+        // unnumbered step would send a reader looking in the wrong place.
+        refused([
+            Refusal {
+                name: "an instant and no seed",
+                text: format!("{HEAD}\nforked at 1.500000000s\n"),
+                want: ParseTraceError::BadFork,
+            },
+            Refusal {
+                name: "a seed and no instant",
+                text: format!("{HEAD}\nforked at  to seed 99\n"),
+                want: ParseTraceError::BadFork,
+            },
+            Refusal {
+                name: "an instant that is not one",
+                text: format!("{HEAD}\nforked at halfway to seed 99\n"),
+                want: ParseTraceError::BadFork,
+            },
+            Refusal {
+                name: "a seed that is not a number",
+                text: format!("{HEAD}\nforked at 1.500000000s to seed lucky\n"),
+                want: ParseTraceError::BadFork,
+            },
+            Refusal {
+                name: "a seed wearing a sign",
+                text: format!("{HEAD}\nforked at 1.500000000s to seed +99\n"),
+                want: ParseTraceError::BadFork,
+            },
+        ]);
+    }
+
+    #[test]
+    fn a_fork_line_moves_the_steps_under_it_down_a_line() {
+        // The number a step is refused at is the number of the line it is on, which a fork line
+        // above it changes. Reported anywhere else, a person opening the file looks at the step
+        // before the one that is wrong.
+        let text = format!(
+            "{HEAD}\nforked at 1.500000000s to seed 99\nstep 1 0.000000000s {} began\n",
+            world(1).state_hash()
+        );
+        assert_eq!(
+            text.parse::<Trace>(),
+            Err(ParseTraceError::OutOfSequence {
+                line: 3,
+                expected: 0,
+                found: 1,
+            })
+        );
     }
 
     #[test]

@@ -61,8 +61,15 @@
 //! from the middle is refused. A trace is addressed by step, and two of its states can be told
 //! apart: [`diff`] walks both at once and stops wherever two subtrees answer to one name, so what
 //! comes back is the path down to each thing that moved and what stands there on either side, at a
-//! cost that is the size of the change rather than the size of the world. Running on from a step
-//! under another seed, and the shrinking, are not here yet.
+//! cost that is the size of the change rather than the size of the world. And a recorded step is
+//! somewhere a run can be sent off from: [`fork`] names the instant a step happened at, and a run
+//! given that instant and another seed draws from its own seed up to it and from the other one
+//! after — so the steps up to the fork are not an approximation of where the run had got to, they
+//! are the run, and the steps after it are another. [`ring`] is the system that shows it, a ring of
+//! nodes writing down what they hear. The shrinking is not here yet.
+//!
+//! [`fork`]: fork::fork
+//! [`ring`]: systems::ring
 //!
 //! [`diff`]: diff::diff
 //! [`VirtualClock`]: clock::VirtualClock
@@ -87,6 +94,7 @@ pub mod diff;
 pub mod event;
 pub mod executor;
 pub mod fault;
+pub mod fork;
 pub mod history;
 pub mod net;
 pub mod rng;
