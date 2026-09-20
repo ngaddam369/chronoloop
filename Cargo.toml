@@ -20,7 +20,7 @@ test = false
 
 [dependencies]
 # `default-features = false` keeps out the colour machinery (anstream, anstyle-*) and the
-# did-you-mean suggestions (strsim), neither of which a two-subcommand CLI needs. The features left
+# did-you-mean suggestions (strsim), neither of which a CLI of six subcommands needs. The features left
 # are the ones that make a mistyped invocation say so: argument parsing, help, usage and context.
 clap = { version = "4", default-features = false, features = [
     "std",

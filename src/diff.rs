@@ -1,4 +1,4 @@
-//! Telling two of a run's states apart.
+//! Reading a run's states: what stands in one, and what differs between two.
 //!
 //! [`crate::world`] names a state, [`crate::store`] keeps a run's states without a copy per step,
 //! and [`crate::trace`] puts them in order. None of that yet says what *changed*. A recorded run
@@ -8,6 +8,11 @@
 //!
 //! [`diff`] is that: two [`StateHash`]es and the store they are in, and back comes every difference
 //! between them, each one the path to where it is and what stands there on either side.
+//!
+//! [`list`] answers the question a comparison cannot — *what was the world at step seven?* — by
+//! writing one state out as what stands at every path of it, in the same form a comparison writes
+//! the side of a change in. The two read as one report because they share a vocabulary: a
+//! [`Path`] down to something, and the [`Contents`] standing there.
 //!
 //! # Why this costs what it changed
 //!
@@ -64,7 +69,7 @@ use core::fmt;
 use std::collections::BTreeSet;
 
 use crate::store::{Held, StateStore};
-use crate::world::{Name, StateHash, Value};
+use crate::world::{Name, Node, StateHash, Value};
 
 /// What a part that appeared is written with, the way a plan of infrastructure work writes it.
 const ADDED: char = '+';
@@ -249,6 +254,100 @@ impl fmt::Display for Changes {
     }
 }
 
+/// What stands at every leaf of one state, in the order their paths sort in.
+///
+/// Where [`Changes`] holds two states against each other, this is one state written out on its own:
+/// every leaf of it, named by the path down to it. That is the question a comparison cannot answer
+/// — *what was the world at step seven* — and it is why this sits beside the walk rather than in a
+/// module of its own.
+///
+/// A state lists as something whatever it holds: a branch with no children under it is written as
+/// itself, since there is nothing below it to write. So the lines are the paths of the state, and
+/// two states that list alike are one state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing(Vec<(Path, Contents)>);
+
+impl Listing {
+    /// Returns every leaf and where it is, in the order their paths sort in.
+    pub fn iter(&self) -> core::slice::Iter<'_, (Path, Contents)> {
+        self.0.iter()
+    }
+
+    /// Returns how many lines the state is written out in.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Returns `true` if there is nothing to write, which no state this walks ever is.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<'a> IntoIterator for &'a Listing {
+    type Item = &'a (Path, Contents);
+    type IntoIter = core::slice::Iter<'a, (Path, Contents)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl fmt::Display for Listing {
+    /// Writes one line per leaf, in the form a comparison writes the side of a change in.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (path, contents) in &self.0 {
+            writeln!(f, "{path} {contents}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Returns what stands at every leaf of `state`, from the root down.
+///
+/// This descends everywhere, and has to: a listing *is* the whole of the state, so there is nothing
+/// for it to stop at. The saving a comparison makes by stopping where two subtrees answer to one
+/// name has no counterpart here, and a walk of one state is the size of that state.
+///
+/// It takes the state itself rather than a store and a name because there is no walk to cut short:
+/// [`crate::store::StateStore::get`] hands back the whole tree in one go, and what this does to it
+/// is arithmetic.
+///
+/// ```
+/// use chronoloop::diff::list;
+/// use chronoloop::world::{Name, Resource, Snapshot, Value, World};
+///
+/// let world = World::new().with_resource(
+///     Name::new("database")?,
+///     Resource::new().with_field(Name::new("replicas")?, Value::Count(3)),
+/// );
+///
+/// assert_eq!(list(&world.snapshot()).to_string(), "database.replicas 3\n");
+/// # Ok::<(), chronoloop::world::NameError>(())
+/// ```
+pub fn list(state: &Node) -> Listing {
+    let mut leaves = Vec::new();
+    gather(&Path::root(), state, &mut leaves);
+    Listing(leaves)
+}
+
+/// Writes out what stands at `path` and everything under it.
+fn gather(path: &Path, state: &Node, leaves: &mut Vec<(Path, Contents)>) {
+    match state {
+        Node::Leaf(bytes) => leaves.push((path.clone(), Contents::Leaf(bytes.clone()))),
+        // A branch of nothing has no leaves to stand for it, so it stands for itself. Anything else
+        // is written by writing what is under it.
+        Node::Branch(children) if children.is_empty() => {
+            leaves.push((path.clone(), Contents::Branch(state.state_hash())));
+        }
+        Node::Branch(children) => {
+            for (name, child) in children {
+                gather(&path.then(name.clone()), child, leaves);
+            }
+        }
+    }
+}
+
 /// Returned when a comparison is asked for a state the store never saw.
 ///
 /// Only ever one of the two the caller named. A branch in the store cannot name a child that is
@@ -350,7 +449,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::clock::VirtualTime;
-    use crate::world::{Node, Resource, Snapshot, World};
+    use crate::world::{Resource, Snapshot, World};
 
     /// A name, failing the test rather than returning an error no case expects.
     fn name(text: &str) -> Name {
@@ -684,6 +783,133 @@ mod tests {
             (&changes).into_iter().count(),
             1,
             "a comparison iterates by reference"
+        );
+    }
+    /// The lines one state is written out in, which is what a reader of a listing is shown.
+    fn listed(state: &Node) -> Vec<String> {
+        list(state).to_string().lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn a_state_is_written_out_as_what_stands_at_every_path_of_it() {
+        // The other half of what a store keeps: a comparison says what moved, and this says what is
+        // there. Written as the lines a reader sees rather than as `Path`s and `Contents`, for the
+        // reason the comparison's cases are — an expectation built from the same calls the walk
+        // makes would agree with it whatever the walk did.
+        struct Case {
+            name: &'static str,
+            state: Node,
+            want: Vec<String>,
+        }
+        let empty = || Resource::new();
+        let line = |text: &str| text.to_owned();
+        let cases = [
+            Case {
+                name: "a world of two resources",
+                state: base().snapshot(),
+                want: vec![
+                    line("cache.warm true"),
+                    line("database.primary \"eu-west\""),
+                    line("database.replicas 3"),
+                ],
+            },
+            Case {
+                name: "every kind of value a field holds",
+                state: World::new()
+                    .with_resource(
+                        name("region"),
+                        Resource::new()
+                            .with_field(name("count"), Value::Count(4))
+                            .with_field(name("flag"), Value::Flag(false))
+                            .with_field(
+                                name("instant"),
+                                Value::Instant(VirtualTime::from_nanos(1_500_000_000)),
+                            )
+                            .with_field(name("text"), Value::Text("eu-west".into())),
+                    )
+                    .snapshot(),
+                want: vec![
+                    line("region.count 4"),
+                    line("region.flag false"),
+                    line("region.instant 1.500000000s"),
+                    line("region.text \"eu-west\""),
+                ],
+            },
+            Case {
+                name: "a value standing on its own",
+                state: Value::Count(3).snapshot(),
+                want: vec![format!("{} 3", Name::SEPARATOR)],
+            },
+            Case {
+                name: "bytes that are not a value this crate wrote",
+                state: Node::Leaf(vec![0xfe, 0xff]),
+                want: vec![format!("{} 0xfeff", Name::SEPARATOR)],
+            },
+            Case {
+                name: "a resource holding no fields",
+                state: World::new()
+                    .with_resource(name("cache"), empty())
+                    .with_resource(
+                        name("database"),
+                        Resource::new().with_field(name("replicas"), Value::Count(3)),
+                    )
+                    .snapshot(),
+                want: vec![
+                    format!("cache {}", empty().state_hash()),
+                    line("database.replicas 3"),
+                ],
+            },
+            Case {
+                name: "a world holding nothing at all",
+                state: World::new().snapshot(),
+                want: vec![format!("{} {}", Name::SEPARATOR, World::new().state_hash())],
+            },
+        ];
+        for case in cases {
+            assert_eq!(listed(&case.state), case.want, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn a_listing_is_read_in_the_order_the_paths_sort_in() {
+        // The order is the walk's, and the walk's order is the type's: a branch keeps its children
+        // in a `BTreeMap`, so descending one meets them in the order their names sort in. Built the
+        // other way round from the world above, which a `Vec` of children would remember and a map
+        // cannot.
+        let backwards = World::new()
+            .with_resource(
+                name("database"),
+                Resource::new()
+                    .with_field(name("replicas"), Value::Count(3))
+                    .with_field(name("primary"), Value::Text("eu-west".into())),
+            )
+            .with_resource(
+                name("cache"),
+                Resource::new().with_field(name("warm"), Value::Flag(true)),
+            );
+        assert_eq!(listed(&backwards.snapshot()), listed(&base().snapshot()));
+
+        let paths: Vec<String> = list(&base().snapshot())
+            .iter()
+            .map(|(path, _)| path.to_string())
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
+    }
+
+    #[test]
+    fn a_listing_says_how_many_lines_it_is_and_iterates_by_reference() {
+        let listing = list(&base().snapshot());
+        assert_eq!(listing.len(), 3, "a leaf apiece");
+        assert!(!listing.is_empty());
+        assert_eq!((&listing).into_iter().count(), listing.len());
+        assert_eq!(
+            (&listing)
+                .into_iter()
+                .next()
+                .map(|(path, _)| path.to_string()),
+            Some("cache.warm".to_owned())
         );
     }
 }

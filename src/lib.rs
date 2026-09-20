@@ -66,12 +66,21 @@
 //! given that instant and another seed draws from its own seed up to it and from the other one
 //! after — so the steps up to the fork are not an approximation of where the run had got to, they
 //! are the run, and the steps after it are another. [`ring`] is the system that shows it, a ring of
-//! nodes writing down what they hear. The shrinking is not here yet.
+//! nodes writing down what they hear.
+//!
+//! All of that is reachable from a terminal. `trace --seed <n>` writes a run's trace to a file, and
+//! `inspect --step`, `diff` and `fork --at` read one back: the first shows a step and, through
+//! [`list`], the world it left the run in; the second says what moved between two of them; the
+//! third sends the run off from one of them under another seed. A trace names states without
+//! holding them, so each of the three runs again what the file's header and fork line name and
+//! refuses to show anything at all if what comes out is not what is written down. The shrinking is
+//! not here yet.
 //!
 //! [`fork`]: fork::fork
 //! [`ring`]: systems::ring
 //!
 //! [`diff`]: diff::diff
+//! [`list`]: diff::list
 //! [`VirtualClock`]: clock::VirtualClock
 //! [`EventQueue`]: event::EventQueue
 //! [`Executor`]: executor::Executor
