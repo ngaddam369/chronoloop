@@ -58,9 +58,13 @@
 //! than holding them, so a run costs what it changed rather than a copy of the world per step. What
 //! puts those states in order is a [`Trace`]: for every step, the event and the name of the state it
 //! left the run in, written to a file and read back strictly enough that a file with a step missing
-//! from the middle is refused. The operations that scrub through a trace — showing one step, telling
-//! two apart, running on from one under another seed — and the shrinking are not here yet.
+//! from the middle is refused. A trace is addressed by step, and two of its states can be told
+//! apart: [`diff`] walks both at once and stops wherever two subtrees answer to one name, so what
+//! comes back is the path down to each thing that moved and what stands there on either side, at a
+//! cost that is the size of the change rather than the size of the world. Running on from a step
+//! under another seed, and the shrinking, are not here yet.
 //!
+//! [`diff`]: diff::diff
 //! [`VirtualClock`]: clock::VirtualClock
 //! [`EventQueue`]: event::EventQueue
 //! [`Executor`]: executor::Executor
@@ -79,6 +83,7 @@
 //! [`StateHash`]: world::StateHash
 
 pub mod clock;
+pub mod diff;
 pub mod event;
 pub mod executor;
 pub mod fault;

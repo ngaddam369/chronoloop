@@ -43,6 +43,18 @@
 //! chosen to line up with a neighbour's hash, which is a preimage search rather than an accident.
 //! What the lengths buy is that the argument does not have to be made again every time the encoding
 //! grows a field. They are the discipline, not the defence.
+//!
+//! # Reading a leaf back
+//!
+//! A [`Value`]'s half of the encoding has an inverse, [`Value::try_from`], so a comparison of two
+//! states can say a field went from three to four rather than that two hashes differ. It lives here
+//! beside what it undoes, because a decoder kept anywhere else is a second copy of the encoding to
+//! keep in step — the same reason [`crate::store`] never spells the encoding out again. It is
+//! strict where the encoding is exact, so no two runs of bytes read back as one value.
+//!
+//! What it does **not** do is read a branch. A branch's children are hashes rather than bytes, so
+//! what is under one is a question for a store rather than for a decoder, and a report that meets
+//! a branch prints the name it answers to and leaves the descent to whoever wants it.
 
 use core::fmt;
 use core::str::FromStr;
@@ -159,6 +171,11 @@ pub enum NameError {
         /// The name that was refused.
         name: String,
     },
+    /// The name carries the character that divides one name from the next in a path.
+    NotOnePart {
+        /// The name that was refused.
+        name: String,
+    },
 }
 
 impl fmt::Display for NameError {
@@ -169,6 +186,9 @@ impl fmt::Display for NameError {
             Self::NotOneLine { name } => {
                 write!(f, "a name must be a single line: {name:?}")
             }
+            Self::NotOnePart { name } => {
+                write!(f, "a name must be one part of a path: {name:?}")
+            }
         }
     }
 }
@@ -178,18 +198,28 @@ impl std::error::Error for NameError {}
 /// What one part of a state is called.
 ///
 /// A name is a key, and a key is what a comparison of two states prints as the path to what
-/// changed. A name holding a line ending would break the report that names it, the same way a
-/// two-line message would break a recorded history, so construction settles it rather than leaving
-/// it to whoever writes the report.
+/// changed. Two spellings would break that report, so both are settled here rather than left to
+/// whoever writes it: a name holding a line ending would break the line it is printed on, the same
+/// way a two-line message would break a recorded history, and a name holding [`Name::SEPARATOR`]
+/// would read as two names once the path around it was written out. A path is the only thing that
+/// tells a reader *where* a state changed, so a path that reads as something it is not is worse
+/// than no path at all.
+///
+/// Nothing about this reaches the encoding — a name is written there with its length in front of
+/// it, so what a name may hold is a question about the report and never about the hash.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Name(String);
 
 impl Name {
+    /// What divides one name from the next where a path is written out.
+    pub const SEPARATOR: char = '.';
+
     /// Creates a name.
     ///
     /// # Errors
     ///
-    /// Returns [`NameError`] if `name` is empty or carries a line ending.
+    /// Returns [`NameError`] if `name` is empty, carries a line ending, or carries
+    /// [`Name::SEPARATOR`].
     pub fn new(name: impl Into<String>) -> Result<Self, NameError> {
         let name = name.into();
         if name.is_empty() {
@@ -197,6 +227,9 @@ impl Name {
         }
         if name.contains(['\n', '\r']) {
             return Err(NameError::NotOneLine { name });
+        }
+        if name.contains(Self::SEPARATOR) {
+            return Err(NameError::NotOnePart { name });
         }
         Ok(Self(name))
     }
@@ -247,6 +280,124 @@ pub enum Value {
     Text(String),
     /// An instant of the run's simulated time.
     Instant(VirtualTime),
+}
+
+impl fmt::Display for Value {
+    /// Writes a value the way a comparison of two states shows one.
+    ///
+    /// Text is written in its escaped form and in quotes: escaped because a report is read by the
+    /// line and text holding a line ending would break the line it is shown on, and quoted so that
+    /// empty text shows as something and so a count is never read as the text of its digits.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Flag(flag) => write!(f, "{flag}"),
+            Self::Count(count) => write!(f, "{count}"),
+            Self::Text(text) => write!(f, "{text:?}"),
+            Self::Instant(at) => write!(f, "{at}"),
+        }
+    }
+}
+
+/// Errors returned when reading a [`Value`] back from the bytes a leaf holds.
+///
+/// A leaf's bytes are whatever the state that wrote them chose, so these say that the bytes are not
+/// a value *this* module wrote rather than that something is broken. A report reading a state built
+/// somewhere else falls back to showing the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DecodeValueError {
+    /// There are no bytes, so they name no kind.
+    Empty,
+    /// The leading byte is not a kind the encoding writes.
+    UnknownKind {
+        /// The byte that was found in place of a kind.
+        tag: u8,
+    },
+    /// The bytes after the kind are not as many as that kind is written with.
+    BadLength {
+        /// How many the kind is written with.
+        expected: usize,
+        /// How many there were.
+        found: usize,
+    },
+    /// A flag is written as a byte that is zero or one, and this is neither.
+    BadFlag {
+        /// The byte that was found in place of a flag.
+        found: u8,
+    },
+    /// Text is written as UTF-8, and this is not.
+    BadText,
+}
+
+impl fmt::Display for DecodeValueError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => write!(f, "a value opens with the kind it is, and this is empty"),
+            Self::UnknownKind { tag } => write!(f, "no value is written with a kind of {tag:#04x}"),
+            Self::BadLength { expected, found } => write!(
+                f,
+                "this kind of value is written in {expected} bytes, and this is {found}"
+            ),
+            Self::BadFlag { found } => {
+                write!(f, "a flag is written as 0 or 1, and this is {found}")
+            }
+            Self::BadText => write!(f, "text is written as UTF-8, and this is not"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeValueError {}
+
+/// Reads the eight bytes a count and an instant are each written as.
+fn eight(bytes: &[u8]) -> Result<[u8; 8], DecodeValueError> {
+    bytes.try_into().map_err(|_| DecodeValueError::BadLength {
+        expected: 8,
+        found: bytes.len(),
+    })
+}
+
+impl TryFrom<&[u8]> for Value {
+    type Error = DecodeValueError;
+
+    /// Reads back what [`Snapshot::snapshot`] wrote, and refuses anything else.
+    ///
+    /// Strict in the places the encoding is exact, so no two runs of bytes read back as one value:
+    /// a flag is one byte that is zero or one, a count and an instant are eight bytes each, and a
+    /// kind the encoding does not write is not guessed at.
+    ///
+    /// ```
+    /// use chronoloop::world::{Node, Snapshot, Value};
+    ///
+    /// let Node::Leaf(bytes) = Value::Count(3).snapshot() else {
+    ///     unreachable!("a value is a leaf")
+    /// };
+    /// assert_eq!(Value::try_from(bytes.as_slice()), Ok(Value::Count(3)));
+    ///
+    /// // Bytes a system wrote itself are not a value this module knows.
+    /// assert!(Value::try_from(b"anything".as_slice()).is_err());
+    /// ```
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        let (tag, rest) = bytes.split_first().ok_or(DecodeValueError::Empty)?;
+        match *tag {
+            FLAG_TAG => match rest {
+                [0] => Ok(Self::Flag(false)),
+                [1] => Ok(Self::Flag(true)),
+                [found] => Err(DecodeValueError::BadFlag { found: *found }),
+                _ => Err(DecodeValueError::BadLength {
+                    expected: 1,
+                    found: rest.len(),
+                }),
+            },
+            COUNT_TAG => Ok(Self::Count(u64::from_le_bytes(eight(rest)?))),
+            TEXT_TAG => core::str::from_utf8(rest)
+                .map(|text| Self::Text(text.to_owned()))
+                .map_err(|_| DecodeValueError::BadText),
+            INSTANT_TAG => Ok(Self::Instant(VirtualTime::from_nanos(u64::from_le_bytes(
+                eight(rest)?,
+            )))),
+            tag => Err(DecodeValueError::UnknownKind { tag }),
+        }
+    }
 }
 
 impl Snapshot for Value {
@@ -875,6 +1026,16 @@ mod tests {
                 text: "database\r",
                 usable: false,
             },
+            Case {
+                name: "a name carrying the separator",
+                text: "database.primary",
+                usable: false,
+            },
+            Case {
+                name: "a name that is nothing but the separator",
+                text: ".",
+                usable: false,
+            },
         ];
         for case in cases {
             assert_eq!(Name::new(case.text).is_ok(), case.usable, "{}", case.name);
@@ -895,6 +1056,175 @@ mod tests {
                 .to_string(),
             "a name must be a single line: \"database\\nprimary\""
         );
+        assert_eq!(
+            Name::new("database.primary")
+                .expect_err("a name holding the separator is refused")
+                .to_string(),
+            "a name must be one part of a path: \"database.primary\""
+        );
+    }
+
+    #[test]
+    fn a_value_reads_back_from_the_bytes_the_encoding_documents() {
+        // The bytes are written here as literals rather than taken from `snapshot`, so the two
+        // sides of the assertion do not come from one place. A round trip through both halves
+        // would stay green with a tag moved, because the encoder and the decoder would move
+        // together; this goes red and says which kind stopped agreeing with the documentation.
+        struct Case {
+            name: &'static str,
+            bytes: Vec<u8>,
+            value: Value,
+        }
+        let cases = [
+            Case {
+                name: "a flag that is off",
+                bytes: vec![0x00, 0],
+                value: Value::Flag(false),
+            },
+            Case {
+                name: "a flag that is on",
+                bytes: vec![0x00, 1],
+                value: Value::Flag(true),
+            },
+            Case {
+                name: "a count of nothing",
+                bytes: vec![0x01, 0, 0, 0, 0, 0, 0, 0, 0],
+                value: Value::Count(0),
+            },
+            Case {
+                name: "a count written least significant byte first",
+                bytes: vec![0x01, 1, 2, 0, 0, 0, 0, 0, 0],
+                value: Value::Count(513),
+            },
+            Case {
+                name: "the largest count there is",
+                bytes: vec![0x01, 255, 255, 255, 255, 255, 255, 255, 255],
+                value: Value::Count(u64::MAX),
+            },
+            Case {
+                name: "empty text",
+                bytes: vec![0x02],
+                value: Value::Text(String::new()),
+            },
+            Case {
+                name: "text running to the end of the bytes",
+                bytes: vec![0x02, b'e', b'u', b'-', b'w', b'e', b's', b't'],
+                value: Value::Text("eu-west".into()),
+            },
+            Case {
+                name: "text that is not ASCII",
+                bytes: vec![0x02, 0xc3, 0xa9],
+                value: Value::Text("é".into()),
+            },
+            Case {
+                name: "the start of the simulation",
+                bytes: vec![0x03, 0, 0, 0, 0, 0, 0, 0, 0],
+                value: Value::Instant(VirtualTime::ZERO),
+            },
+            Case {
+                name: "the end of virtual time",
+                bytes: vec![0x03, 255, 255, 255, 255, 255, 255, 255, 255],
+                value: Value::Instant(VirtualTime::from_nanos(u64::MAX)),
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                Value::try_from(case.bytes.as_slice()),
+                Ok(case.value.clone()),
+                "{}",
+                case.name
+            );
+            // And the two halves are each other's inverse, which is what keeps a decoded report
+            // from naming a value the state it read never held.
+            assert_eq!(
+                case.value.snapshot(),
+                Node::Leaf(case.bytes),
+                "{} is written the way it is read",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn reading_a_value_rejects_bytes_it_could_not_have_written() {
+        // Every kind is refused everything but the one spelling it is written in, so no two runs
+        // of bytes read back as one value and a report cannot claim a state was something it was
+        // not.
+        struct Case {
+            name: &'static str,
+            bytes: Vec<u8>,
+            want: DecodeValueError,
+        }
+        let cases = [
+            Case {
+                name: "no bytes at all",
+                bytes: Vec::new(),
+                want: DecodeValueError::Empty,
+            },
+            Case {
+                name: "a kind the encoding does not write",
+                bytes: vec![0x04],
+                want: DecodeValueError::UnknownKind { tag: 0x04 },
+            },
+            Case {
+                name: "a flag that is neither off nor on",
+                bytes: vec![0x00, 2],
+                want: DecodeValueError::BadFlag { found: 2 },
+            },
+            Case {
+                name: "a flag of no bytes",
+                bytes: vec![0x00],
+                want: DecodeValueError::BadLength {
+                    expected: 1,
+                    found: 0,
+                },
+            },
+            Case {
+                name: "a flag of two bytes",
+                bytes: vec![0x00, 1, 0],
+                want: DecodeValueError::BadLength {
+                    expected: 1,
+                    found: 2,
+                },
+            },
+            Case {
+                name: "a count one byte short",
+                bytes: vec![0x01, 0, 0, 0, 0, 0, 0, 0],
+                want: DecodeValueError::BadLength {
+                    expected: 8,
+                    found: 7,
+                },
+            },
+            Case {
+                name: "a count one byte long",
+                bytes: vec![0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                want: DecodeValueError::BadLength {
+                    expected: 8,
+                    found: 9,
+                },
+            },
+            Case {
+                name: "an instant one byte short",
+                bytes: vec![0x03, 0, 0, 0, 0, 0, 0, 0],
+                want: DecodeValueError::BadLength {
+                    expected: 8,
+                    found: 7,
+                },
+            },
+            Case {
+                name: "text that is not UTF-8",
+                bytes: vec![0x02, 0xff],
+                want: DecodeValueError::BadText,
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                Value::try_from(case.bytes.as_slice()),
+                Err(case.want),
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[test]

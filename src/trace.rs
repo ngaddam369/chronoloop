@@ -211,6 +211,15 @@ impl Trace {
     pub fn steps(&self) -> &[Step] {
         &self.steps
     }
+
+    /// Returns the step numbered `step`, or `None` if the run never reached it.
+    ///
+    /// A trace is addressed by step — that is what the number written on every record is for — and
+    /// this is the way in. What the step names is a state, which a [`crate::store::StateStore`]
+    /// hands back and a comparison tells from another.
+    pub fn at(&self, step: usize) -> Option<&Step> {
+        self.steps.get(step)
+    }
 }
 
 impl fmt::Display for Trace {
@@ -366,6 +375,28 @@ mod tests {
                 ),
             ],
         )
+    }
+
+    #[test]
+    fn a_trace_is_addressed_by_step() {
+        // A trace is an index, and this is the way in: a step number is what a person asks to be
+        // shown and what a report quotes, so it is what the trace answers to.
+        let trace = sample();
+        assert_eq!(
+            trace.at(0).map(Step::state),
+            Some(world(1).state_hash()),
+            "the first step is step zero"
+        );
+        assert_eq!(
+            trace.at(1).map(|step| step.event().message()),
+            Some("the standby caught up"),
+            "and the last of two is step one"
+        );
+        assert_eq!(
+            trace.at(2),
+            None,
+            "a run of two steps was never in a third state"
+        );
     }
 
     #[test]

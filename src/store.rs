@@ -19,7 +19,8 @@
 //! node's children before the node itself, and it is the only way in, so a branch in the store can
 //! never name a child that is not. Two things rest on that: [`StateStore::get`] can rebuild a whole
 //! state from its root without the tree it came from, and a walk of two states can descend a child
-//! at a time, stopping wherever two hashes agree, which is what a comparison of two steps will do.
+//! at a time, stopping wherever two hashes agree, which is what a comparison of two steps does —
+//! see [`StateStore::held`], the one-node-deep view that walk reads the store through.
 //!
 //! `insert` also reads the invariant back out: a node already in the store is a subtree already in
 //! the store, so it returns at once rather than walking what it would only find again. Re-storing
@@ -54,6 +55,21 @@ enum Stored {
     Leaf(Vec<u8>),
     /// Named parts, each one a state the store holds in its own right.
     Branch(BTreeMap<Name, StateHash>),
+}
+
+/// What the store holds under one name: the node's own contents, its children named rather than
+/// held.
+///
+/// This is [`Stored`] as a reader sees it, and it is the store's claim made public. [`StateStore::get`]
+/// rebuilds everything under a node, which is the wrong instrument for a walk that means to stop as
+/// soon as two children agree — that walk wants one level at a time, and a child's name is the hash
+/// it answers to, so descending is a second lookup rather than a second copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Held<'a> {
+    /// A value, as the bytes that stand for it.
+    Leaf(&'a [u8]),
+    /// Named parts, each one a state the store holds in its own right.
+    Branch(&'a BTreeMap<Name, StateHash>),
 }
 
 /// The states a run passed through, each node kept once under the name it answers to.
@@ -139,6 +155,36 @@ impl StateStore {
                 Some(Node::Branch(rebuilt))
             }
         }
+    }
+
+    /// Returns what the store holds under `hash`, one node deep.
+    ///
+    /// `None` if the store never saw it. Where [`StateStore::get`] rebuilds a whole state, this
+    /// hands back the node alone with its children named, which is what lets a comparison of two
+    /// states descend only where their hashes differ.
+    ///
+    /// ```
+    /// use chronoloop::store::{Held, StateStore};
+    /// use chronoloop::world::{Name, Resource, Snapshot, Value, World};
+    ///
+    /// let cache = Resource::new().with_field(Name::new("warm")?, Value::Flag(true));
+    /// let world = World::new().with_resource(Name::new("cache")?, cache.clone());
+    ///
+    /// let mut store = StateStore::new();
+    /// let hash = store.insert(&world.snapshot());
+    ///
+    /// let Some(Held::Branch(resources)) = store.held(hash) else {
+    ///     unreachable!("a world is a branch")
+    /// };
+    /// // The world names the cache by the hash the cache answers to on its own.
+    /// assert_eq!(resources.get(&Name::new("cache")?), Some(&cache.state_hash()));
+    /// # Ok::<(), chronoloop::world::NameError>(())
+    /// ```
+    pub fn held(&self, hash: StateHash) -> Option<Held<'_>> {
+        Some(match self.nodes.get(&hash)? {
+            Stored::Leaf(bytes) => Held::Leaf(bytes),
+            Stored::Branch(children) => Held::Branch(children),
+        })
     }
 
     /// Returns how many distinct nodes the store holds.
@@ -275,6 +321,56 @@ mod tests {
         // A state that is in the store brings everything it names with it, which is what lets a
         // comparison of two states descend into one of them a child at a time.
         reachable(&store, &snapshot);
+    }
+
+    #[test]
+    fn what_the_store_holds_under_a_name_comes_back_without_the_rest_of_it() {
+        // The shallow view a comparison of two states needs. `get` rebuilds everything under a
+        // node, which is the wrong instrument for a walk that means to stop as soon as two
+        // children agree, so the store also answers for one node at a time: a branch's children
+        // by name and hash, and a leaf's bytes.
+        let world = base();
+        let mut store = StateStore::new();
+        store.insert(&world.snapshot());
+
+        let Some(Held::Branch(resources)) = store.held(world.state_hash()) else {
+            panic!("a world is a branch the store holds")
+        };
+        assert_eq!(
+            resources.keys().map(Name::as_str).collect::<Vec<_>>(),
+            vec!["cache", "database"],
+            "a branch names its children in the order their names sort in"
+        );
+
+        let cache = world
+            .get(&name("cache"))
+            .unwrap_or_else(|| panic!("the world holds a cache"));
+        assert_eq!(
+            resources.get(&name("cache")),
+            Some(&cache.state_hash()),
+            "and names each one by the hash it answers to on its own"
+        );
+
+        let Some(Held::Branch(fields)) = store.held(cache.state_hash()) else {
+            panic!("a resource is a branch the store holds")
+        };
+        let warm = fields
+            .get(&name("warm"))
+            .unwrap_or_else(|| panic!("the cache holds a warm flag"));
+        let Node::Leaf(bytes) = Value::Flag(true).snapshot() else {
+            panic!("a value is a leaf")
+        };
+        assert_eq!(
+            store.held(*warm),
+            Some(Held::Leaf(&bytes)),
+            "a leaf is the bytes it holds"
+        );
+
+        assert_eq!(
+            store.held(World::new().state_hash()),
+            None,
+            "and a state the store never saw is not there to be looked at"
+        );
     }
 
     #[test]
