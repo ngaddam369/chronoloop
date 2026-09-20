@@ -55,8 +55,11 @@
 //! hashes, so two states are the same state exactly when they answer to one [`StateHash`], and
 //! a part of the world that did not change keeps the name it had. A [`StateStore`] takes that up:
 //! it keeps each node once under the name it answers to, with a branch naming its children rather
-//! than holding them, so a run costs what it changed rather than a copy of the world per step. The
-//! trace that scrubs through those states, and the shrinking, are not here yet.
+//! than holding them, so a run costs what it changed rather than a copy of the world per step. What
+//! puts those states in order is a [`Trace`]: for every step, the event and the name of the state it
+//! left the run in, written to a file and read back strictly enough that a file with a step missing
+//! from the middle is refused. The operations that scrub through a trace — showing one step, telling
+//! two apart, running on from one under another seed — and the shrinking are not here yet.
 //!
 //! [`VirtualClock`]: clock::VirtualClock
 //! [`EventQueue`]: event::EventQueue
@@ -70,6 +73,7 @@
 //! [`pingpong`]: systems::pingpong
 //! [`Recording`]: history::Recording
 //! [`StateStore`]: store::StateStore
+//! [`Trace`]: trace::Trace
 //! [`World`]: world::World
 //! [`Snapshot`]: world::Snapshot
 //! [`StateHash`]: world::StateHash
@@ -83,4 +87,5 @@ pub mod net;
 pub mod rng;
 pub mod store;
 pub mod systems;
+pub mod trace;
 pub mod world;
