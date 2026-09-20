@@ -296,6 +296,37 @@ fn forking_writes_a_trace_that_says_what_produces_it_again() {
 }
 
 #[test]
+fn a_fork_back_to_a_traces_own_seed_writes_the_trace_back_out() {
+    // The cheapest check on the whole mechanism, made across two processes and a file on disk: a
+    // fork that cannot reproduce its own run has nothing to say about any other. The recorded side
+    // is a file one process wrote and the forked side is what another made of it, which is the
+    // argument that made `replay` take a path rather than a seed.
+    //
+    // What comes back is the file itself with one line inserted, because the fork changes what is
+    // drawn after the instant and the seed it changes to is the seed already being drawn from.
+    let path = recorded_trace("unforked.trace");
+    let text = fs::read_to_string(&path).expect("the trace was just written");
+
+    let forked = chronoloop(&["fork", arg(&path), "--at", "7", "--seed", SEED]);
+    assert!(forked.status.success(), "{}", stderr(&forked));
+
+    let shown = stdout(&forked);
+    let written: Vec<&str> = shown.lines().collect();
+    let recorded: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        written.first(),
+        recorded.first(),
+        "the header still names the run it was until the fork"
+    );
+    assert_eq!(written[1], "forked at 2.879111427s to seed 20260919");
+    assert_eq!(
+        &written[2..],
+        &recorded[1..],
+        "and every step below it is the step the run took"
+    );
+}
+
+#[test]
 fn a_trace_the_run_no_longer_produces_is_refused_rather_than_shown() {
     // The check that makes everything above worth reading: what is shown comes out of a run, and a
     // file the run does not produce is a file about nothing.
