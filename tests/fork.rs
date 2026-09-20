@@ -9,73 +9,14 @@
 //! Two of the cases below carry their own caveat, because the shapes they take are the shapes that
 //! read like more coverage than they are. They are marked where they sit.
 
-use std::collections::BTreeSet;
-
 use chronoloop::diff::diff;
-use chronoloop::fork::{Fork, fork};
 use chronoloop::store::StateStore;
-use chronoloop::systems::ring;
 use chronoloop::trace::Trace;
-use chronoloop::world::{Node, StateHash};
 
-/// The seed the cases run, since none of them is about a particular one.
-const SEED: u64 = 20_260_919;
+#[path = "common/timeline.rs"]
+mod timeline;
 
-/// The seed a fork sends a run off to.
-const OTHER: u64 = 99;
-
-/// How many steps the ring takes, which is what a fork point is chosen out of.
-const STEPS: usize = 20;
-
-/// Runs the ring, failing the test rather than returning an error no case expects.
-fn run(seed: u64) -> (Trace, StateStore) {
-    ring::run(seed).unwrap_or_else(|e| panic!("seed {seed} did not finish: {e}"))
-}
-
-/// Forks a run of `seed` at `step`, failing the test rather than returning an error no case expects.
-fn forked(seed: u64, step: usize, to: u64) -> (Fork, Trace, StateStore) {
-    let (original, _) = run(seed);
-    let at = fork(&original, step, to)
-        .unwrap_or_else(|e| panic!("a run of {STEPS} steps reached step {step}: {e}"));
-    let (trace, store) =
-        ring::forked(seed, at).unwrap_or_else(|e| panic!("the fork did not finish: {e}"));
-    (at, trace, store)
-}
-
-/// The tree the store holds under `hash`, failing the test if it holds none.
-fn state(store: &StateStore, hash: StateHash) -> Node {
-    store
-        .get(hash)
-        .unwrap_or_else(|| panic!("a run's store keeps every state the run passed through"))
-}
-
-/// Puts every state `trace` names into `store`, reading them out of the one that kept them.
-fn merge(store: &mut StateStore, trace: &Trace, kept: &StateStore) {
-    for step in trace.steps() {
-        store.insert(&state(kept, step.state()));
-    }
-}
-
-/// Every distinct node in the trees of the states `trace` names, walked rather than counted.
-///
-/// The store's own arithmetic done the other way round, so a count checked against this is not the
-/// store agreeing with itself.
-fn nodes(trace: &Trace, kept: &StateStore) -> BTreeSet<StateHash> {
-    fn walk(tree: &Node, seen: &mut BTreeSet<StateHash>) {
-        seen.insert(tree.state_hash());
-        if let Node::Branch(children) = tree {
-            for child in children.values() {
-                walk(child, seen);
-            }
-        }
-    }
-
-    let mut seen = BTreeSet::new();
-    for step in trace.steps() {
-        walk(&state(kept, step.state()), &mut seen);
-    }
-    seen
-}
+use timeline::{OTHER, SEED, STEPS, forked, merge, nodes, run};
 
 #[test]
 fn forking_to_the_seed_the_run_already_had_changes_nothing() {
@@ -89,7 +30,7 @@ fn forking_to_the_seed_the_run_already_had_changes_nothing() {
     // key partway through.
     for step in [0, 1, 7, STEPS - 1] {
         let (original, _) = run(SEED);
-        let (at, again, _) = forked(SEED, step, SEED);
+        let (at, again, _) = forked(&original, step, SEED);
         assert_eq!(
             again.steps(),
             original.steps(),
@@ -110,7 +51,7 @@ fn every_step_up_to_the_fork_is_the_step_the_run_took() {
     // the wrong state, since both runs then name the wrong one alike.
     for step in [0, 1, 7, STEPS - 1] {
         let (original, _) = run(SEED);
-        let (_, forked, _) = forked(SEED, step, OTHER);
+        let (_, forked, _) = forked(&original, step, OTHER);
         assert_eq!(
             &forked.steps()[..=step],
             &original.steps()[..=step],
@@ -128,7 +69,7 @@ fn the_steps_after_a_fork_are_another_run() {
     // what the steps themselves say.
     for step in [0, 1, 7] {
         let (original, _) = run(SEED);
-        let (_, forked, _) = forked(SEED, step, OTHER);
+        let (_, forked, _) = forked(&original, step, OTHER);
         assert_ne!(
             &forked.steps()[step + 1..],
             &original.steps()[step + 1..],
@@ -150,7 +91,7 @@ fn a_fork_costs_a_store_its_tail_and_not_a_second_run() {
     // much.
     let step = 7;
     let (original, kept) = run(SEED);
-    let (_, forked, forked_kept) = forked(SEED, step, OTHER);
+    let (_, forked, forked_kept) = forked(&original, step, OTHER);
     let (elsewhere, elsewhere_kept) = run(OTHER);
 
     let mut store = StateStore::new();
@@ -190,7 +131,7 @@ fn a_comparison_says_what_the_other_timeline_did() {
     // a node, and the nodes named are nodes the ring has — since which fields moved is a fact about
     // a seed rather than about the engine.
     let (original, kept) = run(SEED);
-    let (_, forked, forked_kept) = forked(SEED, 7, OTHER);
+    let (_, forked, forked_kept) = forked(&original, 7, OTHER);
 
     let mut store = StateStore::new();
     merge(&mut store, &original, &kept);
@@ -233,7 +174,7 @@ fn a_recorded_fork_is_forked_again_unchanged() {
     // first step they do not — beside the original's own, so the parting is on the page — and the
     // last step of all, which depends on every draw made after the fork.
     let (original, _) = run(SEED);
-    let (_, forked, _) = forked(SEED, 7, OTHER);
+    let (_, forked, _) = forked(&original, 7, OTHER);
 
     let text = forked.to_string();
     let written: Vec<&str> = text.lines().collect();
@@ -279,7 +220,8 @@ fn a_recorded_fork_is_forked_again_unchanged() {
 fn a_forked_trace_survives_being_written_out_and_read_back() {
     // A fork's trace is the artifact a fork produces, so it has to say what it takes to produce
     // these steps again — the seed the run started from *and* where it stopped being that run.
-    let (at, forked, _) = forked(SEED, 7, OTHER);
+    let (original, _) = run(SEED);
+    let (at, forked, _) = forked(&original, 7, OTHER);
     let read_back: Trace = forked
         .to_string()
         .parse()

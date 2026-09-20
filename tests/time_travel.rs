@@ -19,94 +19,36 @@
 //! What each layer holds, and what it does not:
 //!
 //! - The **cheap cases** run in CI and are a spread of seeds rather than a scale.
-//! - The **pinned counts** are recorded from actual runs, so they fail if anything upstream of the
-//!   states moves — the encoding, what the wire draws, the order events fire in — and
-//!   `make local-validation` holds debug and release against the same numbers.
+//! - The **pinned counts** are recorded from actual runs, and what they hold is which of the states
+//!   coincide — so they move with what the wire draws and the order events fire in, since those are
+//!   what decide where two timelines part and what each one passes through on the way. They are
+//!   **blind to the encoding**, and not by luck: both numbers count *distinct* nodes, and distinctness
+//!   survives any injective change to the bytes a node hashes to, so changing a tag or a length
+//!   prefix moves every hash in the engine and leaves these two numbers exactly where they were.
+//!   `tests/world.rs` and the pinned traces are what hold the encoding to account. `make
+//!   local-validation` holds debug and release against the same numbers.
 //! - The **sweeps** are the same checks at a scale where one seed's run cannot be a coincidence.
 //!   Note what they do not say: a sweep of the no-op says nothing about where a fork to a
 //!   *different* seed parts from the run, which `tests/fork.rs` holds; and a node count says
 //!   nothing about the states being the right states, which the pinned traces hold.
 //!
-//! The two sides of the no-op reach their steps by different routes through [`ring`]: [`ring::run`]
-//! draws from a plain generator throughout, [`ring::forked`] from one that asks the clock before
-//! every draw and changes key partway through. Neither is the other compared with itself.
+//! The two sides of the no-op reach their steps by different routes through the ring:
+//! `ring::run` draws from a plain generator throughout, `ring::forked` from one that asks the clock
+//! before every draw and changes key partway through. Neither is the other compared with itself.
 
 use std::collections::BTreeSet;
 
-use chronoloop::fork::{Fork, fork};
 use chronoloop::store::StateStore;
-use chronoloop::systems::ring;
 use chronoloop::trace::Trace;
-use chronoloop::world::{Node, StateHash};
 
-/// The seed the recorded cases run, since none of them is about a particular one.
-const SEED: u64 = 20_260_919;
+#[path = "common/timeline.rs"]
+mod timeline;
 
-/// The seed a fork sends a run off to, where a case wants a run that parts from the original.
-const OTHER: u64 = 99;
-
-/// How many steps a run of the ring takes, which is what a fork point is chosen out of.
-const STEPS: usize = 20;
+use timeline::{OTHER, SEED, STEPS, forked, merge, nodes, run};
 
 /// The spread the cheap cases run, rather than a scale: either end of the range, the two adjacent
 /// seeds the crate's distinctness cases use, and the seed every recorded number here comes from.
 const SPREAD: [u64; 5] = [0, 1, 42, SEED, u64::MAX];
-
-/// Runs the ring, failing the test rather than returning an error no case expects.
-fn run(seed: u64) -> (Trace, StateStore) {
-    let (trace, store) =
-        ring::run(seed).unwrap_or_else(|e| panic!("seed {seed} did not finish: {e}"));
-    assert_eq!(trace.steps().len(), STEPS, "a run of seed {seed}");
-    (trace, store)
-}
-
-/// Runs `trace`'s seed again, drawing from `to` once the run is past the instant of `step`.
-///
-/// The original is taken rather than re-run, so a case sweeping every step of a run pays for that
-/// run once.
-fn forked(trace: &Trace, step: usize, to: u64) -> (Fork, Trace, StateStore) {
-    let at = fork(trace, step, to)
-        .unwrap_or_else(|e| panic!("a run of {STEPS} steps reached step {step}: {e}"));
-    let (forked, store) = ring::forked(trace.seed(), at)
-        .unwrap_or_else(|e| panic!("the fork at step {step} did not finish: {e}"));
-    (at, forked, store)
-}
-
-/// The tree the store holds under `hash`, failing the test if it holds none.
-fn state(store: &StateStore, hash: StateHash) -> Node {
-    store
-        .get(hash)
-        .unwrap_or_else(|| panic!("a run's store keeps every state the run passed through"))
-}
-
-/// Puts every state `trace` names into `store`, reading them out of the one that kept them.
-fn merge(store: &mut StateStore, trace: &Trace, kept: &StateStore) {
-    for step in trace.steps() {
-        store.insert(&state(kept, step.state()));
-    }
-}
-
-/// Every distinct node in the trees of the states `trace` names, walked rather than counted.
-///
-/// The store's own arithmetic done the other way round: the trees come back out of the run's own
-/// store and are hashed again here, so a count checked against this is not one store agreeing with
-/// itself.
-fn nodes(trace: &Trace, kept: &StateStore) -> BTreeSet<StateHash> {
-    fn walk(tree: &Node, seen: &mut BTreeSet<StateHash>) {
-        seen.insert(tree.state_hash());
-        if let Node::Branch(children) = tree {
-            for child in children.values() {
-                walk(child, seen);
-            }
-        }
-    }
-
-    let mut seen = BTreeSet::new();
-    for step in trace.steps() {
-        walk(&state(kept, step.state()), &mut seen);
-    }
-    seen
-}
 
 /// Checks that forking `seed`'s run back to `seed` at every one of its steps leaves it unchanged.
 fn no_fork_of_its_own_seed_changes_a_run(seed: u64) {
@@ -132,6 +74,16 @@ fn no_fork_of_its_own_seed_changes_a_run(seed: u64) {
 /// own, walked out of the trees rather than asked of any store. The second is what the store holding
 /// all of them actually costs, which is the thing under test.
 fn shared_and_apart(seed: u64) -> (usize, usize) {
+    // Every fork below goes to OTHER, so a run of that seed would be forked to the seed it already
+    // has — which is the no-op the case above asserts. All twenty-one timelines would then be one
+    // run, and both numbers would report a run against itself: the ratio would pass, the store would
+    // hold seventy nodes, and nothing about sharing would have been measured. Settled here, where
+    // the pair is built, so widening either caller's range cannot walk into it.
+    assert_ne!(
+        seed, OTHER,
+        "a run forked to the seed it already has is the same run twenty-one times over"
+    );
+
     let (original, kept) = run(seed);
     let mut store = StateStore::new();
     let mut walked = BTreeSet::new();
@@ -187,8 +139,11 @@ fn a_run_and_every_fork_of_it_cost_one_prefix_between_them() {
         shared * 2 < apart,
         "twenty-one timelines cost {apart} nodes in stores of their own and {shared} sharing one"
     );
-    // Recorded from an actual run rather than derived here, so a change anywhere upstream of the
-    // states says so. `make local-validation` holds both profiles against the same pair.
+    // Recorded from an actual run rather than derived here, and the two halves are not worth the
+    // same. The first is the ring's shape and nothing else: twenty-one timelines of seventy nodes
+    // apiece, which is what any run of it costs whatever it draws — see the sweep below, where that
+    // is spelled out. The second is the one that moves with what this seed drew, and the one the
+    // case is for. `make local-validation` holds both profiles against the same pair.
     assert_eq!(
         (apart, shared),
         (1_470, 475),

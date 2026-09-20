@@ -314,6 +314,11 @@ fn a_fork_back_to_a_traces_own_seed_writes_the_trace_back_out() {
     let written: Vec<&str> = shown.lines().collect();
     let recorded: Vec<&str> = text.lines().collect();
     assert_eq!(
+        written.len(),
+        STEPS + 2,
+        "a header, a fork, and a step apiece"
+    );
+    assert_eq!(
         written.first(),
         recorded.first(),
         "the header still names the run it was until the fork"
