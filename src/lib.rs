@@ -73,11 +73,21 @@
 //! [`list`], the world it left the run in; the second says what moved between two of them; the
 //! third sends the run off from one of them under another seed. A trace names states without
 //! holding them, so each of the three runs again what the file's header and fork line name and
-//! refuses to show anything at all if what comes out is not what is written down. The shrinking is
-//! not here yet.
+//! refuses to show anything at all if what comes out is not what is written down.
+//!
+//! What none of that can say is whether a run was **all right**. An [`Outcome`] is that verdict: a
+//! run either held up or it broke, and a failure carries what broke and the step of the trace it
+//! broke at — so the thing to read next is the step the verdict names. Two failures are the same
+//! failure when their reasons agree, and not when the steps they surfaced at do, because cutting a
+//! schedule down moves a step and leaves the failure standing; that is the question a reduction has
+//! to ask of every candidate it tries. [`quorum`] is the system that shows it: a coordinator asking
+//! five replicas to acknowledge it, round after round, over a wire that takes time and does nothing
+//! else — so the only thing that can cost a round its quorum is the [`FaultSchedule`] the run was
+//! given. The reduction itself is not here yet.
 //!
 //! [`fork`]: fork::fork
 //! [`ring`]: systems::ring
+//! [`quorum`]: systems::quorum
 //!
 //! [`diff`]: diff::diff
 //! [`list`]: diff::list
@@ -90,6 +100,7 @@
 //! [`Network`]: net::Network
 //! [`VirtualNetwork`]: net::VirtualNetwork
 //! [`FaultSchedule`]: fault::FaultSchedule
+//! [`Outcome`]: outcome::Outcome
 //! [`pingpong`]: systems::pingpong
 //! [`Recording`]: history::Recording
 //! [`StateStore`]: store::StateStore
@@ -106,6 +117,7 @@ pub mod fault;
 pub mod fork;
 pub mod history;
 pub mod net;
+pub mod outcome;
 pub mod rng;
 pub mod store;
 pub mod systems;
