@@ -20,7 +20,10 @@ use crate::clock::{ParseVirtualTimeError, VirtualTime};
 use crate::net::{NodeId, Odds, OddsError};
 
 /// The first line of a written schedule.
-const HEADER: &str = "chronoloop faults";
+///
+/// Reachable across the crate because a schedule is written inside other forms — a repro
+/// nests one whole — and a header spelled a second time is a second thing to keep in step.
+pub(crate) const HEADER: &str = "chronoloop faults";
 
 /// How an end that never comes is written.
 const FOREVER: &str = "forever";

@@ -28,8 +28,41 @@
 //! neighbouring bug, and it would reject nearly every sound reduction on the way — a schedule that
 //! barely shrinks is not a repro anyone can read. What keeps the reduction honest instead is the
 //! reason being written to name *what* broke rather than the incidental numbers around it.
+//!
+//! # Written, and read back
+//!
+//! An outcome is one line, and that line reads back into the outcome it was written from. The
+//! reader sits here beside the writer for the reason the state encoding lives in [`crate::world`]
+//! and is never spelled a second time: a form written in two places is two things to keep in step.
+//!
+//! It is earned by something taking an outcome as **input**. A [`crate::repro`] names the failure a
+//! later run is expected to produce, and that run is checked against what the file says — so the
+//! line has to survive the trip. [`crate::diff`]'s report has no reader for exactly the opposite
+//! reason: nothing reads a comparison back.
 
 use core::fmt;
+use core::str::FromStr;
+
+/// How a run that held up is written.
+const PASSED: &str = "passed";
+
+/// How a failure opens.
+const FAILED_AT: &str = "failed at step ";
+
+/// What stands between a failure's step and its reason.
+const BECAUSE: &str = ": ";
+
+/// Reads a step the one way a written outcome writes one.
+///
+/// Digits and nothing else, so a sign is refused rather than quietly taken for what it precedes:
+/// the text an outcome is read from has to be text an outcome would have written. [`crate::trace`]
+/// reads its step numbers under the same rule.
+fn step(text: &str) -> Option<usize> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
 
 /// Returned when a reason could not be used as one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,9 +165,57 @@ impl Outcome {
 impl fmt::Display for Outcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Pass => write!(f, "passed"),
-            Self::Fail { reason, step } => write!(f, "failed at step {step}: {reason}"),
+            Self::Pass => write!(f, "{PASSED}"),
+            Self::Fail { reason, step } => write!(f, "{FAILED_AT}{step}{BECAUSE}{reason}"),
         }
+    }
+}
+
+/// Returned when an outcome could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ParseOutcomeError {
+    /// The text is not an outcome this form would have written.
+    Malformed,
+}
+
+impl fmt::Display for ParseOutcomeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Malformed => write!(
+                f,
+                "expected \"{PASSED}\", or a failure written as \"{FAILED_AT}<n>{BECAUSE}<reason>\""
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ParseOutcomeError {}
+
+impl FromStr for Outcome {
+    type Err = ParseOutcomeError;
+
+    /// Reads back what [`fmt::Display`] wrote, and nothing else.
+    ///
+    /// A reason that is empty or spans lines collapses to [`ParseOutcomeError::Malformed`] rather
+    /// than carrying a [`ReasonError`] out, the way [`crate::history::Entry`] treats a message it
+    /// cannot take: such text is simply not something this form ever wrote, and collapsing it keeps
+    /// the error `Copy`.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        if text == PASSED {
+            return Ok(Self::Pass);
+        }
+        let failure = text
+            .strip_prefix(FAILED_AT)
+            .ok_or(ParseOutcomeError::Malformed)?;
+        // The first separator, since the step before it is digits alone — which is what lets a
+        // reason carry one of its own.
+        let (at, reason) = failure
+            .split_once(BECAUSE)
+            .ok_or(ParseOutcomeError::Malformed)?;
+        let at = step(at).ok_or(ParseOutcomeError::Malformed)?;
+        let reason = Reason::new(reason).map_err(|_| ParseOutcomeError::Malformed)?;
+        Ok(Self::Fail { reason, step: at })
     }
 }
 
@@ -309,6 +390,122 @@ mod tests {
             .to_string(),
             "a reason must be a single line: \"lost\\nquorum\"",
             "the reason is escaped, so a line ending shows up as one"
+        );
+    }
+
+    #[test]
+    fn an_outcome_read_back_is_the_outcome_that_was_written() {
+        // The failure line of a repro file is this form, so what `Display` writes has to come back
+        // as the value it was written from.
+        struct Case {
+            name: &'static str,
+            outcome: Outcome,
+        }
+        let cases = [
+            Case {
+                name: "a run that held up",
+                outcome: Outcome::Pass,
+            },
+            Case {
+                name: "a run that broke",
+                outcome: failed("round 3 lost quorum", 11),
+            },
+            Case {
+                name: "a run that broke at its very first step",
+                outcome: failed("round 1 lost quorum", 0),
+            },
+            Case {
+                name: "a reason carrying the separator the step is cut off at",
+                outcome: failed("round 3: lost quorum, 2 of 5", 11),
+            },
+            Case {
+                name: "a step no trace could hold, which is still a step",
+                outcome: failed("round 3 lost quorum", usize::MAX),
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                case.outcome.to_string().parse(),
+                Ok(case.outcome.clone()),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn reading_an_outcome_rejects_text_it_could_not_have_written() {
+        // Strict enough to accept only what `Display` writes: a repro's failure line is what one
+        // failure is told from another, so text that is nearly a failure is not one.
+        struct Case {
+            name: &'static str,
+            text: &'static str,
+        }
+        let cases = [
+            Case {
+                name: "nothing at all",
+                text: "",
+            },
+            Case {
+                name: "a verdict in another case",
+                text: "Passed",
+            },
+            Case {
+                name: "a verdict with something after it",
+                text: "passed ",
+            },
+            Case {
+                name: "a failure that says nothing about where",
+                text: "failed",
+            },
+            Case {
+                name: "a step that is not a number",
+                text: "failed at step one: round 3 lost quorum",
+            },
+            Case {
+                name: "a signed step, which a written outcome never carries",
+                text: "failed at step +1: round 3 lost quorum",
+            },
+            Case {
+                name: "a step below the first one",
+                text: "failed at step -1: round 3 lost quorum",
+            },
+            Case {
+                name: "no step at all",
+                text: "failed at step : round 3 lost quorum",
+            },
+            Case {
+                name: "a step past every step there could be",
+                text: "failed at step 99999999999999999999999999: round 3 lost quorum",
+            },
+            Case {
+                name: "a step with no reason after it",
+                text: "failed at step 11:",
+            },
+            Case {
+                name: "a reason that says nothing",
+                text: "failed at step 11: ",
+            },
+            Case {
+                name: "two lines, which one reason is not",
+                text: "failed at step 11: round 3 lost quorum\nround 4 lost quorum",
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                case.text.parse::<Outcome>(),
+                Err(ParseOutcomeError::Malformed),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn an_outcome_that_could_not_be_read_says_what_was_expected() {
+        assert_eq!(
+            ParseOutcomeError::Malformed.to_string(),
+            "expected \"passed\", or a failure written as \"failed at step <n>: <reason>\""
         );
     }
 }

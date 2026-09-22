@@ -93,6 +93,14 @@
 //! without, and the failure the run under them produces — which is what turns a schedule a sweep
 //! threw at a run into a repro a person can read.
 //!
+//! A reduction dies with the process that made it, and a [`Repro`] is what outlives one: the seed, the
+//! faults the failure could not do without, and the failure to expect out the other end, written to a
+//! file of a few hundred bytes and read back. It invents no form of its own — the failure is an
+//! [`Outcome`] as an outcome writes itself, and everything under it is a [`FaultSchedule`] as a
+//! schedule writes itself, header and all, so the tail of a repro file is a schedule file. A failing
+//! run of a five-node system comes to under a third of a kilobyte, which is small enough to commit as
+//! a fixture and hand to a run months later.
+//!
 //! [`fork`]: fork::fork
 //! [`ring`]: systems::ring
 //! [`quorum`]: systems::quorum
@@ -111,6 +119,7 @@
 //! [`Outcome`]: outcome::Outcome
 //! [`shrink`]: shrink::shrink
 //! [`Reduction`]: shrink::Reduction
+//! [`Repro`]: repro::Repro
 //! [`pingpong`]: systems::pingpong
 //! [`Recording`]: history::Recording
 //! [`StateStore`]: store::StateStore
@@ -128,6 +137,7 @@ pub mod fork;
 pub mod history;
 pub mod net;
 pub mod outcome;
+pub mod repro;
 pub mod rng;
 pub mod shrink;
 pub mod store;
