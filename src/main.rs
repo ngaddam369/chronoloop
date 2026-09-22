@@ -1,13 +1,34 @@
-//! chronoloop's command line: run a simulation, and go back through what it left behind.
+//! chronoloop's command line: run a simulation, go back through what it left behind, and cut a
+//! failure down to what caused it.
 //!
-//! There are two things a run leaves behind, and a family of commands for each. A recorded history
-//! is what *happened*: `run --seed <n>` writes one and `replay <path>` reads one back, runs the
-//! seed it names again and compares. A trace is what happened **and what the world became**:
-//! `trace --seed <n>` writes one, and `inspect`, `diff` and `fork` read one back.
+//! There are three things a run leaves behind, and a family of commands for each. A recorded
+//! history is what *happened*: `run --seed <n>` writes one and `replay <path>` reads one back, runs
+//! the seed it names again and compares. A trace is what happened **and what the world became**:
+//! `trace --seed <n>` writes one, and `inspect`, `diff` and `fork` read one back. A repro is a run
+//! that **broke**: `check` says whether a seed survives a schedule of faults, `shrink` cuts a
+//! failing schedule down to the faults the failure could not do without and writes what is left,
+//! and `reproduce <path>` reads one back and holds a later run to it.
 //!
-//! In both families the recorded side and the re-run side are separate processes reading a file. A
-//! check whose two sides both came from one run would only be comparing a pure function with
-//! itself.
+//! In all three families the recorded side and the re-run side are separate processes reading a
+//! file. A check whose two sides both came from one run would only be comparing a pure function
+//! with itself.
+//!
+//! # A verdict goes where a complaint goes
+//!
+//! Good news leaves on standard output and the command succeeds; bad news leaves on standard error
+//! and it fails — which is what `replay` already does with a divergence, and what lets a sweep tell
+//! the two apart without reading either. Which of them a failing run is depends on what was asked:
+//! `check` asks whether the run held up, so a failure is bad news, while `reproduce` asks whether
+//! the failure came back, so a failure is the thing it wanted.
+//!
+//! # Why the faults are not a flag on `run`, and a repro is not something `replay` reads
+//!
+//! The exchange has no retry between its two halves, so a schedule that cuts its one link leaves
+//! both of them waiting for a message that is never coming: the system worth injecting a schedule
+//! into is the coordinator. A `--faults` flag on `run` would therefore swap the system *and* the
+//! shape of what is printed, which is one command answering two questions. `replay` is the same
+//! argument one file further on — it reports whether the entries matched, where a repro asks
+//! whether the failure came back, and a repro is no more a recording than a trace is.
 //!
 //! # A trace is read by running again what it names
 //!
@@ -27,10 +48,14 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 use chronoloop::diff::{MissingState, diff, list};
+use chronoloop::fault::{FaultSchedule, ParseScheduleError};
 use chronoloop::fork::{Fork, UnreachedStep, fork};
 use chronoloop::history::{Entry, ParseRecordingError, Recording};
+use chronoloop::outcome::Outcome;
+use chronoloop::repro::{ParseReproError, Repro, ReproError};
+use chronoloop::shrink::shrink;
 use chronoloop::store::StateStore;
-use chronoloop::systems::{RunError, pingpong, ring};
+use chronoloop::systems::{RunError, pingpong, quorum, ring};
 use chronoloop::trace::{ParseTraceError, Step, Trace};
 
 /// Deterministic simulation of infrastructure control loops.
@@ -89,6 +114,29 @@ enum Command {
         /// The seed everything after that step is drawn from.
         #[arg(long)]
         seed: u64,
+    },
+    /// Run the coordinator under a schedule of faults, and say how it went.
+    Check {
+        /// The seed every choice in the run is drawn from.
+        #[arg(long)]
+        seed: u64,
+        /// The faults to put the run through.
+        #[arg(long)]
+        faults: PathBuf,
+    },
+    /// Cut a failing run's faults down to the ones that caused it, and write the repro.
+    Shrink {
+        /// The seed every choice in the run is drawn from.
+        #[arg(long)]
+        seed: u64,
+        /// The faults to reduce, which the run of this seed has to break under.
+        #[arg(long)]
+        faults: PathBuf,
+    },
+    /// Run again what a repro names, and check the failure it expects still comes back.
+    Reproduce {
+        /// A repro written earlier by `shrink`.
+        path: PathBuf,
     },
 }
 
@@ -211,6 +259,33 @@ enum CliError {
     Missing(MissingState),
     /// A trace that already draws from a second seed was asked for a third.
     AlreadyForked(Fork),
+    /// The file is not a schedule of faults.
+    ParseSchedule(ParseScheduleError),
+    /// The file is not a repro.
+    ParseRepro(ParseReproError),
+    /// The reduced run could not be written down as a repro.
+    Repro(ReproError),
+    /// The run broke under the faults it was given.
+    Broke {
+        /// The seed it was run under.
+        seed: u64,
+        /// How it broke, in the form an outcome writes itself in.
+        outcome: Outcome,
+    },
+    /// The run held up, so there is no failure to cut down.
+    NothingToReduce {
+        /// The seed it was run under.
+        seed: u64,
+    },
+    /// The run under a repro's faults did not produce the failure it names.
+    NotReproduced {
+        /// The seed the repro names.
+        seed: u64,
+        /// The failure the file says to expect.
+        expected: Outcome,
+        /// What the run did instead.
+        produced: Outcome,
+    },
 }
 
 impl fmt::Display for CliError {
@@ -234,6 +309,26 @@ impl fmt::Display for CliError {
                 fork.at(),
                 fork.seed()
             ),
+            Self::ParseSchedule(error) => write!(f, "{error}"),
+            Self::ParseRepro(error) => write!(f, "{error}"),
+            Self::Repro(error) => write!(f, "{error}"),
+            // The verdict itself, in the outcome's own written form: what a person is told is the
+            // same text a repro would carry, rather than a second way of saying it.
+            Self::Broke { seed, outcome } => write!(f, "seed {seed}: {outcome}"),
+            Self::NothingToReduce { seed } => write!(
+                f,
+                "seed {seed} held up under the faults it was given, so there is nothing to reduce"
+            ),
+            Self::NotReproduced {
+                seed,
+                expected,
+                produced,
+            } => write!(
+                f,
+                "seed {seed} does not reproduce what the repro names\n  \
+                 expected: {expected}\n  \
+                 produced: {produced}"
+            ),
         }
     }
 }
@@ -247,7 +342,15 @@ impl std::error::Error for CliError {
             Self::ParseTrace(error) => Some(error),
             Self::Unreached(error) => Some(error),
             Self::Missing(error) => Some(error),
-            Self::Diverged(_) | Self::TraceDiverged(_) | Self::AlreadyForked(_) => None,
+            Self::ParseSchedule(error) => Some(error),
+            Self::ParseRepro(error) => Some(error),
+            Self::Repro(error) => Some(error),
+            Self::Diverged(_)
+            | Self::TraceDiverged(_)
+            | Self::AlreadyForked(_)
+            | Self::Broke { .. }
+            | Self::NothingToReduce { .. }
+            | Self::NotReproduced { .. } => None,
         }
     }
 }
@@ -279,6 +382,24 @@ impl From<UnreachedStep> for CliError {
 impl From<MissingState> for CliError {
     fn from(error: MissingState) -> Self {
         Self::Missing(error)
+    }
+}
+
+impl From<ParseScheduleError> for CliError {
+    fn from(error: ParseScheduleError) -> Self {
+        Self::ParseSchedule(error)
+    }
+}
+
+impl From<ParseReproError> for CliError {
+    fn from(error: ParseReproError) -> Self {
+        Self::ParseRepro(error)
+    }
+}
+
+impl From<ReproError> for CliError {
+    fn from(error: ReproError) -> Self {
+        Self::Repro(error)
     }
 }
 
@@ -337,6 +458,66 @@ fn replay(path: &Path) -> Result<String, CliError> {
         recorded.seed(),
         recorded.entries().len()
     ))
+}
+
+/// Returns the schedule of faults the file at `path` holds.
+fn schedule(path: &Path) -> Result<FaultSchedule, CliError> {
+    Ok(read(path)?.parse()?)
+}
+
+/// Runs the coordinator under `faults`, and says how it went.
+///
+/// A run that broke leaves as an error, because the question asked was whether it held up.
+fn checked(seed: u64, faults: &FaultSchedule) -> Result<String, CliError> {
+    let (_, _, outcome) = quorum::run(seed, faults)?;
+    match outcome {
+        Outcome::Pass => Ok(format!(
+            "seed {seed}: held up under {} faults\n",
+            faults.len()
+        )),
+        broke @ Outcome::Fail { .. } => Err(CliError::Broke {
+            seed,
+            outcome: broke,
+        }),
+    }
+}
+
+/// Cuts `faults` down to what the failure needs, and writes the repro that is left.
+///
+/// A run that held up is refused rather than answered with the schedule it was given: there is no
+/// failure to reduce, and a repro naming a run that held up is one nothing could ever honour.
+fn reduced(seed: u64, faults: &FaultSchedule) -> Result<String, CliError> {
+    let reduction = shrink(faults, |candidate| {
+        quorum::run(seed, candidate).map(|(_, _, outcome)| outcome)
+    })?
+    .ok_or(CliError::NothingToReduce { seed })?;
+    // The outcome is the *reduced* run's, so the step it names is a step of the run this repro
+    // produces rather than of the run that went in.
+    let repro = Repro::new(
+        seed,
+        reduction.schedule().clone(),
+        reduction.outcome().clone(),
+    )?;
+    Ok(repro.to_string())
+}
+
+/// Runs again what the repro `text` names, and checks the failure it expects still comes back.
+///
+/// The run is held to the file by [`Outcome::reproduces`], which compares the reasons and not the
+/// steps: a step moves whenever anything upstream of it moves, and what identifies a failure is
+/// what broke rather than where it surfaced.
+fn reproduced(text: &str) -> Result<String, CliError> {
+    let repro: Repro = text.parse()?;
+    let seed = repro.seed();
+    let (_, _, produced) = quorum::run(seed, repro.faults())?;
+    if !produced.reproduces(repro.expected()) {
+        return Err(CliError::NotReproduced {
+            seed,
+            expected: repro.expected().clone(),
+            produced,
+        });
+    }
+    Ok(format!("seed {seed}: {produced}, as the repro expects\n"))
 }
 
 /// A recorded trace, and the states of a run that still produces it.
@@ -439,6 +620,9 @@ fn execute(command: &Command) -> Result<String, CliError> {
             after,
         } => Loaded::read(path)?.compare(*before, *after),
         Command::Fork { path, at, seed } => Loaded::read(path)?.forked(*at, *seed),
+        Command::Check { seed, faults } => checked(*seed, &schedule(faults)?),
+        Command::Shrink { seed, faults } => reduced(*seed, &schedule(faults)?),
+        Command::Reproduce { path } => reproduced(&read(path)?),
     }
 }
 
@@ -547,6 +731,35 @@ mod tests {
                 want: "Diff { path: \"run.trace\", before: 8, after: 7 }",
             },
             Case {
+                name: "a run under a schedule of faults",
+                argv: &[
+                    "chronoloop",
+                    "check",
+                    "--seed",
+                    "20260921",
+                    "--faults",
+                    "run.faults",
+                ],
+                want: "Check { seed: 20260921, faults: \"run.faults\" }",
+            },
+            Case {
+                name: "a reduction of a failing run",
+                argv: &[
+                    "chronoloop",
+                    "shrink",
+                    "--seed",
+                    "20260921",
+                    "--faults",
+                    "run.faults",
+                ],
+                want: "Shrink { seed: 20260921, faults: \"run.faults\" }",
+            },
+            Case {
+                name: "a repro put back through its run",
+                argv: &["chronoloop", "reproduce", "bug.repro"],
+                want: "Reproduce { path: \"bug.repro\" }",
+            },
+            Case {
                 name: "a fork of a step",
                 argv: &[
                     "chronoloop",
@@ -580,7 +793,7 @@ mod tests {
             },
             Case {
                 name: "a subcommand that does not exist",
-                argv: &["chronoloop", "shrink"],
+                argv: &["chronoloop", "rewind"],
             },
             Case {
                 name: "a run with no seed",
@@ -629,6 +842,26 @@ mod tests {
             Case {
                 name: "a comparison with a third step",
                 argv: &["chronoloop", "diff", "run.trace", "7", "8", "9"],
+            },
+            Case {
+                name: "a run under no faults, which is what `run` is for",
+                argv: &["chronoloop", "check", "--seed", "20260921"],
+            },
+            Case {
+                name: "faults to put no particular seed through",
+                argv: &["chronoloop", "check", "--faults", "run.faults"],
+            },
+            Case {
+                name: "a reduction with no faults to reduce",
+                argv: &["chronoloop", "shrink", "--seed", "20260921"],
+            },
+            Case {
+                name: "a reduction of no particular seed",
+                argv: &["chronoloop", "shrink", "--faults", "run.faults"],
+            },
+            Case {
+                name: "a repro that is not named",
+                argv: &["chronoloop", "reproduce"],
             },
             Case {
                 name: "a fork with no seed to fork to",
@@ -1049,6 +1282,125 @@ mod tests {
             trace.fork().map(|fork| fork.at()),
             loaded(SEED).at(7).ok().map(|step| step.event().at()),
             "the fork is at the instant the step forked at happened"
+        );
+    }
+
+    /// The seed the fault cases run, since none of them is about a particular one.
+    const QUORUM_SEED: u64 = 20_260_921;
+
+    /// A seed the lossy faults below are not enough to break.
+    const HOLDS_UP: u64 = 1;
+
+    /// Three faults the failure does not need and three that cost round 3 its quorum.
+    const FAULTS: &str = "chronoloop faults\n\
+                          partition on node 4 -> node 5 from 0.000000000s until forever\n\
+                          partition on node 0 -> node 1 from 0.000000000s until 1.000000000s\n\
+                          partition on node 0 -> node 4 from 5.000000000s until 10.000000000s\n\
+                          partition on node 0 -> node 1 from 15.000000000s until 20.000000000s\n\
+                          partition on node 0 -> node 2 from 15.000000000s until 20.000000000s\n\
+                          partition on node 0 -> node 3 from 15.000000000s until 20.000000000s\n";
+
+    /// Faults whose failure the run's draws take part in, so one seed breaks under them and another
+    /// does not.
+    const LOSSY: &str = "chronoloop faults\n\
+                         loss 4 in 4 on node 0 -> node 2 from 10.000000000s until 15.000000001s\n\
+                         loss 1 in 2 on node 0 -> node 3 from 15.000000000s until 15.000000001s\n\
+                         partition on node 0 -> node 4 from 15.000000000s until 15.000000001s\n";
+
+    /// A schedule read back from the text it is written in, failing the test rather than returning.
+    ///
+    /// A node has no public constructor, so the written form is how a schedule arrives from outside
+    /// the crate — and it is how one arrives at these commands too.
+    fn faults(text: &str) -> FaultSchedule {
+        text.parse()
+            .unwrap_or_else(|e| panic!("a test schedule is a schedule: {e}"))
+    }
+
+    /// What `shrink` writes for the six faults above.
+    fn shrunk() -> String {
+        reduced(QUORUM_SEED, &faults(FAULTS))
+            .unwrap_or_else(|e| panic!("seed {QUORUM_SEED} breaks under those faults: {e}"))
+    }
+
+    #[test]
+    fn checking_a_run_says_whether_it_held_up() {
+        // Both sides of the one question `check` asks. The seed that holds up is running faults
+        // another seed breaks under, which is the only thing in this file that can feel the
+        // engine's entropy at all: the outages below reduce to the same three partitions whatever
+        // is drawn.
+        assert_eq!(
+            checked(HOLDS_UP, &faults(LOSSY)).unwrap_or_else(|e| panic!("{e}")),
+            "seed 1: held up under 3 faults\n"
+        );
+
+        let broke = checked(QUORUM_SEED, &faults(FAULTS))
+            .err()
+            .unwrap_or_else(|| panic!("three replicas cut off costs round 3 its quorum"));
+        assert_eq!(
+            broke.to_string(),
+            "seed 20260921: failed at step 13: round 3 lost quorum",
+            "the verdict is the outcome's own written form, with the seed in front of it"
+        );
+    }
+
+    #[test]
+    fn shrinking_writes_a_repro_of_the_run_it_kept() {
+        // What `shrink` writes is what `reproduce` reads, so the two have to agree on the form
+        // without anything in between reformatting it. The text itself is pinned in `tests/cli.rs`,
+        // recorded from the binary; what is asked here is that it is a repro of a smaller run.
+        let written = shrunk();
+        let repro: Repro = written
+            .parse()
+            .unwrap_or_else(|e| panic!("what `shrink` writes is a repro: {e}"));
+
+        assert_eq!(repro.seed(), QUORUM_SEED);
+        assert!(
+            repro.faults().len() < faults(FAULTS).len(),
+            "six faults went in and {} came out",
+            repro.faults().len()
+        );
+        assert!(
+            reproduced(&written).is_ok(),
+            "and the failure it names is the failure the faults it kept produce"
+        );
+    }
+
+    #[test]
+    fn faults_a_run_holds_up_under_have_no_failure_to_reduce() {
+        // Not the schedule handed back as though it had been reduced, and not a repro naming a run
+        // that passed — which `Repro::new` would refuse anyway. There is nothing here to cut down.
+        let refused = reduced(HOLDS_UP, &faults(LOSSY))
+            .err()
+            .unwrap_or_else(|| panic!("seed {HOLDS_UP} holds up under those faults"));
+
+        assert_eq!(
+            refused.to_string(),
+            "seed 1 held up under the faults it was given, so there is nothing to reduce"
+        );
+    }
+
+    #[test]
+    fn a_repro_is_honoured_for_its_reason_and_not_for_its_step() {
+        // The rule the whole artifact rests on. A step moves whenever anything upstream of it
+        // moves, so a repro naming another step of the same failure is still honoured; one naming
+        // another failure is not, and the complaint quotes both sides for a reader holding the file.
+        let written = shrunk();
+
+        let elsewhere = written.replacen("failed at step 14", "failed at step 0", 1);
+        assert!(
+            reproduced(&elsewhere).is_ok(),
+            "what identifies a failure is what broke, not where it surfaced"
+        );
+
+        let another = written.replacen("round 3 lost quorum", "round 4 lost quorum", 1);
+        let refused = reproduced(&another)
+            .err()
+            .unwrap_or_else(|| panic!("round 4 is not the round that broke"));
+        assert_eq!(
+            refused.to_string(),
+            "seed 20260921 does not reproduce what the repro names\n  \
+             expected: failed at step 14: round 4 lost quorum\n  \
+             produced: failed at step 14: round 3 lost quorum"
         );
     }
 

@@ -104,77 +104,16 @@ fn a_replay_of_a_tampered_history_names_the_line_that_diverged() {
     );
 }
 
-#[test]
-fn an_invocation_that_cannot_be_carried_out_fails_and_says_why() {
-    struct Case {
-        name: &'static str,
-        args: Vec<String>,
-        /// Something the complaint has to mention.
-        mentions: &'static str,
-    }
-    let missing = PathBuf::from(SCRATCH).join("no-such.history");
-    let unreadable = scratch_file("not-a-history.history", "some other tool's output\n");
-    let reached_twenty = recorded_trace("reached-twenty.trace");
-    let already_forked = {
-        let forked = chronoloop(&["fork", arg(&reached_twenty), "--at", "7", "--seed", "99"]);
-        assert!(forked.status.success(), "{}", stderr(&forked));
-        scratch_file("already-forked.trace", &stdout(&forked))
-    };
-    let cases = [
-        Case {
-            name: "a history that is not there",
-            args: vec!["replay".to_owned(), arg(&missing).to_owned()],
-            mentions: "cannot read",
-        },
-        Case {
-            name: "a file that is not a history",
-            args: vec!["replay".to_owned(), arg(&unreadable).to_owned()],
-            mentions: "chronoloop history seed",
-        },
-        Case {
-            name: "a run with no seed",
-            args: vec!["run".to_owned()],
-            mentions: "--seed",
-        },
-        Case {
-            name: "no subcommand at all",
-            args: vec![],
-            mentions: "Usage",
-        },
-        Case {
-            name: "a file that is not a trace",
-            args: vec![
-                "inspect".to_owned(),
-                arg(&unreadable).to_owned(),
-                "--step".to_owned(),
-                "0".to_owned(),
-            ],
-            mentions: "chronoloop trace seed",
-        },
-        Case {
-            name: "a step the run never reached",
-            args: vec![
-                "inspect".to_owned(),
-                arg(&reached_twenty).to_owned(),
-                "--step".to_owned(),
-                "20".to_owned(),
-            ],
-            mentions: "never reached step 20",
-        },
-        Case {
-            name: "a second fork of a trace that already forked",
-            args: vec![
-                "fork".to_owned(),
-                arg(&already_forked).to_owned(),
-                "--at".to_owned(),
-                "3".to_owned(),
-                "--seed".to_owned(),
-                "5".to_owned(),
-            ],
-            mentions: "a run carries one fork",
-        },
-    ];
+/// An invocation the binary has to turn away, and something its complaint has to mention.
+struct Refused {
+    name: &'static str,
+    args: Vec<String>,
+    /// Something the complaint has to mention.
+    mentions: &'static str,
+}
 
+/// Checks each invocation fails, and that what it said names what was wrong with it.
+fn refuses(cases: Vec<Refused>) {
     for case in cases {
         let args: Vec<&str> = case.args.iter().map(String::as_str).collect();
         let output = chronoloop(&args);
@@ -188,6 +127,122 @@ fn an_invocation_that_cannot_be_carried_out_fails_and_says_why() {
             case.mentions
         );
     }
+}
+
+#[test]
+fn an_invocation_that_cannot_be_carried_out_fails_and_says_why() {
+    let missing = PathBuf::from(SCRATCH).join("no-such.history");
+    let unreadable = scratch_file("not-a-history.history", "some other tool's output\n");
+    let reached_twenty = recorded_trace("reached-twenty.trace");
+    let already_forked = {
+        let forked = chronoloop(&["fork", arg(&reached_twenty), "--at", "7", "--seed", "99"]);
+        assert!(forked.status.success(), "{}", stderr(&forked));
+        scratch_file("already-forked.trace", &stdout(&forked))
+    };
+    let cases = vec![
+        Refused {
+            name: "a history that is not there",
+            args: vec!["replay".to_owned(), arg(&missing).to_owned()],
+            mentions: "cannot read",
+        },
+        Refused {
+            name: "a file that is not a history",
+            args: vec!["replay".to_owned(), arg(&unreadable).to_owned()],
+            mentions: "chronoloop history seed",
+        },
+        Refused {
+            name: "a run with no seed",
+            args: vec!["run".to_owned()],
+            mentions: "--seed",
+        },
+        Refused {
+            name: "no subcommand at all",
+            args: vec![],
+            mentions: "Usage",
+        },
+        Refused {
+            name: "a file that is not a trace",
+            args: vec![
+                "inspect".to_owned(),
+                arg(&unreadable).to_owned(),
+                "--step".to_owned(),
+                "0".to_owned(),
+            ],
+            mentions: "chronoloop trace seed",
+        },
+        Refused {
+            name: "a step the run never reached",
+            args: vec![
+                "inspect".to_owned(),
+                arg(&reached_twenty).to_owned(),
+                "--step".to_owned(),
+                "20".to_owned(),
+            ],
+            mentions: "never reached step 20",
+        },
+        Refused {
+            name: "a second fork of a trace that already forked",
+            args: vec![
+                "fork".to_owned(),
+                arg(&already_forked).to_owned(),
+                "--at".to_owned(),
+                "3".to_owned(),
+                "--seed".to_owned(),
+                "5".to_owned(),
+            ],
+            mentions: "a run carries one fork",
+        },
+    ];
+
+    refuses(cases);
+}
+
+#[test]
+fn a_failing_run_that_cannot_be_asked_about_fails_and_says_why() {
+    // The same shape one family further on: a file that is not the file the command wanted, and a
+    // command asked about a run that cannot give it what it asked for.
+    let missing = PathBuf::from(SCRATCH).join("no-such.faults");
+    let unreadable = scratch_file("not-a-schedule.faults", "some other tool's output\n");
+    let survivable = scratch_file("nothing-to-reduce.faults", LOSSY);
+    let checking = |faults: &Path| {
+        vec![
+            "check".to_owned(),
+            "--seed".to_owned(),
+            QUORUM_SEED.to_owned(),
+            "--faults".to_owned(),
+            arg(faults).to_owned(),
+        ]
+    };
+    let cases = vec![
+        Refused {
+            name: "faults that are not there",
+            args: checking(&missing),
+            mentions: "cannot read",
+        },
+        Refused {
+            name: "a file that is not a schedule of faults",
+            args: checking(&unreadable),
+            mentions: "chronoloop faults",
+        },
+        Refused {
+            name: "a file that is not a repro",
+            args: vec!["reproduce".to_owned(), arg(&unreadable).to_owned()],
+            mentions: "chronoloop repro seed",
+        },
+        Refused {
+            name: "faults the run holds up under, which have no failure to reduce",
+            args: vec![
+                "shrink".to_owned(),
+                "--seed".to_owned(),
+                HOLDS_UP.to_owned(),
+                "--faults".to_owned(),
+                arg(&survivable).to_owned(),
+            ],
+            mentions: "nothing to reduce",
+        },
+    ];
+
+    refuses(cases);
 }
 
 /// The seed every trace case runs, since none of them is about a particular one.
@@ -356,5 +411,144 @@ fn a_trace_the_run_no_longer_produces_is_refused_rather_than_shown() {
     assert!(
         complaint.contains("in round 9"),
         "the complaint quotes what the file holds: {complaint}"
+    );
+}
+
+/// The seed the fault cases run, since none of them is about a particular one.
+const QUORUM_SEED: &str = "20260921";
+
+/// A seed the reduced lossy faults are not enough to break, found by running them under it.
+const HOLDS_UP: &str = "1";
+
+/// Three faults the failure does not need and three that cost round 3 its quorum.
+///
+/// The same schedule `tests/shrink.rs` and `tests/repro.rs` run, deliberately: what those two reach
+/// through the library, these reach through a process and a file, and the two routes have to agree.
+const FAULTS: &str = "chronoloop faults\n\
+                      partition on node 4 -> node 5 from 0.000000000s until forever\n\
+                      partition on node 0 -> node 1 from 0.000000000s until 1.000000000s\n\
+                      partition on node 0 -> node 4 from 5.000000000s until 10.000000000s\n\
+                      partition on node 0 -> node 1 from 15.000000000s until 20.000000000s\n\
+                      partition on node 0 -> node 2 from 15.000000000s until 20.000000000s\n\
+                      partition on node 0 -> node 3 from 15.000000000s until 20.000000000s\n";
+
+/// The repro reducing it produces, recorded from an actual run.
+const REPRO: &str = "chronoloop repro seed 20260921\n\
+                     failed at step 14: round 3 lost quorum\n\
+                     chronoloop faults\n\
+                     partition on node 0 -> node 1 from 15.000000000s until 15.000000001s\n\
+                     partition on node 0 -> node 2 from 15.000000000s until 15.000000001s\n\
+                     partition on node 0 -> node 3 from 15.000000000s until 15.000000001s\n";
+
+/// Faults whose failure the run's draws take part in, so one seed breaks under them and another does
+/// not.
+///
+/// Every case above is blind to the engine's entropy: the outage schedule reduces to the same three
+/// partitions under every seed, so those cases stay green with the engine cut off from its seed
+/// entirely. `tests/repro.rs` records the same limit about the same schedule. This is the pair that
+/// feels it.
+const LOSSY: &str = "chronoloop faults\n\
+                     loss 4 in 4 on node 0 -> node 2 from 10.000000000s until 15.000000001s\n\
+                     loss 1 in 2 on node 0 -> node 3 from 15.000000000s until 15.000000001s\n\
+                     partition on node 0 -> node 4 from 15.000000000s until 15.000000001s\n";
+
+#[test]
+fn checking_a_run_that_broke_says_how_it_broke_and_fails() {
+    // `check` asks whether the run held up, so a run that did not is bad news: the verdict goes where
+    // every other complaint goes and the exit code says so, which is what makes it usable from a
+    // script hunting for a seed.
+    let path = scratch_file("trouble.faults", FAULTS);
+
+    let checked = chronoloop(&["check", "--seed", QUORUM_SEED, "--faults", arg(&path)]);
+
+    assert!(!checked.status.success(), "a run that broke is a failure");
+    assert_eq!(
+        stderr(&checked),
+        "chronoloop: seed 20260921: failed at step 13: round 3 lost quorum\n"
+    );
+    assert!(
+        stdout(&checked).is_empty(),
+        "the verdict is the complaint, and it is not said twice"
+    );
+}
+
+#[test]
+fn checking_a_run_that_held_up_says_so_and_succeeds() {
+    // The other side of the threshold, and the half that feels the seed: these are faults one seed
+    // breaks under and this one does not.
+    let path = scratch_file("survivable.faults", LOSSY);
+
+    let checked = chronoloop(&["check", "--seed", HOLDS_UP, "--faults", arg(&path)]);
+
+    assert!(checked.status.success(), "{}", stderr(&checked));
+    assert_eq!(stdout(&checked), "seed 1: held up under 3 faults\n");
+
+    let broke = chronoloop(&["check", "--seed", QUORUM_SEED, "--faults", arg(&path)]);
+    assert!(
+        !broke.status.success(),
+        "the same faults under the seed they were reduced from: {}",
+        stdout(&broke)
+    );
+}
+
+#[test]
+fn shrinking_a_failing_run_writes_the_repro_it_reduces_to() {
+    // The pinned text is `tests/repro.rs`'s, reached here through a process and a file rather than
+    // through the library — two routes to one text, which says more about the wiring than anything
+    // asserted inside either of them.
+    let path = scratch_file("shrinkable.faults", FAULTS);
+
+    let shrunk = chronoloop(&["shrink", "--seed", QUORUM_SEED, "--faults", arg(&path)]);
+
+    assert!(shrunk.status.success(), "{}", stderr(&shrunk));
+    assert_eq!(stdout(&shrunk), REPRO);
+    assert_eq!(
+        stdout(&shrunk).len(),
+        295,
+        "a failing run of a five-node system, in under a third of a kilobyte"
+    );
+}
+
+#[test]
+fn a_repro_the_binary_wrote_puts_a_later_run_through_the_same_failure() {
+    // The whole story end to end, across three processes and two files: a schedule goes in, a repro
+    // comes out, and the repro alone is enough to put a run back where it was.
+    let faults = scratch_file("reducible.faults", FAULTS);
+    let shrunk = chronoloop(&["shrink", "--seed", QUORUM_SEED, "--faults", arg(&faults)]);
+    assert!(shrunk.status.success(), "{}", stderr(&shrunk));
+    let repro = scratch_file("written.repro", &stdout(&shrunk));
+
+    let reproduced = chronoloop(&["reproduce", arg(&repro)]);
+
+    assert!(reproduced.status.success(), "{}", stderr(&reproduced));
+    assert_eq!(
+        stdout(&reproduced),
+        "seed 20260921: failed at step 14: round 3 lost quorum, as the repro expects\n"
+    );
+}
+
+#[test]
+fn a_repro_naming_a_failure_the_run_does_not_produce_is_refused() {
+    // What makes the case above worth reading: the run is held to what the file says, so a file
+    // naming a failure nothing produces is turned away with both sides quoted.
+    let tampered = scratch_file(
+        "tampered.repro",
+        &REPRO.replacen("round 3 lost quorum", "round 4 lost quorum", 1),
+    );
+
+    let reproduced = chronoloop(&["reproduce", arg(&tampered)]);
+
+    assert!(
+        !reproduced.status.success(),
+        "a failure that did not come back is a failure"
+    );
+    let complaint = stderr(&reproduced);
+    assert!(
+        complaint.contains("round 4 lost quorum"),
+        "the complaint quotes what the file expects: {complaint}"
+    );
+    assert!(
+        complaint.contains("round 3 lost quorum"),
+        "and what the run actually did: {complaint}"
     );
 }
