@@ -14,12 +14,17 @@
 //! establishes, one drop at a time, that the failure needs the last three entries and none of the
 //! first three; this one asks what the reduction makes of the same schedule without being told any of
 //! it.
+//!
+//! The fifty-fault schedule scatters those same three among forty-seven that cannot cause anything,
+//! which is the size the dropping was measured at and the size at which a reduction that stops
+//! short stops being invisible. It reduces to the same recorded text the six do.
 
 use chronoloop::clock::VirtualTime;
 use chronoloop::fault::{Fault, FaultSchedule, Window};
 use chronoloop::outcome::Outcome;
 use chronoloop::shrink::{Reduction, shrink};
 use chronoloop::systems::quorum;
+use chronoloop::trace::Step;
 
 /// The seed the recorded cases run, since none of them is about a particular one.
 const SEED: u64 = 20_260_921;
@@ -43,6 +48,85 @@ const REDUCED: &str = "chronoloop faults\n\
                        partition on node 0 -> node 2 from 15.000000000s until 15.000000001s\n\
                        partition on node 0 -> node 3 from 15.000000000s until 15.000000001s\n";
 
+/// The same three outages, scattered among forty-seven the failure cannot use.
+///
+/// The measurements that settled how the dropping works were taken at fifty faults, and the three
+/// that matter sit at the tenth, twenty-sixth and forty-second entries — no contiguous chunk holds
+/// them, so nothing but dropping entry by entry can arrive at them.
+///
+/// Three rules make the forty-seven decoration rather than cause, and all three are structural
+/// rather than lucky:
+///
+/// - **At most two of the five replicas are impaired in any round but the third, whatever is
+///   drawn.** Round 1 loses node 4's question and node 5's answer, round 2 node 1's question and
+///   node 2's answer, round 4 node 2's and node 3's, round 5 node 1's and node 5's. Three
+///   acknowledgements is a quorum, so every one of those rounds closes with exactly the three it
+///   needs. The faults that are drawn against only ever fall on a replica an outage has already
+///   silenced, so no draw can make a third.
+/// - **Nothing but the three touches the third round.** No decoration falls on a direction between
+///   the coordinator and a replica between 15s, when the round opens, and 17s, when it gives up —
+///   so no decoration can join the set the failure needs.
+/// - **No decoration shadows one of the three.** Where two faults are in force on one direction the
+///   first of them applies, so every other window on `node 0 -> node 1`, `-> node 2` and `-> node 3`
+///   is disjoint from the three's.
+///
+/// They are not inert, though: outages and real odds sit on links carrying real traffic in four of
+/// the five rounds, so the run under all fifty is not the run under the three. The case below says
+/// so rather than leaving it to be assumed. The two written `loss 0 in 4` are the exception that
+/// makes the point — odds of none are still a fault in force, drawing exactly what the link would
+/// have drawn, so there is nothing to lower and the reduction can only drop them.
+const FIFTY: &str = "chronoloop faults\n\
+                     partition on node 1 -> node 2 from 0.000000000s until forever\n\
+                     partition on node 0 -> node 1 from 0.000000000s until 5.000000000s\n\
+                     loss 1 in 2 on node 1 -> node 4 from 0.000000000s until forever\n\
+                     partition on node 0 -> node 4 from 5.000000000s until 7.000000000s\n\
+                     partition on node 2 -> node 1 from 0.000000000s until forever\n\
+                     partition on node 5 -> node 0 from 5.000000000s until 7.000000000s\n\
+                     partition on node 0 -> node 2 from 0.000000000s until 5.000000000s\n\
+                     loss 1 in 2 on node 0 -> node 5 from 5.000000000s until 7.000000000s\n\
+                     partition on node 1 -> node 3 from 0.000000000s until forever\n\
+                     partition on node 0 -> node 1 from 15.000000000s until 20.000000000s\n\
+                     partition on node 3 -> node 1 from 0.000000000s until forever\n\
+                     partition on node 0 -> node 1 from 10.000000000s until 12.000000000s\n\
+                     loss 3 in 4 on node 4 -> node 1 from 0.000000000s until forever\n\
+                     partition on node 2 -> node 0 from 10.000000000s until 12.000000000s\n\
+                     partition on node 0 -> node 3 from 0.000000000s until 5.000000000s\n\
+                     loss 1 in 2 on node 0 -> node 2 from 10.000000000s until 12.000000000s\n\
+                     partition on node 2 -> node 4 from 0.000000000s until forever\n\
+                     loss 0 in 4 on node 0 -> node 4 from 10.000000000s until 12.000000000s\n\
+                     partition on node 4 -> node 2 from 0.000000000s until forever\n\
+                     partition on node 0 -> node 4 from 0.000000000s until 5.000000000s\n\
+                     loss 1 in 3 on node 2 -> node 5 from 0.000000000s until forever\n\
+                     partition on node 3 -> node 5 from 0.000000000s until forever\n\
+                     partition on node 0 -> node 5 from 0.000000000s until 5.000000000s\n\
+                     loss 1 in 1 on node 1 -> node 0 from 0.000000000s until 5.000000000s\n\
+                     partition on node 5 -> node 3 from 0.000000000s until forever\n\
+                     partition on node 0 -> node 2 from 15.000000000s until 20.000000000s\n\
+                     loss 1 in 1 on node 2 -> node 0 from 0.000000000s until 5.000000000s\n\
+                     partition on node 4 -> node 5 from 0.000000000s until forever\n\
+                     partition on node 0 -> node 2 from 20.000000000s until 22.000000000s\n\
+                     loss 2 in 3 on node 5 -> node 2 from 0.000000000s until forever\n\
+                     partition on node 3 -> node 0 from 20.000000000s until 22.000000000s\n\
+                     partition on node 5 -> node 4 from 0.000000000s until forever\n\
+                     loss 3 in 4 on node 0 -> node 3 from 20.000000000s until 22.000000000s\n\
+                     loss 0 in 4 on node 4 -> node 0 from 20.000000000s until 22.000000000s\n\
+                     partition on node 1 -> node 5 from 0.000000000s until forever\n\
+                     partition on node 0 -> node 1 from 25.000000000s until 27.000000000s\n\
+                     partition on node 5 -> node 1 from 0.000000000s until forever\n\
+                     partition on node 5 -> node 0 from 25.000000000s until 27.000000000s\n\
+                     partition on node 2 -> node 3 from 0.000000000s until forever\n\
+                     loss 1 in 2 on node 0 -> node 5 from 25.000000000s until 27.000000000s\n\
+                     partition on node 3 -> node 2 from 0.000000000s until forever\n\
+                     partition on node 0 -> node 3 from 15.000000000s until 20.000000000s\n\
+                     partition on node 3 -> node 4 from 0.000000000s until forever\n\
+                     partition on node 0 -> node 1 from 30.000000000s until forever\n\
+                     partition on node 4 -> node 3 from 0.000000000s until forever\n\
+                     partition on node 2 -> node 0 from 30.000000000s until forever\n\
+                     loss 1 in 1 on node 0 -> node 3 from 30.000000000s until forever\n\
+                     loss 1 in 2 on node 4 -> node 0 from 30.000000000s until forever\n\
+                     partition on node 0 -> node 5 from 30.000000000s until forever\n\
+                     loss 1 in 4 on node 3 -> node 0 from 30.000000000s until forever\n";
+
 /// A schedule whose faults are odds rather than outages, so the lowering reaches a real wire.
 const LOSSY: &str = "chronoloop faults\n\
                      loss 1 in 1 on node 0 -> node 1 from 10.000000000s until 20.000000000s\n\
@@ -55,6 +139,12 @@ const REDUCED_LOSSY: &str = "chronoloop faults\n\
                              loss 4 in 4 on node 0 -> node 2 from 10.000000000s until 15.000000001s\n\
                              loss 1 in 2 on node 0 -> node 3 from 15.000000000s until 15.000000001s\n\
                              partition on node 0 -> node 4 from 15.000000000s until 15.000000001s\n";
+
+/// How many seeds the sweep over the fifty-fault schedule walks.
+///
+/// Wider than the sweep below because a run is cheap where a reduction is not: this one runs the
+/// system once a seed rather than the hundred and fifty-odd times a reduction asks for.
+const FIFTY_SWEEP: u64 = 500;
 
 /// How many seeds the gated sweep walks.
 ///
@@ -74,6 +164,15 @@ fn runs(seed: u64, faults: &FaultSchedule) -> Outcome {
     quorum::run(seed, faults)
         .unwrap_or_else(|e| panic!("seed {seed} did not finish: {e}"))
         .2
+}
+
+/// What the run of `faults` under `seed` passed through, failing the test rather than returning.
+fn steps(seed: u64, faults: &FaultSchedule) -> Vec<Step> {
+    quorum::run(seed, faults)
+        .unwrap_or_else(|e| panic!("seed {seed} did not finish: {e}"))
+        .0
+        .steps()
+        .to_vec()
 }
 
 /// Reduces `faults` against a real run of the system under `seed`.
@@ -201,14 +300,73 @@ fn the_window_a_reduction_keeps_is_the_shortest_that_still_cuts_the_round() {
 }
 
 #[test]
+fn a_failing_run_of_fifty_faults_reduces_to_the_three_that_caused_it() {
+    // The scale the dropping was measured at, against the real system. What makes this more than
+    // the six-fault case with padding on the end is the answer: two schedules with nothing in
+    // common but three entries reduce to one recorded text, so what comes back is a fact about the
+    // failure rather than about the list it was found in.
+    let reduction = reduce(SEED, &schedule(FIFTY));
+
+    assert_eq!(reduction.schedule().to_string(), REDUCED);
+    assert_eq!(
+        reduction.outcome().to_string(),
+        "failed at step 14: round 3 lost quorum",
+        "the run of the three, which is the run the six-fault schedule also comes down to"
+    );
+
+    // And the forty-seven are not padding. They cut real questions and real answers in four of the
+    // five rounds, so the run they are part of passes through different steps from the run of the
+    // three alone — a reduction that had merely dropped forty-seven faults nothing ever consulted
+    // would leave this equal.
+    assert_ne!(
+        steps(SEED, &schedule(FIFTY)),
+        steps(SEED, reduction.schedule()),
+        "the decorations reach the run, and the reduction takes them out anyway"
+    );
+
+    // What this case cannot feel, said rather than implied by its size: three replicas cut at the
+    // instant the round opens costs that round its quorum whatever the wire draws, so the answer
+    // above is the same under every seed and the engine could be cut off from its entropy without
+    // reddening a line of it. The lossy cases below are what feel the draws.
+}
+
+#[test]
 fn reducing_a_reduction_changes_nothing() {
     // What the reduction's own loop is for, through a real system rather than a scripted predicate.
     // The two sides are one reduction and two of them, not one value compared with itself.
-    let once = reduce(SEED, &schedule(FAULTS));
-    let twice = reduce(SEED, once.schedule());
+    //
+    // The second schedule is what makes this able to fail at all, and it took a mutation to find
+    // out: a reduction made to stop after the first entries it takes out still lands exactly on
+    // the six-fault schedule's three, because those three are one contiguous half of it. Fifty is
+    // where stopping short shows — the result is then not one no single entry can be taken from,
+    // and reducing it again gets further.
+    struct Case {
+        name: &'static str,
+        faults: &'static str,
+    }
+    let cases = [
+        Case {
+            name: "six faults, three of them needed",
+            faults: FAULTS,
+        },
+        Case {
+            name: "fifty faults, the same three needed",
+            faults: FIFTY,
+        },
+    ];
 
-    assert_eq!(twice.schedule().to_string(), once.schedule().to_string());
-    assert_eq!(twice.outcome(), once.outcome());
+    for case in cases {
+        let once = reduce(SEED, &schedule(case.faults));
+        let twice = reduce(SEED, once.schedule());
+
+        assert_eq!(
+            twice.schedule().to_string(),
+            once.schedule().to_string(),
+            "{}",
+            case.name
+        );
+        assert_eq!(twice.outcome(), once.outcome(), "{}", case.name);
+    }
 }
 
 #[test]
@@ -279,6 +437,35 @@ fn every_seed_reduces_to_the_same_outage() {
             reduce(seed, &schedule(FAULTS)).schedule().to_string(),
             REDUCED,
             "seed {seed}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "a sweep of seeds, run by `make local-validation` rather than by CI"]
+fn no_seed_finds_a_failure_among_the_fifty_but_the_one_they_are_scattered_around() {
+    // The premise the fifty-fault fixture rests on, held rather than asserted in prose: the
+    // forty-seven leave at most two of the five replicas impaired in any round but the third, and
+    // three of five answering is a quorum, so no draw can turn one of them into a cause. A
+    // decoration that could cost a round its quorum on some seed would be a fault the reduction is
+    // entitled to keep, and the case above would be pinning a fact about one seed's draws.
+    //
+    // Compared through `reproduces`, which asks the reason and not the step: the step a failure
+    // surfaces at moves with every draw, and what must not move is which round went short.
+    //
+    // It is the only thing holding that premise, which was established by breaking it: moving one
+    // decoration onto a link that would silence a third replica in round 1 turns this red at seed
+    // 0 and leaves every other case in the repository green — seed 20260921 does not happen to
+    // lose that coin, so the case above cannot tell a fixture that is sound from one that is
+    // lucky.
+    let faults = schedule(FIFTY);
+    let expected = runs(SEED, &faults);
+
+    for seed in 0..FIFTY_SWEEP {
+        let outcome = runs(seed, &faults);
+        assert!(
+            outcome.reproduces(&expected),
+            "seed {seed} went {outcome}, where {SEED} went {expected}"
         );
     }
 }

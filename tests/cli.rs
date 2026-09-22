@@ -729,6 +729,80 @@ fn a_repro_naming_a_failure_the_run_does_not_produce_is_refused() {
 }
 
 #[test]
+fn shrinking_the_repro_a_shrink_wrote_writes_the_same_repro() {
+    // Idempotence asked of the **artifact** rather than of a value: the library cases compare one
+    // reduction with two inside one process, and a `Reduction` dies with the process that made it.
+    // What a person keeps is the file, so what goes back through the reduction here is the file.
+    //
+    // It is also the one case that holds the form's own claim. A repro is a seed, a failure, and
+    // then a fault schedule entire, header and all — which is what makes everything from the third
+    // line on a schedule file, and `tail -n +3 bug.repro` a thing that feeds straight back into
+    // `--faults`. That is done here by cutting two lines off the text.
+    //
+    // What it cannot feel, whichever schedule it is given: both sides come out of one build, so a
+    // reduction that moved would move on both of them together. This says the reduction is a fixed
+    // point and says nothing about where the fixed point is — the pinned repro above is what holds
+    // that, and it was checked rather than assumed. A command handing back the schedule it was
+    // given is a fixed point too, and reddens the case above and not this one; what reddens this
+    // one is the failure line moving below the faults, which is the claim it is here for.
+    struct Case {
+        name: &'static str,
+        file: &'static str,
+        faults: &'static str,
+    }
+    let cases = [
+        Case {
+            name: "three outages the draws take no part in",
+            file: "idempotent.faults",
+            faults: FAULTS,
+        },
+        Case {
+            // Already reduced, and reduced against odds rather than outages — the shape where a
+            // fixed point is worth asking about, since a window the draws are standing in is one
+            // the bisection stopped at rather than one it could prove nothing lives below.
+            name: "odds and a window the draws hold open",
+            file: "idempotent-lossy.faults",
+            faults: LOSSY,
+        },
+    ];
+
+    for case in cases {
+        let faults = scratch_file(case.file, case.faults);
+        let once = chronoloop(&["shrink", "--seed", QUORUM_SEED, "--faults", arg(&faults)]);
+        assert!(once.status.success(), "{}: {}", case.name, stderr(&once));
+        let repro = stdout(&once);
+
+        let (header, rest) = repro
+            .split_once('\n')
+            .unwrap_or_else(|| panic!("{}: a repro's first line names its seed", case.name));
+        let (_, tail) = rest
+            .split_once('\n')
+            .unwrap_or_else(|| panic!("{}: a repro's second line names the failure", case.name));
+        assert!(
+            tail.starts_with("chronoloop faults\n"),
+            "{}: the tail of a repro opens a schedule: {tail}",
+            case.name
+        );
+        // The seed goes back in off the file the first command wrote, so what is run again is what
+        // the artifact says rather than what this file happens to know.
+        let seed = header
+            .strip_prefix("chronoloop repro seed ")
+            .unwrap_or_else(|| panic!("{}: a repro's header names its seed: {header}", case.name));
+        let again = scratch_file(&format!("{}.tail", case.file), tail);
+
+        let twice = chronoloop(&["shrink", "--seed", seed, "--faults", arg(&again)]);
+
+        assert!(twice.status.success(), "{}: {}", case.name, stderr(&twice));
+        assert_eq!(
+            stdout(&twice),
+            repro,
+            "{}: a repro put back through the reduction that wrote it comes back as itself",
+            case.name
+        );
+    }
+}
+
+#[test]
 fn sweeping_names_every_seed_that_broke_and_fails() {
     // `sweep` is `check` asked of a range, so it answers the same way: a seed that broke is bad
     // news, the verdict goes where every other complaint goes, and the exit code says so. The
