@@ -143,6 +143,30 @@ impl Odds {
         }
     }
 
+    /// Returns how many occurrences these odds hold, which is what a reduction lowers.
+    ///
+    /// Crate-private on purpose: reducing a failing run has to know what an odds stands at before it
+    /// can offer a lower one, and that is the only caller. From outside, what odds say is what
+    /// [`Display`] writes.
+    ///
+    /// [`Display`]: fmt::Display
+    pub(crate) fn numerator(self) -> u32 {
+        self.numerator
+    }
+
+    /// Returns these odds with `numerator` occurrences, which can only be fewer than they hold.
+    ///
+    /// Infallible by construction, which is the reason it exists rather than the caller reaching for
+    /// [`Odds::new`]: a numerator at most the current one is at most the denominator, so there is
+    /// nothing left for the check in `new` to refuse, and a reduction never has to handle a failure
+    /// it cannot have caused. Asking for more than these odds hold lowers nothing.
+    pub(crate) fn lowered_to(self, numerator: u32) -> Self {
+        Self {
+            numerator: numerator.min(self.numerator),
+            denominator: self.denominator,
+        }
+    }
+
     /// Draws against these odds.
     fn draw(self, rng: &mut impl Rng) -> bool {
         rng.chance(self.numerator, self.denominator)

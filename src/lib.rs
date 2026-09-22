@@ -83,7 +83,15 @@
 //! to ask of every candidate it tries. [`quorum`] is the system that shows it: a coordinator asking
 //! five replicas to acknowledge it, round after round, over a wire that takes time and does nothing
 //! else — so the only thing that can cost a round its quorum is the [`FaultSchedule`] the run was
-//! given. The reduction itself is not here yet.
+//! given.
+//!
+//! And a verdict is what the reduction tests against. [`shrink`] takes a failing run's schedule and
+//! makes it smaller: it drops entries by delta debugging over the list, narrows each window by
+//! bisection towards the span the failure needs, and lowers each odds to the fewest occurrences it
+//! needs, running the system again after every candidate and keeping only those whose run still fails
+//! for the same reason. What comes back is a [`Reduction`] — the faults the failure could not do
+//! without, and the failure the run under them produces — which is what turns a schedule a sweep
+//! threw at a run into a repro a person can read.
 //!
 //! [`fork`]: fork::fork
 //! [`ring`]: systems::ring
@@ -101,6 +109,8 @@
 //! [`VirtualNetwork`]: net::VirtualNetwork
 //! [`FaultSchedule`]: fault::FaultSchedule
 //! [`Outcome`]: outcome::Outcome
+//! [`shrink`]: shrink::shrink
+//! [`Reduction`]: shrink::Reduction
 //! [`pingpong`]: systems::pingpong
 //! [`Recording`]: history::Recording
 //! [`StateStore`]: store::StateStore
@@ -119,6 +129,7 @@ pub mod history;
 pub mod net;
 pub mod outcome;
 pub mod rng;
+pub mod shrink;
 pub mod store;
 pub mod systems;
 pub mod trace;

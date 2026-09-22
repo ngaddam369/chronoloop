@@ -92,6 +92,24 @@ impl Window {
         self.end
     }
 
+    /// Returns this window with its ends moved inward to `start` and `end`.
+    ///
+    /// Crate-private on purpose: reducing a failing run narrows a window towards the span the failure
+    /// actually needs, and that is the only caller.
+    ///
+    /// Infallible by construction, which is why it exists rather than the caller reaching for
+    /// [`Window::new`]: each end is clamped into what this window already holds, and the end is
+    /// clamped to be no earlier than the start that came out of the first clamp, so a narrowing
+    /// cannot produce the one window `new` refuses. A reduction then never has to handle a failure it
+    /// could not have caused.
+    pub(crate) fn narrowed_to(self, start: VirtualTime, end: VirtualTime) -> Self {
+        let start = start.clamp(self.start, self.end);
+        Self {
+            start,
+            end: end.clamp(start, self.end),
+        }
+    }
+
     /// Returns `true` if `at` falls inside the window.
     pub fn holds(&self, at: VirtualTime) -> bool {
         // The end of virtual time is the only instant a window that never closes has to hold, and
@@ -696,6 +714,77 @@ mod tests {
         let forever = Window::forever_from(VirtualTime::ZERO);
         assert!(forever.holds(VirtualTime::ZERO));
         assert!(forever.holds(t(u64::MAX)));
+    }
+
+    #[test]
+    fn a_narrowing_only_ever_moves_a_window_inward() {
+        // What makes narrowing infallible, and so what keeps a reduction from having to handle a
+        // failure it could not have caused: each end is clamped into what the window already holds,
+        // and the end is clamped to be no earlier than the start that came out of the first clamp.
+        //
+        // Reducing a run bisects inside the window it is narrowing, so it never asks for any of the
+        // cases below. They are pinned because the clamp is the whole reason the signature does not
+        // return a `Result`, and without them nothing at all holds it.
+        struct Case {
+            name: &'static str,
+            during: Window,
+            start: u64,
+            end: u64,
+            want: Window,
+        }
+        let cases = [
+            Case {
+                name: "inside, which is what a reduction asks for",
+                during: window(5, 20),
+                start: 7,
+                end: 12,
+                want: window(7, 12),
+            },
+            Case {
+                name: "an end asked to move outward stays where it is",
+                during: window(5, 20),
+                start: 0,
+                end: 99,
+                want: window(5, 20),
+            },
+            Case {
+                name: "one end outward and the other in",
+                during: window(5, 20),
+                start: 0,
+                end: 12,
+                want: window(5, 12),
+            },
+            Case {
+                name: "backwards, so the start it settled on wins",
+                during: window(5, 20),
+                start: 12,
+                end: 7,
+                want: window(12, 12),
+            },
+            Case {
+                name: "a start past the end of the window",
+                during: window(5, 20),
+                start: 99,
+                end: 99,
+                want: window(20, 20),
+            },
+            Case {
+                name: "a window that never closes, narrowed to an instant",
+                during: Window::forever_from(t(5)),
+                start: 5,
+                end: 6,
+                want: window(5, 6),
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(
+                case.during.narrowed_to(t(case.start), t(case.end)),
+                case.want,
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[test]
