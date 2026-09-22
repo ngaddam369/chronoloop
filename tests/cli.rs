@@ -50,6 +50,156 @@ fn arg(path: &Path) -> &str {
     path.to_str().expect("the scratch path is text")
 }
 
+/// A command the binary offers, and a case here that drives it through a real process.
+///
+/// The pairing is what keeps the coverage from depending on whoever adds the next command. The case
+/// below asks the **binary** which commands it has, so one added later is missing from this table
+/// until somebody runs it end to end, and nothing else in the repository would notice:
+/// `src/main.rs`'s own cases parse an argv without running anything, so a command with no case here
+/// is a command whose exit code, standard output and standard error have never been looked at.
+///
+/// What the table does **not** check, said here rather than left for the pairing to imply: that the
+/// case named is the case that drives that command. A row could point at an unrelated case and
+/// still pass. What it makes impossible is the thing that actually happens — a command landing with
+/// no case at all.
+struct Covered {
+    /// The command, spelled the way `--help` names it.
+    command: &'static str,
+    /// A case in this file that runs it in a real process.
+    case: &'static str,
+}
+
+/// Every command the binary offers, paired with a case here.
+static COVERED: [Covered; 10] = [
+    Covered {
+        command: "run",
+        case: "a_run_of_one_seed_writes_the_same_bytes_every_time",
+    },
+    Covered {
+        command: "replay",
+        case: "a_replay_of_a_history_the_binary_wrote_finds_no_divergence",
+    },
+    Covered {
+        command: "trace",
+        case: "a_trace_of_one_seed_writes_the_same_bytes_every_time",
+    },
+    Covered {
+        command: "inspect",
+        case: "inspecting_a_step_shows_the_record_and_the_world_behind_it",
+    },
+    Covered {
+        command: "diff",
+        case: "comparing_two_steps_says_which_fields_moved_and_leaves_the_rest_alone",
+    },
+    Covered {
+        command: "fork",
+        case: "forking_writes_a_trace_that_says_what_produces_it_again",
+    },
+    Covered {
+        command: "sweep",
+        case: "sweeping_names_every_seed_that_broke_and_fails",
+    },
+    Covered {
+        command: "check",
+        case: "checking_a_run_that_broke_says_how_it_broke_and_fails",
+    },
+    Covered {
+        command: "shrink",
+        case: "shrinking_a_failing_run_writes_the_repro_it_reduces_to",
+    },
+    Covered {
+        command: "reproduce",
+        case: "a_repro_the_binary_wrote_puts_a_later_run_through_the_same_failure",
+    },
+];
+
+/// This file's own source, so the table can be held to cases and invocations that are really here.
+const SOURCE: &str = include_str!("cli.rs");
+
+/// This file's source with the table above cut out of it.
+///
+/// Without the cut, "the command is handed to the binary somewhere here" would be satisfied by the
+/// table's own spelling of it and could never fail — the same trap as a fixture generated from the
+/// string it is meant to match.
+fn source_beyond_the_table() -> String {
+    let table = "static COVERED";
+    let (before, rest) = SOURCE
+        .split_once(table)
+        .unwrap_or_else(|| panic!("the table is declared in this file"));
+    let (_, after) = rest
+        .split_once("\n];\n")
+        .unwrap_or_else(|| panic!("the table ends where an array ends"));
+    format!("{before}{after}")
+}
+
+/// What the binary itself says its commands are, `help` aside.
+///
+/// Read out of the real process rather than written down here: the question is what a person typing
+/// `chronoloop --help` is offered, and a list kept in this file would be one more thing to update
+/// rather than the thing that does the updating.
+fn commands() -> Vec<String> {
+    let help = chronoloop(&["--help"]);
+    assert!(help.status.success(), "{}", stderr(&help));
+    stdout(&help)
+        .lines()
+        .skip_while(|line| *line != "Commands:")
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|command| *command != "help")
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn every_command_the_binary_offers_is_driven_through_a_real_process() {
+    let offered = commands();
+
+    // Against a vacuous green. If clap ever laid its help out differently the parse above would
+    // find no commands and every assertion below would hold of nothing — green because it read
+    // nothing rather than because everything is covered. The same guard `tests/audit.rs` puts on
+    // its walk, for the same reason.
+    assert!(
+        offered.len() >= COVERED.len(),
+        "the help lists {} commands, fewer than the {} already covered, so the parse is reading \
+         the wrong thing: {offered:?}",
+        offered.len(),
+        COVERED.len()
+    );
+
+    let source = source_beyond_the_table();
+    for command in &offered {
+        let covered = COVERED
+            .iter()
+            .find(|covered| covered.command == command)
+            .unwrap_or_else(|| {
+                panic!(
+                    "`chronoloop {command}` is offered and nothing here runs it: drive it in a real \
+                     process and name the case beside the command"
+                )
+            });
+        assert!(
+            SOURCE.contains(&format!("fn {}(", covered.case)),
+            "`{command}` names `{}`, which is not a case in this file",
+            covered.case
+        );
+        assert!(
+            source.contains(&format!("\"{command}\"")),
+            "`{command}` is never handed to the binary as an argument here"
+        );
+    }
+
+    // And the other direction, which is how a command renamed or withdrawn is caught: a row naming
+    // a command the binary does not have asserts something about nothing.
+    for covered in &COVERED {
+        assert!(
+            offered.iter().any(|command| command == covered.command),
+            "`{}` is in the table and the binary does not offer it",
+            covered.command
+        );
+    }
+}
+
 #[test]
 fn a_run_of_one_seed_writes_the_same_bytes_every_time() {
     let first = chronoloop(&["run", "--seed", "20260917"]);
