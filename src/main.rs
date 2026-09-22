@@ -5,9 +5,11 @@
 //! history is what *happened*: `run --seed <n>` writes one and `replay <path>` reads one back, runs
 //! the seed it names again and compares. A trace is what happened **and what the world became**:
 //! `trace --seed <n>` writes one, and `inspect`, `diff` and `fork` read one back. A repro is a run
-//! that **broke**: `check` says whether a seed survives a schedule of faults, `shrink` cuts a
-//! failing schedule down to the faults the failure could not do without and writes what is left,
-//! and `reproduce <path>` reads one back and holds a later run to it.
+//! that **broke**: `sweep` asks a whole range of seeds whether any of them break under a schedule
+//! of faults, `check` asks one of them, `shrink` cuts a failing schedule down to the faults the
+//! failure could not do without and writes what is left, and `reproduce <path>` reads one back and
+//! holds a later run to it. Those four are one pipeline read left to right — a sweep finds a seed, a
+//! reduction makes its schedule readable, and a repro is what outlives the process that found it.
 //!
 //! In all three families the recorded side and the re-run side are separate processes reading a
 //! file. A check whose two sides both came from one run would only be comparing a pure function
@@ -16,10 +18,12 @@
 //! # A verdict goes where a complaint goes
 //!
 //! Good news leaves on standard output and the command succeeds; bad news leaves on standard error
-//! and it fails — which is what `replay` already does with a divergence, and what lets a sweep tell
+//! and it fails — which is what `replay` already does with a divergence, and what lets a script tell
 //! the two apart without reading either. Which of them a failing run is depends on what was asked:
 //! `check` asks whether the run held up, so a failure is bad news, while `reproduce` asks whether
-//! the failure came back, so a failure is the thing it wanted.
+//! the failure came back, so a failure is the thing it wanted. `sweep` is `check` asked of many
+//! seeds and answers the same question, so a seed that broke is bad news there too — which is also
+//! what lets a sweep over a system that has been fixed be read as going green.
 //!
 //! # Why the faults are not a flag on `run`, and a repro is not something `replay` reads
 //!
@@ -39,6 +43,7 @@
 //! run that still produces the file on the page.
 
 use core::fmt;
+use core::num::{NonZeroU64, NonZeroUsize};
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -51,10 +56,11 @@ use chronoloop::diff::{MissingState, diff, list};
 use chronoloop::fault::{FaultSchedule, ParseScheduleError};
 use chronoloop::fork::{Fork, UnreachedStep, fork};
 use chronoloop::history::{Entry, ParseRecordingError, Recording};
-use chronoloop::outcome::Outcome;
+use chronoloop::outcome::{Broke, Outcome};
 use chronoloop::repro::{ParseReproError, Repro, ReproError};
 use chronoloop::shrink::shrink;
 use chronoloop::store::StateStore;
+use chronoloop::sweep::{Survey, sweep};
 use chronoloop::systems::{RunError, pingpong, quorum, ring};
 use chronoloop::trace::{ParseTraceError, Step, Trace};
 
@@ -114,6 +120,21 @@ enum Command {
         /// The seed everything after that step is drawn from.
         #[arg(long)]
         seed: u64,
+    },
+    /// Run many seeds under a schedule of faults, and say which of them broke.
+    Sweep {
+        /// How many seeds to run, counting up from zero.
+        #[arg(long)]
+        seeds: NonZeroU64,
+        /// How many seeds to run at once.
+        ///
+        /// A cost rather than a choice: every count of workers sweeps the same seeds and finds the
+        /// same failures, so the default is the one that asks nothing of the machine.
+        #[arg(long, default_value = "1")]
+        jobs: NonZeroUsize,
+        /// The faults to put every run through.
+        #[arg(long)]
+        faults: PathBuf,
     },
     /// Run the coordinator under a schedule of faults, and say how it went.
     Check {
@@ -266,12 +287,9 @@ enum CliError {
     /// The reduced run could not be written down as a repro.
     Repro(ReproError),
     /// The run broke under the faults it was given.
-    Broke {
-        /// The seed it was run under.
-        seed: u64,
-        /// How it broke, in the form an outcome writes itself in.
-        outcome: Outcome,
-    },
+    Broke(Broke),
+    /// Some of the seeds a sweep covered broke under the faults they were given.
+    SomeSeedsBroke(Survey),
     /// The run held up, so there is no failure to cut down.
     NothingToReduce {
         /// The seed it was run under.
@@ -314,7 +332,22 @@ impl fmt::Display for CliError {
             Self::Repro(error) => write!(f, "{error}"),
             // The verdict itself, in the outcome's own written form: what a person is told is the
             // same text a repro would carry, rather than a second way of saying it.
-            Self::Broke { seed, outcome } => write!(f, "seed {seed}: {outcome}"),
+            Self::Broke(broke) => write!(f, "{broke}"),
+            // The count first, because it is the answer, and then a line per seed so that the seed
+            // to hand to `shrink` can be read straight off. In seed order, which is the whole of
+            // what makes a sweep say the same thing at every count of workers.
+            Self::SomeSeedsBroke(survey) => {
+                write!(
+                    f,
+                    "{} of {} seeds broke",
+                    survey.broke().len(),
+                    survey.swept()
+                )?;
+                for broke in survey.broke() {
+                    write!(f, "\n  {broke}")?;
+                }
+                Ok(())
+            }
             Self::NothingToReduce { seed } => write!(
                 f,
                 "seed {seed} held up under the faults it was given, so there is nothing to reduce"
@@ -348,7 +381,8 @@ impl std::error::Error for CliError {
             Self::Diverged(_)
             | Self::TraceDiverged(_)
             | Self::AlreadyForked(_)
-            | Self::Broke { .. }
+            | Self::Broke(_)
+            | Self::SomeSeedsBroke(_)
             | Self::NothingToReduce { .. }
             | Self::NotReproduced { .. } => None,
         }
@@ -470,16 +504,39 @@ fn schedule(path: &Path) -> Result<FaultSchedule, CliError> {
 /// A run that broke leaves as an error, because the question asked was whether it held up.
 fn checked(seed: u64, faults: &FaultSchedule) -> Result<String, CliError> {
     let (_, _, outcome) = quorum::run(seed, faults)?;
-    match outcome {
-        Outcome::Pass => Ok(format!(
+    match Broke::new(seed, outcome) {
+        None => Ok(format!(
             "seed {seed}: held up under {} faults\n",
             faults.len()
         )),
-        broke @ Outcome::Fail { .. } => Err(CliError::Broke {
-            seed,
-            outcome: broke,
-        }),
+        Some(broke) => Err(CliError::Broke(broke)),
     }
+}
+
+/// Runs the coordinator under `faults` for every seed below `seeds`, and says which of them broke.
+///
+/// Every seed is run even after one has broken, and the failures come back in seed order. Both of
+/// those are what keep the answer from depending on `jobs`, which buys wall-clock time and nothing
+/// else; [`sweep`] carries the argument in full.
+///
+/// A sweep that found something leaves as an error, for the reason [`checked`] does: the question
+/// asked was whether these seeds hold up.
+fn swept(
+    seeds: NonZeroU64,
+    jobs: NonZeroUsize,
+    faults: &FaultSchedule,
+) -> Result<String, CliError> {
+    let survey = sweep(seeds, jobs, |seed| {
+        quorum::run(seed, faults).map(|(_, _, outcome)| outcome)
+    })?;
+    if survey.broke().is_empty() {
+        return Ok(format!(
+            "swept {} seeds under {} faults: every one held up\n",
+            survey.swept(),
+            faults.len()
+        ));
+    }
+    Err(CliError::SomeSeedsBroke(survey))
 }
 
 /// Cuts `faults` down to what the failure needs, and writes the repro that is left.
@@ -620,6 +677,11 @@ fn execute(command: &Command) -> Result<String, CliError> {
             after,
         } => Loaded::read(path)?.compare(*before, *after),
         Command::Fork { path, at, seed } => Loaded::read(path)?.forked(*at, *seed),
+        Command::Sweep {
+            seeds,
+            jobs,
+            faults,
+        } => swept(*seeds, *jobs, &schedule(faults)?),
         Command::Check { seed, faults } => checked(*seed, &schedule(faults)?),
         Command::Shrink { seed, faults } => reduced(*seed, &schedule(faults)?),
         Command::Reproduce { path } => reproduced(&read(path)?),
@@ -676,90 +738,95 @@ mod tests {
             .unwrap_or_else(|e| panic!("a test expectation is one line: {e}"))
     }
 
-    #[test]
-    fn the_root_accepts_every_subcommand() {
-        struct Case {
-            name: &'static str,
-            argv: &'static [&'static str],
-            /// What the parsed command carries, as it describes itself.
-            want: &'static str,
+    /// An invocation the root has to accept, and what the command it parses to says it is.
+    struct Accepted {
+        name: &'static str,
+        argv: &'static [&'static str],
+        /// What the parsed command carries, as it describes itself.
+        want: &'static str,
+    }
+
+    /// Checks each invocation parses, and that what it parsed to is the command that was asked for.
+    fn parses(cases: &[Accepted]) {
+        for case in cases {
+            let cli =
+                Cli::try_parse_from(case.argv).unwrap_or_else(|e| panic!("{}: {e}", case.name));
+            assert_eq!(format!("{:?}", cli.command), case.want, "{}", case.name);
         }
-        let cases = [
-            Case {
+    }
+
+    /// An invocation the root has to turn away.
+    struct Refused {
+        name: &'static str,
+        argv: &'static [&'static str],
+    }
+
+    /// Checks each invocation is turned away rather than carried out as something else.
+    fn refuses(cases: &[Refused]) {
+        for case in cases {
+            assert!(Cli::try_parse_from(case.argv).is_err(), "{}", case.name);
+        }
+    }
+
+    // The tables below are split along the three families the module docs describe — a recorded
+    // history, a trace, and a run that broke — plus the root itself. One table of everything is how
+    // this started, and it outgrew what a person can read in one go.
+
+    #[test]
+    fn the_root_accepts_the_commands_that_write_and_read_a_recorded_history() {
+        parses(&[
+            Accepted {
                 name: "a run of the smallest seed",
                 argv: &["chronoloop", "run", "--seed", "0"],
                 want: "Run { seed: 0 }",
             },
-            Case {
+            Accepted {
                 name: "a run of the largest seed",
                 argv: &["chronoloop", "run", "--seed", "18446744073709551615"],
                 want: "Run { seed: 18446744073709551615 }",
             },
-            Case {
+            Accepted {
                 name: "a replay of a relative path",
                 argv: &["chronoloop", "replay", "run.history"],
                 want: "Replay { path: \"run.history\" }",
             },
-            Case {
+            Accepted {
                 name: "a replay of an absolute path",
                 argv: &["chronoloop", "replay", "/tmp/run.history"],
                 want: "Replay { path: \"/tmp/run.history\" }",
             },
-            Case {
+        ]);
+    }
+
+    #[test]
+    fn the_root_accepts_the_commands_that_read_a_trace() {
+        parses(&[
+            Accepted {
                 name: "a trace of a run",
                 argv: &["chronoloop", "trace", "--seed", "20260919"],
                 want: "Trace { seed: 20260919 }",
             },
-            Case {
+            Accepted {
                 name: "an inspection of a step",
                 argv: &["chronoloop", "inspect", "run.trace", "--step", "7"],
                 want: "Inspect { path: \"run.trace\", step: 7 }",
             },
-            Case {
+            Accepted {
                 name: "an inspection of the first step",
                 argv: &["chronoloop", "inspect", "run.trace", "--step", "0"],
                 want: "Inspect { path: \"run.trace\", step: 0 }",
             },
-            Case {
+            Accepted {
                 name: "a comparison of two steps",
                 argv: &["chronoloop", "diff", "run.trace", "7", "8"],
                 want: "Diff { path: \"run.trace\", before: 7, after: 8 }",
             },
-            Case {
+            Accepted {
                 name: "a comparison that reads backwards",
                 argv: &["chronoloop", "diff", "run.trace", "8", "7"],
                 want: "Diff { path: \"run.trace\", before: 8, after: 7 }",
             },
-            Case {
-                name: "a run under a schedule of faults",
-                argv: &[
-                    "chronoloop",
-                    "check",
-                    "--seed",
-                    "20260921",
-                    "--faults",
-                    "run.faults",
-                ],
-                want: "Check { seed: 20260921, faults: \"run.faults\" }",
-            },
-            Case {
-                name: "a reduction of a failing run",
-                argv: &[
-                    "chronoloop",
-                    "shrink",
-                    "--seed",
-                    "20260921",
-                    "--faults",
-                    "run.faults",
-                ],
-                want: "Shrink { seed: 20260921, faults: \"run.faults\" }",
-            },
-            Case {
-                name: "a repro put back through its run",
-                argv: &["chronoloop", "reproduce", "bug.repro"],
-                want: "Reproduce { path: \"bug.repro\" }",
-            },
-            Case {
+            Accepted {
                 name: "a fork of a step",
                 argv: &[
                     "chronoloop",
@@ -772,109 +839,212 @@ mod tests {
                 ],
                 want: "Fork { path: \"run.trace\", at: 7, seed: 99 }",
             },
-        ];
-        for case in cases {
-            let cli =
-                Cli::try_parse_from(case.argv).unwrap_or_else(|e| panic!("{}: {e}", case.name));
-            assert_eq!(format!("{:?}", cli.command), case.want, "{}", case.name);
-        }
+        ]);
     }
 
     #[test]
-    fn the_root_rejects_an_invocation_it_could_not_carry_out() {
-        struct Case {
-            name: &'static str,
-            argv: &'static [&'static str],
-        }
-        let cases = [
-            Case {
+    fn the_root_accepts_the_commands_that_ask_whether_a_run_broke() {
+        parses(&[
+            Accepted {
+                name: "a sweep of a range of seeds over several workers",
+                argv: &[
+                    "chronoloop",
+                    "sweep",
+                    "--seeds",
+                    "1000",
+                    "--jobs",
+                    "8",
+                    "--faults",
+                    "run.faults",
+                ],
+                want: "Sweep { seeds: 1000, jobs: 8, faults: \"run.faults\" }",
+            },
+            Accepted {
+                name: "a sweep that says nothing about workers, which is one of them",
+                argv: &[
+                    "chronoloop",
+                    "sweep",
+                    "--seeds",
+                    "1000",
+                    "--faults",
+                    "run.faults",
+                ],
+                want: "Sweep { seeds: 1000, jobs: 1, faults: \"run.faults\" }",
+            },
+            Accepted {
+                name: "a run under a schedule of faults",
+                argv: &[
+                    "chronoloop",
+                    "check",
+                    "--seed",
+                    "20260921",
+                    "--faults",
+                    "run.faults",
+                ],
+                want: "Check { seed: 20260921, faults: \"run.faults\" }",
+            },
+            Accepted {
+                name: "a reduction of a failing run",
+                argv: &[
+                    "chronoloop",
+                    "shrink",
+                    "--seed",
+                    "20260921",
+                    "--faults",
+                    "run.faults",
+                ],
+                want: "Shrink { seed: 20260921, faults: \"run.faults\" }",
+            },
+            Accepted {
+                name: "a repro put back through its run",
+                argv: &["chronoloop", "reproduce", "bug.repro"],
+                want: "Reproduce { path: \"bug.repro\" }",
+            },
+        ]);
+    }
+
+    #[test]
+    fn the_root_rejects_an_invocation_that_names_no_command_it_has() {
+        // `rewind` is a verb on no roadmap. A case written against something's absence stops being
+        // that case the day the thing exists — `shrink` sat here once and went on passing for want
+        // of a flag, which is a different complaint entirely and nothing said the coverage had
+        // moved.
+        refuses(&[
+            Refused {
                 name: "no subcommand",
                 argv: &["chronoloop"],
             },
-            Case {
+            Refused {
                 name: "a subcommand that does not exist",
                 argv: &["chronoloop", "rewind"],
             },
-            Case {
+        ]);
+    }
+
+    #[test]
+    fn the_root_rejects_a_history_it_could_not_write_or_read() {
+        refuses(&[
+            Refused {
                 name: "a run with no seed",
                 argv: &["chronoloop", "run"],
             },
-            Case {
+            Refused {
                 name: "a seed that is not a number",
                 argv: &["chronoloop", "run", "--seed", "lucky"],
             },
-            Case {
+            Refused {
                 name: "a negative seed",
                 argv: &["chronoloop", "run", "--seed", "-1"],
             },
-            Case {
+            Refused {
                 name: "a seed past the end of the range",
                 argv: &["chronoloop", "run", "--seed", "18446744073709551616"],
             },
-            Case {
+            Refused {
                 name: "a replay with no path",
                 argv: &["chronoloop", "replay"],
             },
-            Case {
+        ]);
+    }
+
+    #[test]
+    fn the_root_rejects_a_trace_it_could_not_read() {
+        refuses(&[
+            Refused {
                 name: "a trace with no seed",
                 argv: &["chronoloop", "trace"],
             },
-            Case {
+            Refused {
                 name: "an inspection with no step",
                 argv: &["chronoloop", "inspect", "run.trace"],
             },
-            Case {
+            Refused {
                 name: "an inspection with no trace to inspect",
                 argv: &["chronoloop", "inspect", "--step", "7"],
             },
-            Case {
+            Refused {
                 name: "a step that is not a number",
                 argv: &["chronoloop", "inspect", "run.trace", "--step", "last"],
             },
-            Case {
+            Refused {
                 name: "a step before the first one",
                 argv: &["chronoloop", "inspect", "run.trace", "--step", "-1"],
             },
-            Case {
+            Refused {
                 name: "a comparison with only one step",
                 argv: &["chronoloop", "diff", "run.trace", "7"],
             },
-            Case {
+            Refused {
                 name: "a comparison with a third step",
                 argv: &["chronoloop", "diff", "run.trace", "7", "8", "9"],
             },
-            Case {
-                name: "a run under no faults, which is what `run` is for",
-                argv: &["chronoloop", "check", "--seed", "20260921"],
-            },
-            Case {
-                name: "faults to put no particular seed through",
-                argv: &["chronoloop", "check", "--faults", "run.faults"],
-            },
-            Case {
-                name: "a reduction with no faults to reduce",
-                argv: &["chronoloop", "shrink", "--seed", "20260921"],
-            },
-            Case {
-                name: "a reduction of no particular seed",
-                argv: &["chronoloop", "shrink", "--faults", "run.faults"],
-            },
-            Case {
-                name: "a repro that is not named",
-                argv: &["chronoloop", "reproduce"],
-            },
-            Case {
+            Refused {
                 name: "a fork with no seed to fork to",
                 argv: &["chronoloop", "fork", "run.trace", "--at", "7"],
             },
-            Case {
+            Refused {
                 name: "a fork with no step to fork at",
                 argv: &["chronoloop", "fork", "run.trace", "--seed", "99"],
             },
-        ];
-        for case in cases {
-            assert!(Cli::try_parse_from(case.argv).is_err(), "{}", case.name);
-        }
+        ]);
+    }
+
+    #[test]
+    fn the_root_rejects_a_question_about_a_failing_run_it_could_not_answer() {
+        refuses(&[
+            Refused {
+                name: "a sweep with no range to sweep",
+                argv: &["chronoloop", "sweep", "--faults", "run.faults"],
+            },
+            Refused {
+                name: "a sweep with no faults to sweep under",
+                argv: &["chronoloop", "sweep", "--seeds", "1000"],
+            },
+            Refused {
+                name: "a sweep of no seeds, which would hold up by having run nothing",
+                argv: &[
+                    "chronoloop",
+                    "sweep",
+                    "--seeds",
+                    "0",
+                    "--faults",
+                    "run.faults",
+                ],
+            },
+            Refused {
+                name: "a sweep on no workers, which would never run anything either",
+                argv: &[
+                    "chronoloop",
+                    "sweep",
+                    "--seeds",
+                    "1000",
+                    "--jobs",
+                    "0",
+                    "--faults",
+                    "run.faults",
+                ],
+            },
+            Refused {
+                name: "a run under no faults, which is what `run` is for",
+                argv: &["chronoloop", "check", "--seed", "20260921"],
+            },
+            Refused {
+                name: "faults to put no particular seed through",
+                argv: &["chronoloop", "check", "--faults", "run.faults"],
+            },
+            Refused {
+                name: "a reduction with no faults to reduce",
+                argv: &["chronoloop", "shrink", "--seed", "20260921"],
+            },
+            Refused {
+                name: "a reduction of no particular seed",
+                argv: &["chronoloop", "shrink", "--faults", "run.faults"],
+            },
+            Refused {
+                name: "a repro that is not named",
+                argv: &["chronoloop", "reproduce"],
+            },
+        ]);
     }
 
     /// A writer that fails every write and every flush the same way.
@@ -1401,6 +1571,87 @@ mod tests {
             "seed 20260921 does not reproduce what the repro names\n  \
              expected: failed at step 14: round 4 lost quorum\n  \
              produced: failed at step 14: round 3 lost quorum"
+        );
+    }
+
+    /// How many seeds the sweep cases cover: few enough for CI, enough for a scattered answer.
+    const SWEPT: u64 = 20;
+
+    /// Faults no seed in that range breaks under — a link nobody uses, and losses on one between two
+    /// replicas, which never speak to each other.
+    ///
+    /// Not an empty schedule: a sweep under no faults at all would be green because the coordinator
+    /// cannot fail without them, which says nothing about the sweep.
+    const MILD: &str = "chronoloop faults\n\
+                        partition on node 4 -> node 5 from 0.000000000s until forever\n\
+                        loss 1 in 2 on node 2 -> node 3 from 0.000000000s until forever\n";
+
+    /// A range of seeds, failing the test rather than returning an error no case expects.
+    fn range(count: u64) -> NonZeroU64 {
+        NonZeroU64::new(count).unwrap_or_else(|| panic!("a sweep covers at least one seed"))
+    }
+
+    /// A count of workers, the same way.
+    fn workers(count: usize) -> NonZeroUsize {
+        NonZeroUsize::new(count).unwrap_or_else(|| panic!("a sweep runs on at least one worker"))
+    }
+
+    #[test]
+    fn sweeping_says_which_seeds_broke_and_says_so_when_none_did() {
+        // Both sides of the one question `sweep` asks, over the schedule whose failures the run's
+        // draws take part in: half of these twenty seeds break under it and half do not, which is
+        // the only shape of fixture that can tell a sweep from a loop that answers the same way
+        // whatever is drawn. The outage schedule above would fail every seed identically.
+        assert_eq!(
+            swept(range(SWEPT), workers(1), &faults(MILD)).unwrap_or_else(|e| panic!("{e}")),
+            "swept 20 seeds under 2 faults: every one held up\n"
+        );
+
+        let found = swept(range(SWEPT), workers(1), &faults(LOSSY))
+            .err()
+            .unwrap_or_else(|| panic!("those faults are enough to break some of twenty seeds"));
+        assert_eq!(
+            found.to_string(),
+            "10 of 20 seeds broke\n  \
+             seed 0: failed at step 13: round 3 lost quorum\n  \
+             seed 3: failed at step 13: round 3 lost quorum\n  \
+             seed 4: failed at step 13: round 3 lost quorum\n  \
+             seed 5: failed at step 13: round 3 lost quorum\n  \
+             seed 7: failed at step 13: round 3 lost quorum\n  \
+             seed 8: failed at step 13: round 3 lost quorum\n  \
+             seed 12: failed at step 13: round 3 lost quorum\n  \
+             seed 16: failed at step 13: round 3 lost quorum\n  \
+             seed 17: failed at step 13: round 3 lost quorum\n  \
+             seed 18: failed at step 13: round 3 lost quorum",
+            "the count, and then a line per seed in seed order"
+        );
+    }
+
+    #[test]
+    fn the_seed_a_sweep_found_is_a_seed_the_reduction_takes() {
+        // What the command is for, in one step rather than three processes: a sweep hands back a
+        // seed, and that seed under the same faults is something `shrink` will reduce. A sweep
+        // naming a seed nothing can be done with would be a sweep of no use at all.
+        let lossy = faults(LOSSY);
+        let found = swept(range(SWEPT), workers(4), &lossy)
+            .err()
+            .unwrap_or_else(|| panic!("some of twenty seeds break under those faults"));
+        let CliError::SomeSeedsBroke(survey) = found else {
+            panic!("a sweep that found failures reports them: {found}")
+        };
+
+        let seed = survey
+            .broke()
+            .first()
+            .unwrap_or_else(|| panic!("the survey holds the failures it counted"))
+            .seed();
+        assert!(
+            reduced(seed, &lossy).is_ok(),
+            "seed {seed} broke under these faults, so there is a reduction of it"
+        );
+        assert!(
+            checked(seed, &lossy).is_err(),
+            "and it is the same failure `check` would have reported for it"
         );
     }
 

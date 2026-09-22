@@ -19,17 +19,23 @@
 //! forbidden spelling is written out below as a literal, so without the skip the audit would be its
 //! own first violation. That is asserted rather than assumed.
 //!
-//! In two places this is deliberately stricter than the rule it enforces. A seed sweep is entitled
-//! to real threads — each seed is an independent single-threaded run, and nothing about that makes
-//! a history depend on how the operating system interleaved them — but the four thread spellings
-//! below are forbidden in every file the scan reads, sweeps included. A scan cannot tell a sweep
-//! from a simulation; the exemption would have to be a file's name, and a file's name is a poor
-//! account of what the code in it does. It is the same argument that forbids `HashMap` in all of
-//! `src/` rather than only where a simulation can see it. When a sweep here wants threads, this is
-//! the decision to re-open — visibly, in a commit that says which file is being trusted and why,
-//! rather than by widening a needle until the build goes quiet.
+//! One file is trusted with one rule. A seed sweep is entitled to real threads — each seed is an
+//! independent single-threaded run, and a report merged by seed does not depend on how the
+//! operating system interleaved them — so `src/sweep.rs` is excused the thread rule and **nothing
+//! else**: every other needle still counts inside it, and every other file is still forbidden a
+//! thread. The trust is a table naming the file and the one jewel, so a second file wanting threads
+//! is a visible change to that table rather than a needle quietly weakened until the build goes
+//! quiet. It is held to account rather than taken on faith: a trusted path that is not here, or
+//! that turns out not to break the rule it is trusted for, fails the build in its own right, since
+//! an exemption that excuses nothing is a comment.
 //!
-//! The other is `UNIX_EPOCH`, which is a constant and reads nothing: an instant rendered against it
+//! The alternative was weakening the needles, and it is worse in the way that matters. A scan
+//! cannot tell a sweep from a simulation, so the exemption is a file's name either way — a poor
+//! account of what the code in a file does, but one that a reader finds in one table, where a
+//! widened needle stops matching everywhere at once and says so nowhere.
+//!
+//! Where this is still stricter than the rule it enforces is `UNIX_EPOCH`, which is a constant and
+//! reads nothing: an instant rendered against it
 //! is as deterministic as the instant was. What reaches the machine is an elapsed or a duration
 //! measured from it, and a scan cannot tell one from the other, so the name is forbidden outright.
 //! A simulation has no call for the wall clock's origin either way — a recorded instant is a
@@ -416,6 +422,28 @@ static BOUNDARIES: [Boundary; 8] = [
     },
 ];
 
+/// A file trusted to break one rule, and why it may.
+struct Trusted {
+    /// The file, spelled relative to the crate root the way a report spells one.
+    path: &'static str,
+    /// The one jewel it may break. Every other needle in the table above still counts inside it.
+    jewel: &'static str,
+    /// Why that rule does not reach this file.
+    why: &'static str,
+}
+
+/// Every file trusted with a rule, which is the whole of what this scan lets through.
+///
+/// Kept deliberately short and deliberately specific: a path and a jewel, not a path. Trusting a
+/// file outright would excuse the wall clock and the operating system's entropy in the same breath
+/// as the thread it was actually about.
+static TRUSTED: [Trusted; 1] = [Trusted {
+    path: "src/sweep.rs",
+    jewel: ONE_THREAD,
+    why: "a seed sweep runs each seed as an independent single-threaded simulation and merges the \
+          answers by seed, so no part of what it reports comes from how the work was split",
+}];
+
 /// Whether a character continues a name rather than ending one.
 fn continues_a_name(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
@@ -557,15 +585,34 @@ fn report(path: &Path, line: usize, rule: &Rule) -> String {
     )
 }
 
+/// Whether `rule` is one `path` is trusted to break.
+///
+/// The comparison is against the name a report would print — `relative` of the walked path — rather
+/// than against a resolved one. A checkout reached through a link then fails to match and the
+/// violation is reported, which is the direction to be wrong in: a trust that matched too widely
+/// would excuse a thread in a file nobody decided to trust.
+fn excused(path: &Path, rule: &Rule) -> bool {
+    TRUSTED
+        .iter()
+        .any(|trusted| rule.jewel == trusted.jewel && relative(path) == Path::new(trusted.path))
+}
+
+/// Every rule `text` breaks that `path` is not trusted to break, spelled as the failure reports it.
+fn violations(path: &Path, text: &str) -> Vec<String> {
+    scan(text)
+        .into_iter()
+        .filter(|(_, rule)| !excused(path, rule))
+        .map(|(line, rule)| report(path, line, rule))
+        .collect()
+}
+
 #[test]
 fn nothing_in_the_engine_reaches_past_the_simulation() {
     let mut broken = Vec::new();
     for path in sources() {
         let text = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
-        for (line, rule) in scan(&text) {
-            broken.push(report(&path, line, rule));
-        }
+        broken.extend(violations(&path, &text));
     }
 
     assert!(
@@ -705,6 +752,79 @@ fn the_audit_does_not_read_itself() {
     assert!(
         !scan(&text).is_empty(),
         "without the skip this file would be the audit's own first failure"
+    );
+}
+
+/// A line holding a thread, and one holding a map, so a case can say which of the two got through.
+const THREADED: &str = "    std::thread::scope(|region| region.spawn(|| sweep(seeds)));";
+
+/// The other half of that fixture, breaking a rule nothing is trusted with.
+const UNORDERED: &str = "    let mut seen: HashMap<NodeId, u64> = HashMap::new();";
+
+#[test]
+fn a_trusted_file_is_here_and_really_does_break_the_rule_it_is_trusted_for() {
+    // Both halves of the same worry. A trust naming a file that is not read excuses nothing and
+    // nothing says so; a trust naming a file that never breaks the rule is a line of prose that
+    // reads like a decision. Either way the next person to add a thread somewhere else finds a
+    // table that appears to have worked and does not.
+    for trusted in &TRUSTED {
+        let path = root().join(trusted.path);
+        assert!(
+            sources().contains(&path),
+            "{} is trusted with `{}` and is not a file this scan reads",
+            trusted.path,
+            trusted.jewel
+        );
+
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+        let excused: Vec<&str> = scan(&text)
+            .iter()
+            .filter(|(_, rule)| rule.jewel == trusted.jewel)
+            .map(|&(_, rule)| rule.needle)
+            .collect();
+        assert!(
+            !excused.is_empty(),
+            "{} is trusted to break `{}` — {} — and breaks it nowhere, so the trust excuses \
+             nothing and is a comment",
+            trusted.path,
+            trusted.jewel,
+            trusted.why
+        );
+    }
+}
+
+#[test]
+fn a_trusted_file_is_trusted_for_one_rule_and_not_for_the_rest() {
+    // The whole point of trusting a jewel rather than a path. The sweep may start a thread; it may
+    // not reach the operating system's entropy, read the machine's clock, or iterate a map in an
+    // order that came from somewhere other than the seed.
+    let trusted = root().join(TRUSTED[0].path);
+    let source = format!("{THREADED}\n{UNORDERED}\n");
+
+    let found = violations(&trusted, &source);
+
+    assert_eq!(found.len(), 1, "one of the two got through: {found:?}");
+    assert!(
+        found[0].contains("HashMap") && found[0].contains(ORDERED),
+        "the map is still a violation in the one file allowed a thread: {}",
+        found[0]
+    );
+}
+
+#[test]
+fn only_the_file_the_table_names_is_trusted_with_a_thread() {
+    // And the trust reaches exactly one file. The same line in the engine proper is what it always
+    // was, which is what keeps this from being an exemption for `src/` at large.
+    let elsewhere = root().join("src").join("executor.rs");
+
+    let found = violations(&elsewhere, THREADED);
+
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("thread::scope") && found[0].contains(ONE_THREAD),
+        "{}",
+        found[0]
     );
 }
 

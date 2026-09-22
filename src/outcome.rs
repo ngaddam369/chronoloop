@@ -171,6 +171,62 @@ impl fmt::Display for Outcome {
     }
 }
 
+/// How a seed is named where a failing run is reported.
+const SEED: &str = "seed ";
+
+/// A seed, and the failure the run under it produced.
+///
+/// More than one command has to say *which* run broke and how, and a form spelled in two places is
+/// two things to keep in step — the argument that already keeps the state encoding in
+/// [`crate::world`] and the fault header in [`crate::fault`] to one copy each. The failure itself is
+/// written by [`Outcome`], so this adds the seed in front of it and nothing else.
+///
+/// A run that held up cannot be made into one of these. That is settled at construction rather than
+/// wherever the value is printed, the way [`Reason::new`] settles what a reason may be: a report of
+/// a failure that is not a failure names nothing a reader can go and look at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Broke {
+    seed: u64,
+    failure: Outcome,
+}
+
+impl Broke {
+    /// Returns how the run under `seed` broke, or [`None`] if it held up.
+    ///
+    /// ```
+    /// use chronoloop::outcome::{Broke, Outcome, Reason};
+    ///
+    /// let failure = Outcome::Fail { reason: Reason::new("round 3 lost quorum")?, step: 14 };
+    ///
+    /// assert_eq!(
+    ///     Broke::new(20_260_921, failure).map(|broke| broke.to_string()).as_deref(),
+    ///     Some("seed 20260921: failed at step 14: round 3 lost quorum"),
+    /// );
+    /// assert_eq!(Broke::new(7, Outcome::Pass), None);
+    /// # Ok::<(), chronoloop::outcome::ReasonError>(())
+    /// ```
+    pub fn new(seed: u64, outcome: Outcome) -> Option<Self> {
+        match outcome {
+            Outcome::Pass => None,
+            failure @ Outcome::Fail { .. } => Some(Self { seed, failure }),
+        }
+    }
+
+    /// Returns the seed the run that broke was drawn from.
+    ///
+    /// This is what a reduction is asked for next: the seed goes back in at `shrink --seed`, which
+    /// is the whole reason a sweep names the seeds it does rather than counting them.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+}
+
+impl fmt::Display for Broke {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{SEED}{}{BECAUSE}{}", self.seed, self.failure)
+    }
+}
+
 /// Returned when an outcome could not be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -233,6 +289,62 @@ mod tests {
         Outcome::Fail {
             reason: reason(text),
             step,
+        }
+    }
+
+    #[test]
+    fn a_seed_that_broke_is_written_as_the_seed_and_what_its_run_did() {
+        // One form for "which run, and how it went", so that every command reporting a failing seed
+        // says it the same way and there is one place to keep in step. A run that held up did not
+        // break, and is refused where the value is made rather than written out as a failure that
+        // is not one — the rule `Repro::new` already follows for a repro naming a run that passed.
+        struct Case {
+            name: &'static str,
+            seed: u64,
+            outcome: Outcome,
+            /// What a person is shown, or nothing at all because there is no failure to show.
+            want: Option<&'static str>,
+        }
+        let cases = [
+            Case {
+                name: "a failure, named by its seed and written in the outcome's own form",
+                seed: 20_260_921,
+                outcome: failed("round 3 lost quorum", 14),
+                want: Some("seed 20260921: failed at step 14: round 3 lost quorum"),
+            },
+            Case {
+                name: "the smallest seed",
+                seed: 0,
+                outcome: failed("round 1 lost quorum", 2),
+                want: Some("seed 0: failed at step 2: round 1 lost quorum"),
+            },
+            Case {
+                name: "the largest seed",
+                seed: u64::MAX,
+                outcome: failed("round 5 lost quorum", 0),
+                want: Some("seed 18446744073709551615: failed at step 0: round 5 lost quorum"),
+            },
+            Case {
+                name: "a run that held up, which is not a run that broke",
+                seed: 7,
+                outcome: Outcome::Pass,
+                want: None,
+            },
+        ];
+        for case in cases {
+            let broke = Broke::new(case.seed, case.outcome);
+            assert_eq!(
+                broke.as_ref().map(ToString::to_string).as_deref(),
+                case.want,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                broke.map(|broke| broke.seed()),
+                case.want.map(|_| case.seed),
+                "{}: and it still knows which run it was",
+                case.name
+            );
         }
     }
 

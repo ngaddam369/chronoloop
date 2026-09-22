@@ -101,6 +101,17 @@
 //! run of a five-node system comes to under a third of a kilobyte, which is small enough to commit as
 //! a fixture and hand to a run months later.
 //!
+//! All of that starts from a seed that is known to break, and [`sweep`] is what finds one: it runs a
+//! whole range of seeds under one schedule of faults and hands back the ones that could not take it,
+//! each of which is something a reduction can then cut down. Seeds are independent — a run of one
+//! draws nothing from a run of another — so this is the one place in the engine that uses real
+//! threads, and the fourth determinism rule is untouched because every run is still a
+//! single-threaded simulation on an executor of its own. What the rule does demand is that nothing
+//! about the answer come from the split, so a sweep runs every seed even after one has broken and
+//! merges what the workers found **by seed**: `--jobs` buys wall-clock time and moves nothing else.
+//! The scan in `tests/audit.rs` names that one file as the one place a thread is allowed, for that
+//! one rule, in a table that says why.
+//!
 //! [`fork`]: fork::fork
 //! [`ring`]: systems::ring
 //! [`quorum`]: systems::quorum
@@ -118,6 +129,7 @@
 //! [`FaultSchedule`]: fault::FaultSchedule
 //! [`Outcome`]: outcome::Outcome
 //! [`shrink`]: shrink::shrink
+//! [`sweep`]: sweep::sweep
 //! [`Reduction`]: shrink::Reduction
 //! [`Repro`]: repro::Repro
 //! [`pingpong`]: systems::pingpong
@@ -141,6 +153,7 @@ pub mod repro;
 pub mod rng;
 pub mod shrink;
 pub mod store;
+pub mod sweep;
 pub mod systems;
 pub mod trace;
 pub mod world;

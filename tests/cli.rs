@@ -230,6 +230,19 @@ fn a_failing_run_that_cannot_be_asked_about_fails_and_says_why() {
             mentions: "chronoloop repro seed",
         },
         Refused {
+            name: "a sweep on no workers, which would never run anything",
+            args: vec![
+                "sweep".to_owned(),
+                "--seeds".to_owned(),
+                SWEPT.to_owned(),
+                "--jobs".to_owned(),
+                "0".to_owned(),
+                "--faults".to_owned(),
+                arg(&survivable).to_owned(),
+            ],
+            mentions: "--jobs",
+        },
+        Refused {
             name: "faults the run holds up under, which have no failure to reduce",
             args: vec![
                 "shrink".to_owned(),
@@ -452,6 +465,18 @@ const LOSSY: &str = "chronoloop faults\n\
                      loss 1 in 2 on node 0 -> node 3 from 15.000000000s until 15.000000001s\n\
                      partition on node 0 -> node 4 from 15.000000000s until 15.000000001s\n";
 
+/// How many seeds the sweep cases cover, which is few enough to run in CI.
+const SWEPT: &str = "20";
+
+/// Faults no seed in that range breaks under — a link nobody uses, and losses on one between two
+/// replicas, which never speak to each other.
+///
+/// Not an empty schedule: the coordinator cannot fail without faults, so a sweep under none would
+/// be green for a reason that says nothing about the sweep.
+const MILD: &str = "chronoloop faults\n\
+                    partition on node 4 -> node 5 from 0.000000000s until forever\n\
+                    loss 1 in 2 on node 2 -> node 3 from 0.000000000s until forever\n";
+
 #[test]
 fn checking_a_run_that_broke_says_how_it_broke_and_fails() {
     // `check` asks whether the run held up, so a run that did not is bad news: the verdict goes where
@@ -550,5 +575,136 @@ fn a_repro_naming_a_failure_the_run_does_not_produce_is_refused() {
     assert!(
         complaint.contains("round 3 lost quorum"),
         "and what the run actually did: {complaint}"
+    );
+}
+
+#[test]
+fn sweeping_names_every_seed_that_broke_and_fails() {
+    // `sweep` is `check` asked of a range, so it answers the same way: a seed that broke is bad
+    // news, the verdict goes where every other complaint goes, and the exit code says so. The
+    // schedule is the one whose failures the run's draws take part in — half of these twenty seeds
+    // break under it — because a sweep asserted against the outage schedule would name every seed
+    // whatever the engine drew.
+    let path = scratch_file("swept.faults", LOSSY);
+
+    let swept = chronoloop(&[
+        "sweep",
+        "--seeds",
+        SWEPT,
+        "--jobs",
+        "4",
+        "--faults",
+        arg(&path),
+    ]);
+
+    assert!(!swept.status.success(), "seeds that broke are a failure");
+    assert_eq!(
+        stderr(&swept),
+        "chronoloop: 10 of 20 seeds broke\n  \
+         seed 0: failed at step 13: round 3 lost quorum\n  \
+         seed 3: failed at step 13: round 3 lost quorum\n  \
+         seed 4: failed at step 13: round 3 lost quorum\n  \
+         seed 5: failed at step 13: round 3 lost quorum\n  \
+         seed 7: failed at step 13: round 3 lost quorum\n  \
+         seed 8: failed at step 13: round 3 lost quorum\n  \
+         seed 12: failed at step 13: round 3 lost quorum\n  \
+         seed 16: failed at step 13: round 3 lost quorum\n  \
+         seed 17: failed at step 13: round 3 lost quorum\n  \
+         seed 18: failed at step 13: round 3 lost quorum\n"
+    );
+    assert!(
+        stdout(&swept).is_empty(),
+        "the verdict is the complaint, and it is not said twice"
+    );
+}
+
+#[test]
+fn sweeping_under_faults_nothing_breaks_under_says_so_and_succeeds() {
+    // The half a sweep over a system that has been fixed would print, which is what makes "the
+    // sweep went green" a thing a person can read off the exit code.
+    let path = scratch_file("swept-clean.faults", MILD);
+
+    let swept = chronoloop(&[
+        "sweep",
+        "--seeds",
+        SWEPT,
+        "--jobs",
+        "4",
+        "--faults",
+        arg(&path),
+    ]);
+
+    assert!(swept.status.success(), "{}", stderr(&swept));
+    assert_eq!(
+        stdout(&swept),
+        "swept 20 seeds under 2 faults: every one held up\n"
+    );
+}
+
+#[test]
+fn a_sweep_reports_the_same_seeds_however_many_workers_it_is_given() {
+    // Across real processes, which is where a count of workers is a count of threads. What holds it
+    // is the merge being by seed; `tests/sweep.rs` says so beside the library-side case.
+    let path = scratch_file("swept-jobs.faults", LOSSY);
+    let sweeping = |jobs: &str| {
+        let swept = chronoloop(&[
+            "sweep",
+            "--seeds",
+            SWEPT,
+            "--jobs",
+            jobs,
+            "--faults",
+            arg(&path),
+        ]);
+        assert!(!swept.status.success(), "{jobs}: {}", stdout(&swept));
+        stderr(&swept)
+    };
+
+    let alone = sweeping("1");
+    assert!(
+        alone.contains("10 of 20 seeds broke"),
+        "one worker found them: {alone}"
+    );
+    for jobs in ["2", "3", "8", "64"] {
+        assert_eq!(sweeping(jobs), alone, "{jobs} workers");
+    }
+}
+
+#[test]
+fn a_seed_a_sweep_found_is_a_seed_the_rest_of_the_family_takes() {
+    // The pipeline the command exists for, end to end across four processes and three files: a
+    // sweep finds a seed, `shrink` cuts its schedule down to a repro, and the repro alone puts a
+    // later run back where it was. The seed is read off what the sweep printed rather than written
+    // in here, which is what makes this a test of the sweep's answer and not of a constant.
+    let faults = scratch_file("pipeline.faults", LOSSY);
+    let swept = chronoloop(&[
+        "sweep",
+        "--seeds",
+        SWEPT,
+        "--jobs",
+        "4",
+        "--faults",
+        arg(&faults),
+    ]);
+    assert!(!swept.status.success(), "{}", stdout(&swept));
+
+    let complaint = stderr(&swept);
+    let seed = complaint
+        .lines()
+        .nth(1)
+        .and_then(|line| line.trim().strip_prefix("seed "))
+        .and_then(|line| line.split(':').next())
+        .unwrap_or_else(|| panic!("a sweep names the seeds it found: {complaint}"));
+
+    let shrunk = chronoloop(&["shrink", "--seed", seed, "--faults", arg(&faults)]);
+    assert!(shrunk.status.success(), "{}", stderr(&shrunk));
+    let repro = scratch_file("swept.repro", &stdout(&shrunk));
+
+    let reproduced = chronoloop(&["reproduce", arg(&repro)]);
+    assert!(reproduced.status.success(), "{}", stderr(&reproduced));
+    assert!(
+        stdout(&reproduced).starts_with(&format!("seed {seed}: failed at step ")),
+        "the repro puts the seed the sweep found back through its failure: {}",
+        stdout(&reproduced)
     );
 }
