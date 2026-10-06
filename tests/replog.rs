@@ -45,13 +45,16 @@
 //! the world it recorded. Nothing here makes a run break that order, since nothing in the module
 //! does; the unit cases beside it hold the check to account on worlds built to break it.
 
+use core::ops::Range;
 use std::collections::{BTreeMap, BTreeSet};
 
 use chronoloop::clock::VirtualTime;
 use chronoloop::fault::FaultSchedule;
 use chronoloop::outcome::Outcome;
+use chronoloop::store::StateStore;
 use chronoloop::systems::replog;
 use chronoloop::trace::Trace;
+use chronoloop::world::{Name, Value, World};
 
 #[path = "common/survey.rs"]
 mod survey;
@@ -488,35 +491,85 @@ const SEND_ONLY: &str = "chronoloop faults\n\
 /// How many whole seconds [`deposing`] keeps a leader from its followers.
 const DEPOSED_FOR: u64 = 6;
 
-/// The replica `trace` says leads at `at`, in nanoseconds: the one named by the last step before
-/// then that says a replica became leader.
-fn leading(trace: &Trace, at: u64) -> Option<&str> {
+/// One second, in the nanoseconds a step's instant is read in.
+const SECOND: u64 = 1_000_000_000;
+
+/// The replicas `trace` says became leader at an instant within `during`, in nanoseconds, each with
+/// the term it led, in the order they did.
+fn elected(trace: &Trace, during: Range<u64>) -> impl Iterator<Item = (&str, u64)> {
     trace
         .steps()
         .iter()
-        .filter(|step| step.event().at().as_nanos() < at)
+        .filter(move |step| during.contains(&step.event().at().as_nanos()))
         .filter_map(|step| step.event().message().split_once(" became leader of term "))
-        .map(|(who, _)| who)
-        .next_back()
+        .filter_map(|(who, term)| Some((who, term.parse().ok()?)))
 }
 
-/// The replica leading `seed`'s run with nothing in its way, as its node number, and the first
-/// whole second from three on at which one leads: whom [`deposing`] cuts off for that seed, and
-/// from when.
+/// The replica `trace` says leads at `at`, in nanoseconds: the one named by the last step before
+/// then that says a replica became leader. Read off what the steps *say*, so it does not see a
+/// leader step down — which is why [`first_deposable`] reads the world instead.
+fn leading(trace: &Trace, at: u64) -> Option<&str> {
+    elected(trace, 0..at).last().map(|(who, _)| who)
+}
+
+/// The replica leading at `at`, in nanoseconds, in a finished run, as its node number.
+///
+/// Read off the world the last step before `at` recorded rather than off what the steps say: the
+/// replica whose role is leader — the one in the latest term, should a leader deposed not have
+/// heard so yet — and nobody if no replica is leading, as when a leader has stepped down and the
+/// election after it is not won. No seed of the sweep's five hundred has that happen before its
+/// cut, so nothing here reaches that last branch; what the world buys today is a route to the
+/// leader the steps' own account does not take.
+fn leader_at(trace: &Trace, store: &StateStore, at: u64) -> Option<u64> {
+    let step = trace
+        .steps()
+        .iter()
+        .rfind(|step| step.event().at().as_nanos() < at)?;
+    let node = store
+        .get(step.state())
+        .unwrap_or_else(|| panic!("the store holds every state the trace names"));
+    let world = World::try_from(&node).unwrap_or_else(|e| panic!("a recorded world: {e}"));
+    let (role, term) = (name("role"), name("term"));
+    world
+        .resources()
+        .filter(|(_, replica)| replica.get(&role) == Some(&Value::Text("leader".into())))
+        .filter_map(|(who, replica)| match replica.get(&term) {
+            Some(Value::Count(term)) => Some((*term, who)),
+            _ => None,
+        })
+        .max()
+        .and_then(|(_, who)| who.as_str().strip_prefix("node-")?.parse().ok())
+}
+
+/// A name, failing the test if it is not one.
+fn name(text: &str) -> Name {
+    Name::new(text).unwrap_or_else(|e| panic!("{text} is a name: {e}"))
+}
+
+/// The replica leading a run with nothing in its way, as its node number, and the first whole
+/// second from three on at which one leads: whom [`deposing`] cuts off for that seed, and from
+/// when.
 ///
 /// Read off the run with nothing in its way because it is the run with the cut, up to the instant
 /// the cut begins: a fault decides nothing about a message sent before it is in force, and a fault
 /// in force still draws against its odds. Three seconds, as [`DEPOSED`] has it, unless no replica
-/// has won an election by then, which a split vote can see to.
-fn first_deposable(seed: u64) -> (u64, u64) {
-    let (trace, _) = runs(seed, &FaultSchedule::default());
+/// leads then, which a split vote can see to.
+fn first_deposable(trace: &Trace, store: &StateStore) -> (u64, u64) {
     (3..10)
-        .find_map(|second| {
-            let leader = leading(&trace, second * 1_000_000_000)?;
-            let node = leader.strip_prefix("node-")?.parse().ok()?;
-            Some((node, second))
+        .find_map(|second| Some((leader_at(trace, store, second * SECOND)?, second)))
+        .unwrap_or_else(|| {
+            panic!(
+                "seed {} has a leader before ten seconds: {trace}",
+                trace.seed()
+            )
         })
-        .unwrap_or_else(|| panic!("seed {seed} elects a leader before ten seconds: {trace}"))
+}
+
+/// [`first_deposable`] for `seed`, running it with nothing in its way.
+fn deposable(seed: u64) -> (u64, u64) {
+    let (trace, store, _) = replog::run(seed, &FaultSchedule::default())
+        .unwrap_or_else(|e| panic!("seed {seed} did not finish: {e}"));
+    first_deposable(&trace, &store)
 }
 
 /// [`DEPOSED`]'s shape around `node`: cut off from every other replica both ways for
@@ -542,7 +595,7 @@ fn the_deposed_leader_of_the_seed_run_here_is_the_one_every_seed_is_swept_under(
     // is a fact about the timings and not about the schedule — so it is asserted, and a change that
     // moves the first election turns this red rather than turning the single-seed case into a
     // follower cut off.
-    assert_eq!(first_deposable(SEED), (5, 3));
+    assert_eq!(deposable(SEED), (5, 3));
     assert_eq!(deposing(5, 3), faults(DEPOSED));
 }
 
@@ -550,34 +603,28 @@ fn the_deposed_leader_of_the_seed_run_here_is_the_one_every_seed_is_swept_under(
 fn each_seed_is_deposed_of_the_leader_it_actually_elected() {
     // The sweep under the deposed leader cannot tell a leader cut off from a follower cut off — the
     // system holds up either way — so this is what holds the derivation to account, by a second
-    // route: the run *with* the cut, read for who was leading when it began and who led while it
-    // lasted. Seeds 0 to 26 put the first election on each of the five replicas, and on seed 8
-    // nobody has won one by three seconds — both asserted below, since a seed chosen for its timings
-    // is a hypothesis about the next version of them.
+    // route: the derivation reads the role each replica's world records in the run with nothing in
+    // its way, and this reads what the steps of the run *with* the cut say — who last became leader
+    // before it began, and who led while it lasted. Seeds 0, 2, 3, 8 and 26 put the first leader on
+    // nodes 6, 7, 5, 4 and 3, and on seed 8 nobody leads until four seconds — chosen by running, and
+    // asserted below, since a seed chosen for its timings is a hypothesis about the next version of
+    // them. The gated sweep runs the derivation on five hundred seeds, holding only the verdicts.
     let mut deposed = BTreeSet::new();
     let mut late = false;
-    for seed in 0..27 {
-        let (node, from) = first_deposable(seed);
+    for seed in [0, 2, 3, 8, 26] {
+        let (node, from) = deposable(seed);
         deposed.insert(node);
         late |= from > 3;
         let (trace, outcome) = runs(seed, &deposing(node, from));
-        let cut = from * 1_000_000_000;
+        let cut = from * SECOND;
         let name = format!("node-{node}");
         assert_eq!(
             leading(&trace, cut),
             Some(name.as_str()),
             "seed {seed}: the replica cut off was leading when the cut began"
         );
-        let replaced = trace
-            .steps()
-            .iter()
-            .filter(|step| {
-                (cut..cut + DEPOSED_FOR * 1_000_000_000).contains(&step.event().at().as_nanos())
-            })
-            .filter_map(|step| step.event().message().split_once(" became leader of term "))
-            .any(|(who, _)| who != name);
         assert!(
-            replaced,
+            elected(&trace, cut..cut + DEPOSED_FOR * SECOND).any(|(who, _)| who != name),
             "seed {seed}: another replica led while {name} was away"
         );
         assert_eq!(outcome, Outcome::Pass, "seed {seed}");
@@ -698,14 +745,9 @@ fn a_deposed_leader_with_a_longer_log_from_an_older_term_asks_and_is_refused() {
         .iter()
         .map(|step| (step.event().at().as_nanos(), step.event().message()))
         .collect();
-    let led = steps
-        .iter()
-        .filter(|(at, message)| *at < HEALED && message.contains(" became leader of term "))
-        .map(|(_, message)| *message)
-        .next_back();
     assert_eq!(
-        led,
-        Some("node-3 became leader of term 3"),
+        elected(&trace, 0..HEALED).last(),
+        Some(("node-3", 3)),
         "the replica the schedule cuts off is the one leading at the heal"
     );
     let asked = steps
@@ -772,7 +814,6 @@ fn every_invariant_holds_on_every_seed_with_or_without_a_partition() {
     // The pinned trace is what feels the seed, and the cases above on the isolation and the
     // stranded leader are what say a stale replica is still put up for election at all.
     let schedules = [
-        ("no faults", FaultSchedule::default()),
         ("the isolation", faults(ISOLATED)),
         ("the replica that cannot hear", faults(SEND_ONLY)),
     ];
@@ -783,15 +824,23 @@ fn every_invariant_holds_on_every_seed_with_or_without_a_partition() {
         assert_eq!(swept, (SWEEP, Vec::new()), "under {name}");
     }
 
-    // Each seed's own leader, rather than node 5 on every seed: node 5 leads at three seconds on a
-    // fifth of these, and on the rest a fixed node 5 cut off a follower while the leader went on.
+    // No faults, then each seed's own leader cut off, rather than node 5 on every seed: node 5
+    // leads at three seconds on a fifth of these, and on the rest a fixed node 5 cut off a follower
+    // while the leader went on. One run is both the verdict with no faults and where the leader is
+    // read from, so a seed reported here broke under one schedule or the other — the reason says
+    // which invariant, and running the seed with no faults says which schedule. A seed that breaks
+    // with no faults is not cut at all: who leads in a run that broke is no derivation to trust.
     let swept = survey(SWEEP, |seed| {
-        let (node, from) = first_deposable(seed);
+        let (trace, store, outcome) = replog::run(seed, &FaultSchedule::default())?;
+        if outcome != Outcome::Pass {
+            return Ok(outcome);
+        }
+        let (node, from) = first_deposable(&trace, &store);
         replog::run(seed, &deposing(node, from)).map(|(_, _, outcome)| outcome)
     });
     assert_eq!(
         swept,
         (SWEEP, Vec::new()),
-        "under each seed's leader deposed"
+        "with no faults, and under each seed's leader deposed"
     );
 }
