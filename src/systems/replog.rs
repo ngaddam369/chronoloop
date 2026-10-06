@@ -1927,6 +1927,79 @@ mod tests {
         assert_eq!(asking.recorded.term, 6);
     }
 
+    /// A case for [`hear`]: what a replica answers and when, in milliseconds, and what the client
+    /// asking about command 2 should take from it.
+    struct HearCase {
+        name: &'static str,
+        answers: Vec<(u64, u64, Answer)>,
+        heard: Option<Answer>,
+        at: u64,
+    }
+
+    #[test]
+    fn a_client_sets_aside_answers_about_commands_gone_by() {
+        // A leader can answer one command twice — once on committing it, and at once for a retry
+        // of it already committed — so the second can reach a client that has moved on. Taken as
+        // the answer to the command now asked about, it would mark that one done uncommitted.
+        let millis = |ms: u64| VirtualTime::from_nanos(ms * 1_000_000);
+        let cases = [
+            HearCase {
+                name: "the answer about the command before is passed over for the one about this",
+                answers: vec![(0, 1, Answer::Committed), (100, 2, Answer::NotLeader(None))],
+                heard: Some(Answer::NotLeader(None)),
+                at: 110,
+            },
+            HearCase {
+                name: "an answer only about the command before is no answer at all",
+                answers: vec![(0, 1, Answer::Committed)],
+                heard: None,
+                at: 1_000,
+            },
+            HearCase {
+                name: "an answer about this command is taken as it lands",
+                answers: vec![(0, 2, Answer::Committed)],
+                heard: Some(Answer::Committed),
+                at: 10,
+            },
+        ];
+        for case in cases {
+            let mut executor = Executor::new();
+            let network: VirtualNetwork<Message, SeededRng> =
+                VirtualNetwork::new(executor.handle(), SeededRng::from_seed(SEED))
+                    .with_default_link(Link::new(
+                        Duration::from_millis(10)..=Duration::from_millis(10),
+                    ));
+            let asking = network.add_node();
+            let answering = network.add_node();
+            let to = asking.id();
+
+            let clock = executor.handle();
+            executor.spawn(async move {
+                for (at, command, answer) in case.answers {
+                    clock.sleep_until(millis(at)).await;
+                    answering.send(to, Message::Submitted { command, answer });
+                }
+            });
+            let clock = executor.handle();
+            let result = Rc::new(RefCell::new(None));
+            let written = Rc::clone(&result);
+            executor.spawn(async move {
+                let heard = hear(&clock, &asking, 2, millis(1_000)).await;
+                *written.borrow_mut() = Some((heard, clock.now()));
+            });
+            executor
+                .run()
+                .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+
+            assert_eq!(
+                result.take(),
+                Some((case.heard, millis(case.at))),
+                "{}",
+                case.name
+            );
+        }
+    }
+
     #[test]
     fn a_candidate_that_wins_while_asking_again_does_not_stand_on_the_answers() {
         // Its election for term 1 timed out and it asked about term 2; the votes for term 1 then
