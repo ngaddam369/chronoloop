@@ -5,6 +5,7 @@
 # Local-only working documents
 TODO.md
 CLAUDE.md
+CLAUDE_CHANGELOG.md
 
 # Simulation artifacts
 /traces
