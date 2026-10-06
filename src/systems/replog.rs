@@ -9,9 +9,11 @@
 //! # The protocol
 //!
 //! It is Raft's shape. Each replica is a **follower**, a **candidate** or a **leader**, in a
-//! numbered **term**. A follower that hears nothing from a leader for an election timeout becomes a
-//! candidate in the next term, votes for itself and asks every other replica for its vote; a
-//! replica votes at most once a term, and a candidate that collects a majority leads that term. A
+//! numbered **term**. A follower that hears nothing from a leader for an election timeout first asks
+//! every other replica whether it could stand in the next term — a **pre-vote**, which moves no term
+//! and spends no vote — and only once a majority says it could does it become a candidate in that
+//! term, vote for itself and ask every other replica for its vote; a replica votes at most once a
+//! term, and a candidate that collects a majority leads that term. A
 //! leader appends a no-op to its log the moment it is elected, takes each command a client sends
 //! it as the next entry of its log, and copies its log to every follower on a heartbeat. A follower
 //! accepts entries only after the entry they follow, which it must already hold, and an entry that
@@ -32,8 +34,26 @@
 //! Without the rule, a replica that spent a partition alone — timing out, standing, failing,
 //! standing again, its term climbing all the while — would come back with a term every other
 //! replica must defer to and a log missing whatever was committed while it was away, and win as
-//! readily as any other. With it, it stands, takes the others to its term, and is turned away by
-//! each of them.
+//! readily as any other. With it alone, it stands, takes the others to its term, and is turned away
+//! by each of them — deposing whichever leader they had on the way.
+//!
+//! # Why a replica that cannot hear cannot depose
+//!
+//! Every term a message carries is one its receiver must take, so a replica standing in a term
+//! nobody else has reached makes every replica it asks a follower in that term, the leader among
+//! them. A replica that can send and cannot hear — one direction of its links cut — never hears a
+//! leader, stands every time its timer runs out, and would depose every leader for as long as it
+//! stayed deaf. The pre-vote is what stops it: the term a replica asks about is one nobody has
+//! begun, so it is not taken; the answer is yes only from a replica whose own log is no further on
+//! and which is following no leader; and the asker stands only on a majority's yes, which a replica
+//! that cannot hear never receives. The same keeps a replica back from a partition alone from
+//! deposing the leader it returns to, since its term never climbed while it was away. The log rule
+//! is asked twice, of the pre-vote and of the vote itself: a pre-vote promises nothing, and the
+//! voters' logs may have moved on between the two.
+//!
+//! What is still missing is the other half of the same failure, **check-quorum**: a leader that can
+//! send and cannot hear keeps every follower — its heartbeats arrive — and commits nothing for as
+//! long as it stays deaf, since nobody's answers reach it. Nothing in this module notices.
 //!
 //! # The run
 //!
@@ -139,8 +159,8 @@ const PERIOD: Duration = Duration::from_secs(2);
 /// so a follower that can hear its leader never stands against it.
 const HEARTBEAT: Duration = Duration::from_millis(500);
 
-/// How long a follower or a candidate waits to hear from a leader before standing for election,
-/// drawn afresh every time the wait starts.
+/// How long a follower or a candidate waits to hear from a leader before asking whether it could
+/// stand, drawn afresh every time the wait starts.
 ///
 /// Drawn rather than fixed so that two replicas whose timeouts started together do not stand
 /// together again and split the vote forever; three times the [`HEARTBEAT`] at the least, so a
@@ -360,6 +380,18 @@ struct LogEnd {
 /// What travels between the replicas, and between a replica and a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Message {
+    /// A replica whose timer ran out asking whether it could stand in `proposed`, the term after
+    /// its own, saying where its log ends.
+    ///
+    /// `proposed` is a term nobody has begun, so unlike every other term a message carries it is
+    /// not one its receiver takes.
+    PreVote { proposed: u64, end: LogEnd },
+    /// A replica's answer to a question about `proposed`, with the replica's own term.
+    PreVoted {
+        term: u64,
+        proposed: u64,
+        ballot: Ballot,
+    },
     /// A candidate asking for a vote in its term, saying where its log ends.
     RequestVote { term: u64, end: LogEnd },
     /// A replica's answer to a candidate, with the replica's term.
@@ -385,11 +417,12 @@ impl Message {
     /// The term a message between replicas was sent in; the clients' messages are in none.
     fn term(&self) -> Option<u64> {
         match self {
-            Self::RequestVote { term, .. }
+            Self::PreVoted { term, .. }
+            | Self::RequestVote { term, .. }
             | Self::Vote { term, .. }
             | Self::Append { term, .. }
             | Self::Appended { term, .. } => Some(*term),
-            Self::Submit { .. } | Self::Submitted { .. } => None,
+            Self::PreVote { .. } | Self::Submit { .. } | Self::Submitted { .. } => None,
         }
     }
 }
@@ -451,6 +484,7 @@ struct Replica {
     peers: Rc<[NodeId]>,
     recorded: Recorded,
     leader: Option<usize>,
+    prevotes: BTreeSet<usize>,
     votes: BTreeSet<usize>,
     next: Vec<u64>,
     matched: Vec<u64>,
@@ -473,6 +507,7 @@ impl Replica {
                 led: BTreeSet::new(),
             },
             leader: None,
+            prevotes: BTreeSet::new(),
             votes: BTreeSet::new(),
             next: Vec::new(),
             matched: Vec::new(),
@@ -513,7 +548,11 @@ impl Replica {
         out.notes.push((message, self.recorded.clone()));
     }
 
-    /// The timer ran out: a leader copies its log, and anyone else stands for election.
+    /// The timer ran out: a leader copies its log, and anyone else asks whether it could stand.
+    ///
+    /// Asking spends nothing. The replica's term, its vote and its role stay as they were, and it
+    /// stands only once a majority has said it could — so a replica that cannot hear its peers'
+    /// answers never moves anyone into a term it began.
     fn on_timer(&mut self) -> Out {
         let mut out = Out::new();
         if self.recorded.role == Role::Leader {
@@ -521,6 +560,29 @@ impl Replica {
             out.rearm = Rearm::Heartbeat;
             return out;
         }
+        let proposed = self.recorded.term.saturating_add(1);
+        let end = self.last();
+        self.leader = None;
+        self.prevotes = BTreeSet::from([self.me]);
+        self.note(
+            &mut out,
+            format!(
+                "{} asked whether it could stand for term {proposed}",
+                node(self.me)
+            ),
+        );
+        for (other, peer) in self.peers.iter().enumerate() {
+            if other != self.me {
+                out.sends.push((*peer, Message::PreVote { proposed, end }));
+            }
+        }
+        out.rearm = Rearm::Election;
+        out
+    }
+
+    /// A majority said this replica could stand: it begins the next term as a candidate, votes for
+    /// itself and asks every other replica for its vote.
+    fn stand(&mut self, out: &mut Out) {
         self.recorded.term = self.recorded.term.saturating_add(1);
         self.recorded.role = Role::Candidate;
         self.recorded.voted_for = Some(self.me);
@@ -529,7 +591,7 @@ impl Replica {
         let term = self.recorded.term;
         let end = self.last();
         self.note(
-            &mut out,
+            out,
             format!("{} became candidate for term {term}", node(self.me)),
         );
         for (other, peer) in self.peers.iter().enumerate() {
@@ -538,7 +600,6 @@ impl Replica {
             }
         }
         out.rearm = Rearm::Election;
-        out
     }
 
     /// Answers `message`, which `from` sent.
@@ -555,6 +616,10 @@ impl Replica {
             self.adopt(term, &mut out);
         }
         match message {
+            Message::PreVote { proposed, end } => self.on_pre_vote(from, proposed, end, &mut out),
+            Message::PreVoted {
+                proposed, ballot, ..
+            } => self.on_pre_voted(from, proposed, ballot, &mut out),
             Message::RequestVote { term, end } => {
                 self.on_request_vote(from, term, end, &mut out);
             }
@@ -609,6 +674,51 @@ impl Replica {
             self.votes.clear();
             self.pending.clear();
             out.rearm = Rearm::Election;
+        }
+    }
+
+    /// A replica asked whether it could stand in `proposed`, its log ending at `end`.
+    ///
+    /// The answer is yes when `proposed` is ahead of this replica's term, the asker's log is at
+    /// least as up to date as its own, and it is following no leader: a replica that still hears
+    /// one has no reason to want an election, and saying yes would let a replica that alone cannot
+    /// hear the leader depose it. Answering moves nothing — no term, no vote, no timer.
+    fn on_pre_vote(&self, from: NodeId, proposed: u64, end: LogEnd, out: &mut Out) {
+        let ballot = if proposed > self.recorded.term && end >= self.last() && self.leader.is_none()
+        {
+            Ballot::Granted
+        } else {
+            Ballot::Refused
+        };
+        out.sends.push((
+            from,
+            Message::PreVoted {
+                term: self.recorded.term,
+                proposed,
+                ballot,
+            },
+        ));
+    }
+
+    /// A replica answered this one's question about standing in `proposed`.
+    ///
+    /// Only an answer to the question it is asking now counts: one about a term it has since moved
+    /// past, or arriving after it stopped asking, is about an election it no longer means to stand
+    /// in.
+    fn on_pre_voted(&mut self, from: NodeId, proposed: u64, ballot: Ballot, out: &mut Out) {
+        if !self.prevotes.contains(&self.me)
+            || proposed != self.recorded.term.saturating_add(1)
+            || ballot != Ballot::Granted
+        {
+            return;
+        }
+        let Some(voter) = self.peer(from) else {
+            return;
+        };
+        self.prevotes.insert(voter);
+        if self.prevotes.len() >= MAJORITY {
+            self.prevotes.clear();
+            self.stand(out);
         }
     }
 
@@ -724,6 +834,7 @@ impl Replica {
             self.votes.clear();
         }
         self.leader = Some(leader);
+        self.prevotes.clear();
         out.rearm = Rearm::Election;
         if self.term_at(prev_index) != Some(prev_term) {
             out.sends.push((from, refused));
@@ -1581,6 +1692,28 @@ mod tests {
         }
     }
 
+    /// A replica in `term` answering a question about `proposed`.
+    fn pre_voted(term: u64, proposed: u64, ballot: Ballot) -> Message {
+        Message::PreVoted {
+            term,
+            proposed,
+            ballot,
+        }
+    }
+
+    /// Makes `replica` a candidate in its next term the way a run does: its timer runs out, and two
+    /// others say it could stand.
+    fn stand(replica: &mut Replica) {
+        let (me, term) = (replica.me, replica.recorded.term);
+        replica.on_timer();
+        for other in (0..REPLICAS).filter(|other| *other != me).take(2) {
+            replica.on_message(
+                peer(other),
+                pre_voted(term, term.saturating_add(1), Ballot::Granted),
+            );
+        }
+    }
+
     /// The messages `out` sends, and to whom.
     fn sent(out: &Out) -> Vec<(NodeId, Message)> {
         out.sends.clone()
@@ -1675,18 +1808,73 @@ mod tests {
     }
 
     #[test]
-    fn a_follower_whose_timer_runs_out_stands_and_asks_everyone_else() {
-        // With a log whose last entry is from an earlier term than the replica's own, so the request
+    fn a_follower_whose_timer_runs_out_asks_whether_it_could_stand_and_changes_nothing_else() {
+        // With a log whose last entry is from an earlier term than the replica's own, so the question
         // is seen to carry the last entry's term and not the replica's — and whose length is not that
-        // term, so the request is seen to carry each of the two in its own place.
+        // term, so it is seen to carry each of the two in its own place.
         let mut follower = replica(2);
         follower.recorded.term = 4;
         follower.recorded.log = vec![command(1, 1), command(1, 2), command(1, 3)];
+        follower.leader = Some(0);
+        let before = follower.recorded.clone();
         let out = follower.on_timer();
 
-        assert_eq!(follower.recorded.term, 5);
-        assert_eq!(follower.recorded.role, Role::Candidate);
-        assert_eq!(follower.recorded.voted_for, Some(2), "it votes for itself");
+        assert_eq!(
+            follower.recorded, before,
+            "no term is spent, no vote is cast, on a question"
+        );
+        assert_eq!(follower.leader, None, "the leader it followed is gone");
+        assert_eq!(
+            said(&out),
+            ["node-5 asked whether it could stand for term 5"]
+        );
+        assert_eq!(
+            sent(&out),
+            [0, 1, 3, 4]
+                .map(|other| (
+                    peer(other),
+                    Message::PreVote {
+                        proposed: 5,
+                        end: end(1, 3)
+                    }
+                ))
+                .to_vec(),
+            "everyone but itself, with where its log ends"
+        );
+        assert_eq!(
+            out.rearm,
+            Rearm::Election,
+            "a question nobody answers times out too"
+        );
+    }
+
+    #[test]
+    fn a_majority_of_pre_votes_makes_a_candidate_that_asks_for_real_ones() {
+        let mut asking = replica(2);
+        asking.recorded.term = 4;
+        asking.recorded.log = vec![command(1, 1), command(1, 2), command(1, 3)];
+        asking.on_timer();
+
+        let one = asking.on_message(peer(0), pre_voted(4, 5, Ballot::Granted));
+        assert_eq!(
+            asking.recorded.role,
+            Role::Follower,
+            "two of five is not a majority"
+        );
+        assert_eq!(asking.recorded.term, 4);
+        assert!(sent(&one).is_empty());
+        let refused = asking.on_message(peer(3), pre_voted(4, 5, Ballot::Refused));
+        assert_eq!(
+            asking.recorded.role,
+            Role::Follower,
+            "a refusal counts for nothing"
+        );
+        assert!(sent(&refused).is_empty());
+
+        let out = asking.on_message(peer(1), pre_voted(4, 5, Ballot::Granted));
+        assert_eq!(asking.recorded.term, 5);
+        assert_eq!(asking.recorded.role, Role::Candidate);
+        assert_eq!(asking.recorded.voted_for, Some(2), "it votes for itself");
         assert_eq!(said(&out), ["node-5 became candidate for term 5"]);
         assert_eq!(
             sent(&out),
@@ -1695,7 +1883,7 @@ mod tests {
                     peer(other),
                     Message::RequestVote {
                         term: 5,
-                        end: end(1, 3),
+                        end: end(1, 3)
                     }
                 ))
                 .to_vec(),
@@ -1706,6 +1894,145 @@ mod tests {
             Rearm::Election,
             "an election it cannot win times out too"
         );
+
+        let late = asking.on_message(peer(4), pre_voted(4, 5, Ballot::Granted));
+        assert!(
+            sent(&late).is_empty() && said(&late).is_empty(),
+            "a pre-vote that comes after it stood is spent"
+        );
+        assert_eq!(asking.recorded.term, 5);
+    }
+
+    #[test]
+    fn a_pre_vote_answering_an_earlier_question_counts_for_nothing() {
+        // It asked about term 5, was told term 6 had begun, and asked about term 7. Grants for the
+        // first question arriving now are about an election it no longer means to stand in.
+        let mut asking = replica(2);
+        asking.recorded.term = 4;
+        asking.on_timer();
+        asking.on_message(peer(0), pre_voted(6, 5, Ballot::Refused));
+        assert_eq!(asking.recorded.term, 6, "the later term is taken");
+        asking.on_timer();
+
+        for other in [1, 3] {
+            let out = asking.on_message(peer(other), pre_voted(4, 5, Ballot::Granted));
+            assert!(sent(&out).is_empty(), "{other}'s grant is about term 5");
+        }
+        assert_eq!(asking.recorded.role, Role::Follower);
+        assert_eq!(asking.recorded.term, 6);
+    }
+
+    #[test]
+    fn a_replica_that_hears_a_leader_while_asking_stops_asking() {
+        let mut asking = replica(2);
+        asking.recorded.term = 4;
+        asking.on_timer();
+        asking.on_message(peer(0), pre_voted(4, 5, Ballot::Granted));
+        asking.on_message(peer(3), append(4, 0, 0, Vec::new(), 0));
+        assert_eq!(asking.leader, Some(3));
+
+        let out = asking.on_message(peer(1), pre_voted(4, 5, Ballot::Granted));
+        assert!(
+            sent(&out).is_empty(),
+            "a replica following a leader does not stand against it"
+        );
+        assert_eq!(asking.recorded.role, Role::Follower);
+        assert_eq!(asking.recorded.term, 4);
+    }
+
+    #[test]
+    fn a_pre_vote_goes_only_to_an_up_to_date_replica_while_no_leader_is_heard() {
+        struct Case {
+            name: &'static str,
+            voter: fn() -> Replica,
+            proposed: u64,
+            end: LogEnd,
+            ballot: Ballot,
+        }
+        // Every voter is in term 2 holding three entries, the last of them from term 2, and none
+        // has voted. Whatever it answers, it answers from where it stands: a question moves no
+        // term, spends no vote and puts no timer back.
+        fn unled() -> Replica {
+            let mut voter = replica(0);
+            voter.recorded.term = 2;
+            voter.recorded.log = vec![command(1, 1), command(1, 2), command(2, 3)];
+            voter
+        }
+        fn following() -> Replica {
+            let mut voter = unled();
+            voter.leader = Some(1);
+            voter
+        }
+        fn leading() -> Replica {
+            let mut voter = leader(0, 2, vec![command(1, 1), command(1, 2), command(2, 3)]);
+            voter.recorded.voted_for = None;
+            voter
+        }
+        let cases = [
+            Case {
+                name: "an up-to-date asker with no leader in its way has it",
+                voter: unled,
+                proposed: 9,
+                end: end(2, 3),
+                ballot: Ballot::Granted,
+            },
+            Case {
+                name: "an asker whose longer log ends in an earlier term is refused",
+                voter: unled,
+                proposed: 9,
+                end: end(1, 7),
+                ballot: Ballot::Refused,
+            },
+            Case {
+                name: "an asker whose shorter log ends in the same term is refused",
+                voter: unled,
+                proposed: 9,
+                end: end(2, 2),
+                ballot: Ballot::Refused,
+            },
+            Case {
+                name: "a replica following a leader refuses",
+                voter: following,
+                proposed: 9,
+                end: end(2, 3),
+                ballot: Ballot::Refused,
+            },
+            Case {
+                name: "a leader refuses",
+                voter: leading,
+                proposed: 9,
+                end: end(2, 3),
+                ballot: Ballot::Refused,
+            },
+            Case {
+                name: "a term not ahead of the voter's is refused",
+                voter: unled,
+                proposed: 2,
+                end: end(2, 3),
+                ballot: Ballot::Refused,
+            },
+        ];
+        for case in cases {
+            let mut voter = (case.voter)();
+            let before = voter.recorded.clone();
+            let out = voter.on_message(
+                peer(4),
+                Message::PreVote {
+                    proposed: case.proposed,
+                    end: case.end,
+                },
+            );
+
+            assert_eq!(
+                sent(&out),
+                [(peer(4), pre_voted(2, case.proposed, case.ballot))],
+                "{}",
+                case.name
+            );
+            assert_eq!(voter.recorded, before, "{}", case.name);
+            assert!(said(&out).is_empty(), "{}", case.name);
+            assert_eq!(out.rearm, Rearm::Keep, "{}", case.name);
+        }
     }
 
     #[test]
@@ -1980,7 +2307,7 @@ mod tests {
     #[test]
     fn a_majority_of_votes_makes_a_leader_that_appends_a_no_op_and_copies_it_out() {
         let mut candidate = replica(0);
-        candidate.on_timer();
+        stand(&mut candidate);
         let granted = Message::Vote {
             term: 1,
             ballot: Ballot::Granted,
