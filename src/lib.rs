@@ -117,7 +117,11 @@
 //! the difference. Its decision reads those two states and nothing else, so it is
 //! **level-triggered** — an action the wire lost is asked for again on the next pass without
 //! anything deciding to retry it, and a controller restarted from nothing decides exactly what one
-//! that was there all along would.
+//! that was there all along would. What it keeps in place is a set of replicated databases across
+//! regions — a primary and its standbys — in a world where nothing is ready the moment it is asked
+//! for: replicas take their time to be provisioned, and a standby takes longer still to catch up.
+//! That is what gives the order of things consequences, and the world keeps the worst of them as a
+//! fact: a primary taken away while none of its standbys has caught up destroys the database's data.
 //!
 //! [`fork`]: fork::fork
 //! [`ring`]: systems::ring

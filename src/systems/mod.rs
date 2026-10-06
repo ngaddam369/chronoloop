@@ -8,6 +8,7 @@ use core::fmt;
 use crate::executor::ExecutorError;
 use crate::history::MultilineMessageError;
 use crate::outcome::ReasonError;
+use crate::systems::reconciler::PlacementError;
 use crate::world::NameError;
 
 pub mod pingpong;
@@ -27,6 +28,8 @@ pub enum RunError {
     Name(NameError),
     /// The run broke, and could not say why in a form a failure is identified by.
     Reason(ReasonError),
+    /// The run asked for a database to be placed somewhere no database can be.
+    Placement(PlacementError),
 }
 
 impl fmt::Display for RunError {
@@ -36,6 +39,7 @@ impl fmt::Display for RunError {
             Self::Message(error) => write!(f, "{error}"),
             Self::Name(error) => write!(f, "{error}"),
             Self::Reason(error) => write!(f, "{error}"),
+            Self::Placement(error) => write!(f, "{error}"),
         }
     }
 }
@@ -47,6 +51,7 @@ impl std::error::Error for RunError {
             Self::Message(error) => Some(error),
             Self::Name(error) => Some(error),
             Self::Reason(error) => Some(error),
+            Self::Placement(error) => Some(error),
         }
     }
 }
@@ -72,5 +77,11 @@ impl From<NameError> for RunError {
 impl From<ReasonError> for RunError {
     fn from(error: ReasonError) -> Self {
         Self::Reason(error)
+    }
+}
+
+impl From<PlacementError> for RunError {
+    fn from(error: PlacementError) -> Self {
+        Self::Placement(error)
     }
 }
