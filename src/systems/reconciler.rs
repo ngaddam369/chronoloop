@@ -81,6 +81,14 @@
 //! A run breaks if a database that was still wanted lost its data, at the step that destroyed it.
 //! Otherwise it holds up when, once the loop has finished, every replica that was asked for exists
 //! in the role asked of it and is ready, and nothing else does.
+//!
+//! Both are [`Invariant`]s over the world each step recorded — a safety promise and a liveness one
+//! — and the verdict is the first breach [`invariant::check`] finds. Nothing the server noted for
+//! itself while it ran is consulted, so a run is judged from exactly what `inspect`, `diff` and a
+//! reduction read. Only the world's own field names are shared with the encoder: a database is
+//! wanted when it has a `<region>-wanted` field, lost when its `lost` flag is up, and converged when
+//! every region wanted of it has a replica there in that role whose phase is `ready`, and no region
+//! has a replica that is not wanted.
 
 use core::cell::RefCell;
 use core::fmt;
@@ -93,6 +101,7 @@ use crate::clock::{Clock, VirtualTime};
 use crate::executor::Executor;
 use crate::fault::{Fault, FaultSchedule, Window};
 use crate::history::Entry;
+use crate::invariant::{self, Invariant};
 use crate::net::{Link, Network, NodeId, Odds, VirtualNetwork};
 use crate::outcome::{Outcome, Reason, ReasonError};
 use crate::rng::{Rng, SeededRng};
@@ -563,17 +572,6 @@ pub enum Action {
     },
 }
 
-impl Action {
-    /// The database the action is about.
-    fn database(&self) -> &Name {
-        match self {
-            Self::Create { database, .. }
-            | Self::Promote { database, .. }
-            | Self::Delete { database, .. } => database,
-        }
-    }
-}
-
 impl fmt::Display for Action {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -695,16 +693,6 @@ pub fn reconcile(desired: &Desired, observed: &Observed) -> Vec<Action> {
         .collect()
 }
 
-/// Whether what is `observed` is exactly what is `desired`: every replica asked for exists in the
-/// role asked of it and is ready, and nothing else exists.
-fn converged(desired: &Desired, observed: &Observed) -> bool {
-    let wanted = desired.replicas();
-    wanted.len() == observed.replicas.len()
-        && observed.replicas().all(|(database, region, replica)| {
-            replica.phase == Phase::Ready && wanted.get(&(database, region)) == Some(&replica.role)
-        })
-}
-
 /// What travels between the controller and the server.
 #[derive(Debug, Clone)]
 enum Message {
@@ -817,14 +805,76 @@ fn world(desired: &Desired, observed: &Observed) -> Result<World, NameError> {
     Ok(world)
 }
 
+/// The regions `resource` has a field ending in `-<ending>` for, with that field's value.
+///
+/// Found by comparing what each field is spelled as, so there is no name to make and nothing that
+/// can fail on the way to an answer.
+fn region_fields<'a>(
+    resource: &'a Resource,
+    ending: &'a str,
+) -> impl Iterator<Item = (&'a str, &'a Value)> {
+    resource.fields().filter_map(move |(field, value)| {
+        field
+            .as_str()
+            .strip_suffix(ending)
+            .and_then(|rest| rest.strip_suffix('-'))
+            .map(|region| (region, value))
+    })
+}
+
+/// The field of `resource` called `<region>-<ending>`, if it has one.
+fn region_field<'a>(resource: &'a Resource, region: &str, ending: &'a str) -> Option<&'a Value> {
+    region_fields(resource, ending).find_map(|(place, value)| (place == region).then_some(value))
+}
+
+/// Whether no database that is wanted has had its data destroyed.
+///
+/// Read off a recorded world rather than the server's typed state: a database is wanted when it has
+/// a field saying what is wanted of some region, and lost when its `lost` flag is up. A database
+/// wanted nowhere that lost its primary was being torn down, and keeps nothing anyone asked for.
+fn keeps_its_data(world: &World) -> bool {
+    world.resources().all(|(_, database)| {
+        let lost = database
+            .fields()
+            .any(|(field, value)| field.as_str() == LOST && *value == Value::Flag(true));
+        !lost || region_fields(database, WANTED).next().is_none()
+    })
+}
+
+/// Whether the recorded world is exactly what is wanted: every replica asked for exists in the role
+/// asked of it and is ready, and nothing else exists.
+fn settled(world: &World) -> bool {
+    let ready = Value::Text(Phase::Ready.to_string());
+    world.resources().all(|(_, database)| {
+        region_fields(database, WANTED).all(|(region, role)| {
+            region_field(database, region, ROLE) == Some(role)
+                && region_field(database, region, PHASE) == Some(&ready)
+        }) && region_fields(database, ROLE)
+            .all(|(region, _)| region_field(database, region, WANTED).is_some())
+    })
+}
+
+/// What the controller promises, judged over the world each step of its run recorded.
+///
+/// Losing a wanted database's data is a **safety** breach, broken at the step that destroyed it.
+/// Converging is a **liveness** promise with no span to speak of: what is wanted changes underneath
+/// the loop and trouble holds it back, so it owes nothing about how soon, only that the run does not
+/// end short of what was asked. A span too long for virtual time is broken by the end of the run
+/// and nothing else. The safety promise stands first, so a run that ends short at the step that
+/// destroyed the data is reported for the data.
+fn invariants() -> Result<[Invariant; 2], ReasonError> {
+    Ok([
+        Invariant::safety(Reason::new("lost data")?, keeps_its_data),
+        Invariant::liveness(Reason::new("did not converge")?, Duration::MAX, settled),
+    ])
+}
+
 /// Something the server changed, and the state the run was in once it had.
 struct Observation {
     at: VirtualTime,
     message: String,
     desired: Desired,
     observed: Observed,
-    destroyed: bool,
-    converged: bool,
 }
 
 /// Runs the controller and the server under `seed`, with `faults` to get in their way.
@@ -850,10 +900,10 @@ struct Observation {
 /// Returns [`RunError`] if the simulation could not finish, or if the run wrote down something that
 /// could not be read back.
 pub fn run(seed: u64, faults: &FaultSchedule) -> Result<(Trace, StateStore, Outcome), RunError> {
-    let observed = observe(seed, faults)?;
-    let outcome = verdict(&observed)?;
-    let (steps, store) = collect(observed)?;
-    Ok((Trace::new(seed, steps), store, outcome))
+    let (steps, store) = collect(observe(seed, faults)?)?;
+    let trace = Trace::new(seed, steps);
+    let outcome = verdict(&trace, &store)?;
+    Ok((trace, store, outcome))
 }
 
 /// Draws a schedule of trouble for the run of `seed`, knowing nothing about what the run is for.
@@ -1062,7 +1112,7 @@ impl<R: Rng> Server<'_, R> {
     fn change(&mut self, now: VirtualTime, change: Change) {
         let message = format!("{} wanted with {}", change.database, change.placement);
         self.desired.insert(change.database, change.placement);
-        self.write(now, message, false);
+        self.write(now, message);
     }
 
     /// Moves on the next replica whose time has come, if one has.
@@ -1083,17 +1133,11 @@ impl<R: Rng> Server<'_, R> {
         if replica.phase() == Phase::CatchingUp {
             self.arm(now, &database, &region, CATCHING_UP);
         }
-        self.write(
-            now,
-            format!("{database} in {region} {}", replica.phase()),
-            false,
-        );
+        self.write(now, format!("{database} in {region} {}", replica.phase()));
     }
 
     /// Carries out what the controller asked for.
     fn apply(&mut self, now: VirtualTime, action: &Action) {
-        let database = action.database();
-        let was_lost = self.observed.is_lost(database);
         if !self.observed.apply(action) {
             return;
         }
@@ -1109,24 +1153,19 @@ impl<R: Rng> Server<'_, R> {
             }
             Action::Promote { .. } => {}
         }
-        let destroyed = !was_lost
-            && self.observed.is_lost(database)
-            && self.desired.databases.contains_key(database);
-        self.write(now, action.to_string(), destroyed);
+        self.write(now, action.to_string());
     }
 
     /// Writes down a change the server has just made.
     ///
     /// Nothing here waits, so the borrow is given up before the server goes round again and is never
     /// held across a poll.
-    fn write(&self, at: VirtualTime, message: String, destroyed: bool) {
+    fn write(&self, at: VirtualTime, message: String) {
         self.observations.borrow_mut().push(Observation {
             at,
             message,
             desired: self.desired.clone(),
             observed: self.observed.clone(),
-            destroyed,
-            converged: converged(&self.desired, &self.observed),
         });
     }
 }
@@ -1194,27 +1233,20 @@ async fn serve<C, N, R>(
     }
 }
 
-/// Reads the run's verdict off what the server wrote down.
+/// Judges the run by what it recorded: its [`invariants`], checked over the world every step of
+/// `trace` left behind in `store`.
 ///
-/// A database that was still wanted losing its data is the worse failure and has a step of its own
-/// to be named at — the one that destroyed it — so it is looked for first. Otherwise the last change
-/// the server made is the state the run ended in, and the run held up exactly when that state is
-/// what was asked for; a run that did not get there names that last step, since there is no one
-/// earlier step a failure to get somewhere can be said to have happened at.
-fn verdict(observed: &[Observation]) -> Result<Outcome, ReasonError> {
-    if let Some(step) = observed.iter().position(|seen| seen.destroyed) {
-        return Ok(Outcome::Fail {
-            reason: Reason::new("lost data")?,
-            step,
-        });
-    }
-    match observed.iter().enumerate().next_back() {
-        Some((step, last)) if !last.converged => Ok(Outcome::Fail {
-            reason: Reason::new("did not converge")?,
-            step,
-        }),
-        _ => Ok(Outcome::Pass),
-    }
+/// The first breach is the verdict. A wanted database losing its data is broken at the step that
+/// destroyed it, and comes before anything else that step broke. A run that did not end where it was
+/// asked names its last step, since there is no one earlier step a failure to get somewhere can be
+/// said to have happened at. Nothing the server kept for itself is consulted, so the verdict is
+/// reached from what `inspect`, `diff` and a reduction read too.
+fn verdict(trace: &Trace, store: &StateStore) -> Result<Outcome, RunError> {
+    let broken = invariant::check(trace, store, &invariants()?)?;
+    Ok(broken
+        .into_iter()
+        .next()
+        .map_or(Outcome::Pass, Outcome::from))
 }
 
 /// Turns what the server observed into steps, keeping every state it passed through in a store.
@@ -1283,6 +1315,19 @@ mod tests {
             }
         }
         observed
+    }
+
+    /// Whether what is `observed` is exactly what is `desired`, asked of the typed state: every
+    /// replica asked for exists in the role asked of it and is ready, and nothing else exists.
+    ///
+    /// The route the run's verdict does not take, kept so the one it does take can be held to it.
+    fn converged(desired: &Desired, observed: &Observed) -> bool {
+        let wanted = desired.replicas();
+        wanted.len() == observed.replicas.len()
+            && observed.replicas().all(|(database, region, replica)| {
+                replica.phase == Phase::Ready
+                    && wanted.get(&(database, region)) == Some(&replica.role)
+            })
     }
 
     /// Lets every replica's time come until none has anywhere left to go.
@@ -1833,45 +1878,142 @@ mod tests {
     }
 
     #[test]
+    fn the_recorded_world_says_what_the_typed_state_does() {
+        // The verdict reads the world a step recorded and never the typed state the server held, so
+        // the two invariants are only the controller's promises if, read off the encoded world, they
+        // answer what the typed state answers. Every state of one database across three regions,
+        // against a placement with a standby and one without, and each again with its data lost —
+        // and once more wanted nowhere, where a lost database is a teardown rather than a loss.
+        let wants = [
+            Some(desired("east", &["west"])),
+            Some(desired("east", &[])),
+            None,
+        ];
+        let mut answers = BTreeSet::new();
+        for want in &wants {
+            let desired = want.clone().unwrap_or_default();
+            for chosen in every_state() {
+                for lose in [false, true] {
+                    let mut before = observed(&chosen);
+                    if lose {
+                        before.lost.insert(name("orders"));
+                    }
+                    let recorded = world(&desired, &before)
+                        .unwrap_or_else(|e| panic!("the fields are names: {e}"));
+                    let typed = (
+                        converged(&desired, &before),
+                        !(before.is_lost(&name("orders")) && want.is_some()),
+                    );
+
+                    assert_eq!(
+                        (settled(&recorded), keeps_its_data(&recorded)),
+                        typed,
+                        "{chosen:?} wanting {want:?}, lost {lose}"
+                    );
+                    answers.insert(typed);
+                }
+            }
+        }
+        // Every pairing of the two answers turns up, so neither predicate can pass by being constant.
+        assert_eq!(answers.len(), 4, "{answers:?}");
+    }
+
+    /// The run a sequence of states makes, one step a second, judged the way `run` judges one.
+    fn judged(states: &[(Desired, Observed)]) -> Outcome {
+        let seen = states
+            .iter()
+            .zip(0..)
+            .map(|((desired, observed), second)| Observation {
+                at: VirtualTime::from_nanos(second * 1_000_000_000),
+                message: format!("step {second}"),
+                desired: desired.clone(),
+                observed: observed.clone(),
+            })
+            .collect();
+        let (steps, store) = collect(seen).unwrap_or_else(|e| panic!("the states record: {e}"));
+        verdict(&Trace::new(0, steps), &store).unwrap_or_else(|e| panic!("a verdict: {e}"))
+    }
+
+    /// `before` with `action` carried out on it, failing the test if it changed nothing.
+    fn then(before: &Observed, action: &Action) -> Observed {
+        let mut after = before.clone();
+        assert!(after.apply(action), "{action} changes something");
+        after
+    }
+
+    #[test]
     fn the_verdict_names_the_step_that_destroyed_data_before_anything_else() {
         struct Case {
             name: &'static str,
-            observed: Vec<Observation>,
+            states: Vec<(Desired, Observed)>,
             expected: Option<(&'static str, usize)>,
         }
-        let seen = |destroyed: bool, converged: bool| Observation {
-            at: VirtualTime::from_nanos(0),
-            message: String::from("something"),
-            desired: Desired::new(),
-            observed: Observed::new(),
-            destroyed,
-            converged,
+        let want = desired("east", &["west"]);
+        let delete = |place: &str| Action::Delete {
+            database: name("orders"),
+            region: region(place),
         };
+        let behind = observed(&[("east", Primary, Ready), ("west", Standby, CatchingUp)]);
+        let done = observed(&[("east", Primary, Ready), ("west", Standby, Ready)]);
+        // The primary taken away with its one standby still behind: the move the world records as
+        // the end of the database's data.
+        let destroyed = then(&behind, &delete("east"));
+        // And every replica put back afterwards, which gives the data somewhere to live and not
+        // what it held.
+        let mut rebuilt = destroyed.clone();
+        for action in reconcile(&want, &rebuilt) {
+            rebuilt.apply(&action);
+        }
+        settle(&mut rebuilt);
         let cases = [
             Case {
                 name: "nothing happened at all",
-                observed: vec![],
+                states: vec![],
                 expected: None,
             },
             Case {
                 name: "ended where it was asked",
-                observed: vec![seen(false, false), seen(false, true)],
+                states: vec![(want.clone(), behind.clone()), (want.clone(), done.clone())],
                 expected: None,
             },
             Case {
                 name: "ended short",
-                observed: vec![seen(false, true), seen(false, false)],
+                states: vec![(want.clone(), done.clone()), (want.clone(), behind.clone())],
                 expected: Some(("did not converge", 1)),
             },
             Case {
                 name: "destroyed data and then ended short",
-                observed: vec![seen(false, true), seen(true, false), seen(false, false)],
+                states: vec![
+                    (want.clone(), behind.clone()),
+                    (want.clone(), destroyed.clone()),
+                    (want.clone(), destroyed.clone()),
+                ],
+                expected: Some(("lost data", 1)),
+            },
+            Case {
+                // Both are broken at the last step, so the order the two are judged in decides.
+                name: "destroyed data at the very last step",
+                states: vec![(want.clone(), behind.clone()), (want.clone(), destroyed)],
                 expected: Some(("lost data", 1)),
             },
             Case {
                 name: "destroyed data and then ended where it was asked anyway",
-                observed: vec![seen(true, false), seen(false, true)],
-                expected: Some(("lost data", 0)),
+                states: vec![(want.clone(), behind.clone()), (want.clone(), rebuilt)],
+                expected: Some(("lost data", 1)),
+            },
+            Case {
+                // Nothing wants the database, so taking its primary away first is a teardown in an
+                // unlucky order and not a loss of anything anyone asked to keep.
+                name: "a database wanted nowhere torn down primary first",
+                states: vec![
+                    (Desired::new(), behind.clone()),
+                    (Desired::new(), then(&behind, &delete("east"))),
+                    (
+                        Desired::new(),
+                        then(&then(&behind, &delete("east")), &delete("west")),
+                    ),
+                ],
+                expected: None,
             },
         ];
         for case in cases {
@@ -1882,12 +2024,7 @@ mod tests {
                     step,
                 },
             };
-            assert_eq!(
-                verdict(&case.observed).unwrap_or_else(|e| panic!("a verdict: {e}")),
-                expected,
-                "{}",
-                case.name
-            );
+            assert_eq!(judged(&case.states), expected, "{}", case.name);
         }
     }
 

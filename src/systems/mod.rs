@@ -9,6 +9,7 @@ use core::str::FromStr;
 use crate::executor::ExecutorError;
 use crate::fault::FaultSchedule;
 use crate::history::MultilineMessageError;
+use crate::invariant::CheckError;
 use crate::outcome::{Outcome, ReasonError};
 use crate::systems::reconciler::PlacementError;
 use crate::world::NameError;
@@ -106,6 +107,8 @@ pub enum RunError {
     Reason(ReasonError),
     /// The run asked for a database to be placed somewhere no database can be.
     Placement(PlacementError),
+    /// The run could not be judged from what it recorded.
+    Check(CheckError),
 }
 
 impl fmt::Display for RunError {
@@ -116,6 +119,7 @@ impl fmt::Display for RunError {
             Self::Name(error) => write!(f, "{error}"),
             Self::Reason(error) => write!(f, "{error}"),
             Self::Placement(error) => write!(f, "{error}"),
+            Self::Check(error) => write!(f, "{error}"),
         }
     }
 }
@@ -128,7 +132,14 @@ impl std::error::Error for RunError {
             Self::Name(error) => Some(error),
             Self::Reason(error) => Some(error),
             Self::Placement(error) => Some(error),
+            Self::Check(error) => Some(error),
         }
+    }
+}
+
+impl From<CheckError> for RunError {
+    fn from(error: CheckError) -> Self {
+        Self::Check(error)
     }
 }
 

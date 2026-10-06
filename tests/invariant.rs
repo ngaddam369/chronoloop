@@ -6,10 +6,14 @@
 //! recorded world lands where the system's own verdict does.
 //!
 //! That agreement is the point of every case here, and it is only worth anything because the two
-//! sides take **different routes**. A system's verdict is read off notes it kept for itself while
-//! it ran; the invariants below read field names out of a world rebuilt from the store, written
-//! here from what the module docs say the world holds. A checker naming the wrong step, or the
-//! wrong state, or reading a world the store did not hold, disagrees with a verdict it never saw.
+//! sides take **different routes**. The coordinator's verdict is read off notes it kept for itself
+//! while it ran. The controller's is its own invariants, checked by this same checker, but over
+//! predicates written in its module; the ones below are written here, from what the module docs say
+//! the world holds, and share no code with them. A checker naming the wrong step, or the wrong state,
+//! or reading a world the store did not hold, disagrees with the coordinator's verdict, which never
+//! saw it — and for the controller, a predicate reading the world wrong disagrees with the other
+//! one. What the controller's side cannot catch is a fault in the checker itself, since both of its
+//! routes run through it; the coordinator's cases are the ones here that hold the checker.
 //!
 //! What none of it pins is the content of any one run: each expectation is the run's own verdict,
 //! so a change upstream that moved every step would move both sides alike. Pinned histories live in
@@ -96,8 +100,8 @@ fn every_round_reaches_quorum(world: &World) -> bool {
 /// Every database has exactly the replicas wanted of it, each in its role and ready.
 ///
 /// Read off the fields the controller's world names for a region: `<region>-wanted` for the role
-/// asked of it, `<region>-role` and `<region>-phase` for the replica there. The controller has a
-/// convergence check of its own over its typed state; this one never sees it.
+/// asked of it, `<region>-role` and `<region>-phase` for the replica there. The controller judges
+/// convergence with a predicate of its own over the same fields; this one shares no code with it.
 fn converged(world: &World) -> bool {
     world.resources().all(|(_, database)| {
         let at = |region: &str, ending: &str| {
@@ -157,8 +161,8 @@ fn a_run_that_holds_up_breaks_no_safety_invariant() {
 #[test]
 fn a_loop_that_never_converges_breaks_liveness_at_the_last_step_its_run_took() {
     // The span is longer than the run, so the only thing that can break it is the run ending with
-    // the stretch still open — and the controller's own verdict, reached over its typed state,
-    // names the last step for not converging.
+    // the stretch still open — and the controller's own verdict, reached through a predicate of its
+    // own over the same world, names the last step for not converging.
     let (trace, store, outcome) = reconciler::run(RECONCILER_SEED, &faults(CUT))
         .unwrap_or_else(|e| panic!("the run finishes: {e}"));
     let settles = Invariant::liveness(reason("did not converge"), AN_HOUR, converged);
