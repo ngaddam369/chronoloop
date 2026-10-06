@@ -112,9 +112,17 @@
 //! The scan in `tests/audit.rs` names that one file as the one place a thread is allowed, for that
 //! one rule, in a table that says why.
 //!
+//! Every system so far is a protocol, and [`reconciler`] is the first **control loop**: a controller
+//! that wakes on a resync period, asks an API server what is wanted and what exists, and asks for
+//! the difference. Its decision reads those two states and nothing else, so it is
+//! **level-triggered** — an action the wire lost is asked for again on the next pass without
+//! anything deciding to retry it, and a controller restarted from nothing decides exactly what one
+//! that was there all along would.
+//!
 //! [`fork`]: fork::fork
 //! [`ring`]: systems::ring
 //! [`quorum`]: systems::quorum
+//! [`reconciler`]: systems::reconciler
 //!
 //! [`diff`]: diff::diff
 //! [`list`]: diff::list

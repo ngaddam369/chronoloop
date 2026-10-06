@@ -12,6 +12,7 @@ use crate::world::NameError;
 
 pub mod pingpong;
 pub mod quorum;
+pub mod reconciler;
 pub mod ring;
 
 /// Why a system's run produced no history.
