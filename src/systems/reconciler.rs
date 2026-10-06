@@ -40,15 +40,19 @@
 //! nothing the next pass cannot put right.
 //!
 //! The decision asks for every difference it sees at once, and says nothing about the order they
-//! should land in. Nothing on the timeline this module runs ever moves a primary, so no run of it
-//! reaches the one move whose order is not safe — but the decision itself makes no promise about it,
-//! and the world is built to notice when one is broken.
+//! should land in. That is safe for every move but one, and the timeline this module runs reaches
+//! that one: when a database's primary is moved out of a region that is wanted for nothing, the
+//! same pass asks for the old primary to be deleted and the new one promoted, and if the delete
+//! lands while the standby to be promoted is still catching up, the data goes with it. Whether it
+//! is still catching up is a matter of how long it took to be created and how long it is taking to
+//! catch up, so what reaches the hazard is a run's draws together with whatever held it up.
 //!
 //! # The run
 //!
 //! [`run`] starts two tasks over the simulated network. The **API server** holds what is desired and
 //! what exists. What is desired changes on a fixed timeline — two databases are placed, one gains a
-//! standby in a third region, and then loses the standby it started with — and the server applies
+//! standby in a third region and then loses the standby it started with, and the other is moved out
+//! of the region holding its primary, into the region holding its standby — and the server applies
 //! whatever it is asked to, and moves every replica on through its phases as their time comes. The
 //! **controller** wakes on a fixed resync period, asks for a listing, works out what to do and sends
 //! it. Every change the server makes, whether asked for or the passage of time, is a step of the
@@ -115,13 +119,19 @@ const CATCHING_UP: RangeInclusive<Duration> = Duration::from_secs(2)..=Duration:
 /// What is asked for over the run: at a whole number of seconds, a database, the region its primary
 /// is wanted in, and the regions its standbys are wanted in.
 ///
-/// Each change falls between two passes, so the pass after it is the first to see it. No change
-/// moves a primary.
+/// Each change falls between two passes, so the pass after it is the first to see it. The last one
+/// evacuates west: `users`' primary is wanted in east, where its standby is, and west is wanted for
+/// nothing. It falls late enough that with nothing in the way the standby in east has always caught
+/// up by the time the pass after it acts: asked for on the first pass, it exists by 7.4s at the
+/// latest and is in sync by 23.4s, and that pass opens at 25s. So only a run held up on its way
+/// there can reach the unsafe delete, which `tests/reconciler.rs` checks over a sweep of seeds
+/// rather than leaving to this arithmetic.
 const TIMELINE: &[(u64, &str, &str, &[&str])] = &[
     (0, "orders", "east", &["west"]),
     (0, "users", "west", &["east"]),
     (12, "orders", "east", &["south", "west"]),
     (22, "orders", "east", &["south"]),
+    (23, "users", "east", &["south"]),
 ];
 
 /// The field holding whether a database's data has been destroyed.

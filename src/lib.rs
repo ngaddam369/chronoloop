@@ -122,6 +122,9 @@
 //! for: replicas take their time to be provisioned, and a standby takes longer still to catch up.
 //! That is what gives the order of things consequences, and the world keeps the worst of them as a
 //! fact: a primary taken away while none of its standbys has caught up destroys the database's data.
+//! The decision is a plain diff that asks for everything at once, and the timeline it runs moves a
+//! primary — so a run held up on its way there can take the old primary away before the new one has
+//! caught up.
 //!
 //! [`fork`]: fork::fork
 //! [`ring`]: systems::ring

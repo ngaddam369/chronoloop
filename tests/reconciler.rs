@@ -18,10 +18,15 @@
 //! cut is lost on every seed, and a server never heard from is short of everything on every seed —
 //! and the gated sweep is there to say so at scale rather than letting one seed imply it.
 //!
-//! Nothing on the timeline moves a primary, so no case here reaches the one move that can destroy a
-//! database's data; the unit cases beside the module are what hold the world to that. What the sweep
-//! does say is that the timeline as it stands never loses anything on any seed it tries, which is
-//! what a run that does will be measured against.
+//! At 23 seconds the timeline evacuates west: `users`, whose primary is there, is wanted with its
+//! primary in east instead. The pass that sees it asks to promote east, create a standby in south
+//! and delete west all at once, and if the delete lands while east is still catching up the data is
+//! gone. With nothing in the way that never happens — east is always in sync by then, and the gated
+//! sweep holds that rather than the arithmetic — but a pass whose creates are lost puts east a pass
+//! behind, and from there whether it catches up before the delete lands is the draws' to decide. So
+//! the cases reaching the hazard need a fault **and** a seed: one seed that loses the data under a
+//! schedule and one that holds up under the same schedule, which is what keeps them from being
+//! blind to the seed the way the partition cases above are.
 
 use chronoloop::fault::FaultSchedule;
 use chronoloop::outcome::{Outcome, Reason};
@@ -55,8 +60,14 @@ step 12 15.341333989s c60e635f41c874c319968ddd35843e9130f3e7622ba268b8bf423af87a
 step 13 16.119259949s 8e2715526e0cfee73fad557422664d1c82e438d9b39ebc079b3c0e9899a5b803 create orders in south as standby\n\
 step 14 18.526590425s 700f59f4eb63ed4781b9aff758f2a4c3ee4d29b270ffcac85edd1d0386516106 orders in south catching up\n\
 step 15 22.000000000s 659abc6cadfb4e0e1b1b023d063263899a73b85004eb7183bb896c8b4dccb3a0 orders wanted with primary east and standbys south\n\
-step 16 24.373838850s 7a927a93bd1c301280a1923c907a32a99f2a5026a7c58338d2f9b3a3aa05d29c orders in south ready\n\
-step 17 26.209087666s f02d5ca4811191e7b24769308fc04b669e4407e847f6986cd07ae73853ac3474 delete orders in west\n";
+step 16 23.000000000s d834c0ef4aacf506969da2ce04c46300b5b59d19e6f461a885b39a7c787e83c8 users wanted with primary east and standbys south\n\
+step 17 24.373838850s c804552b76d8e4c12e5892d4ec8ac7b0a91fe539660eb39771c1b9bdd604ca2d orders in south ready\n\
+step 18 26.121789341s 7009f56cc8bc66764827a0a8f45d55b6ab5b27d6069b31f24c3c9e78f7d65aae promote users in east\n\
+step 19 26.180765861s 6d120c7b4b4a7abc0f74fc2dda03ea6d5cfb2533cd68e6a0dbec22168fc512da create users in south as standby\n\
+step 20 26.209087666s e4a43a3c8e6ff4375730e3482d8f580d098903ffd80b6bf26e40e4d4f1608b80 delete orders in west\n\
+step 21 26.272151813s cd0873fd4b5823e626a17b45f4b1916cef9928fe4ce987a63bf9b1a20d959013 delete users in west\n\
+step 22 28.821562356s afd90b258e400ba0c9d0db15b796e62ac7fc034d2dbdfee0dc3b84588fe017d2 users in south catching up\n\
+step 23 32.169870047s 3a6e5fb3588cc43381759d5f81383f30e785e2a46d5dc4eaa88dcf789f75e7cd users in south ready\n";
 
 /// A schedule losing everything the controller sends in the two seconds after the fifth pass asks.
 ///
@@ -64,8 +75,37 @@ step 17 26.209087666s f02d5ca4811191e7b24769308fc04b669e4407e847f6986cd07ae73853
 /// opens a nanosecond later — in time to lose the teardown the pass decides on, which is the first
 /// pass to see the standby in west is no longer wanted. Two seconds because a listing can take most
 /// of one to come back and the teardown sent on it has to fall inside the window on every seed.
+///
+/// The same pass is the first to see west evacuated for `users`, so that pass's promote, create and
+/// delete are lost too and asked for again on the next pass — by when east is in sync on every seed,
+/// so the window costs a pass and not the data.
 const LOST_TEARDOWN: &str = "chronoloop faults\n\
                              partition on node 0 -> node 1 from 25.000000001s until 27.000000000s\n";
+
+/// A schedule losing everything the controller sends in the five seconds after the first pass asks.
+///
+/// The listing goes through and every create the first pass decides on is lost, so every replica is
+/// asked for a pass late — late enough that `users`' standby in east may still be catching up when
+/// the evacuation of west is acted on.
+const DELAYED_CREATES: &str = "chronoloop faults\n\
+                               partition on node 0 -> node 1 from 5.000000001s until 10.000000000s\n";
+
+/// The lowest seed that loses `users`' data under [`DELAYED_CREATES`], found by running: east
+/// catches up at 26.57s, about half a second after the delete of west has landed.
+const LOSES: u64 = 31;
+
+/// The lowest seed that holds up under [`DELAYED_CREATES`] with its delete of west landing
+/// **before** its promote of east, found by running: west is still the primary when it goes, and
+/// what saves the data is east having caught up at 24.1s, two seconds before.
+///
+/// Not simply the lowest seed that holds up. Seed 0 does, but its promote lands first, so west has
+/// already stepped down when it is deleted and the case would stay green in a world where deleting
+/// any primary destroyed the data — which is how this was found.
+const HOLDS: u64 = 7;
+
+/// How many of the gated sweep's seeds lose `users`' data under [`DELAYED_CREATES`], recorded from
+/// an actual run.
+const LOST_IN_SWEEP: usize = 11;
 
 /// A schedule cutting the controller off from the server for the whole run.
 const NEVER_HEARD: &str = "chronoloop faults\n\
@@ -137,6 +177,57 @@ fn a_lost_teardown_is_asked_for_again_on_the_next_pass() {
     );
 }
 
+/// The failure a run that destroyed `users`' data reports, at the step that did it.
+fn lost_data(trace: &Trace) -> Outcome {
+    let step = trace
+        .steps()
+        .iter()
+        .position(|step| step.event().message() == "delete users in west")
+        .unwrap_or_else(|| panic!("seed {} deleted west", trace.seed()));
+    Outcome::Fail {
+        reason: Reason::new("lost data").unwrap_or_else(|e| panic!("a reason is a reason: {e}")),
+        step,
+    }
+}
+
+#[test]
+fn evacuating_a_region_before_its_standby_catches_up_loses_the_data() {
+    // The plain diff asks for the promote and the delete in one pass and nothing keeps them in order.
+    // Here east has not caught up when the delete of west lands, so the primary goes with nothing in
+    // sync behind it — named at that step, and not at the end of the run.
+    let (trace, outcome) = runs(LOSES, &faults(DELAYED_CREATES));
+    assert_eq!(outcome, lost_data(&trace));
+    assert!(
+        when(&trace, "delete users in west") < when(&trace, "users in east ready"),
+        "the delete landed before east had caught up"
+    );
+
+    // And the fault is what moved it: the same seed with nothing in its way holds up.
+    let (_, outcome) = runs(LOSES, &FaultSchedule::default());
+    assert_eq!(
+        outcome,
+        Outcome::Pass,
+        "seed {LOSES} with nothing in its way"
+    );
+}
+
+#[test]
+fn whether_the_evacuation_loses_the_data_is_the_seeds_to_decide() {
+    // The other side of the case above, under the very same faults: a seed whose standby catches up
+    // in time. Without it the case above could be a fact about the schedule alone, and a schedule
+    // that fails on every seed says nothing about whether the seed reaches the run at all.
+    let (trace, outcome) = runs(HOLDS, &faults(DELAYED_CREATES));
+    assert_eq!(outcome, Outcome::Pass);
+    assert!(
+        when(&trace, "delete users in west") < when(&trace, "promote users in east"),
+        "west was still the primary when it was deleted, as it is in the case above"
+    );
+    assert!(
+        when(&trace, "users in east ready") < when(&trace, "delete users in west"),
+        "and east had caught up before the delete landed, which is all that kept the data"
+    );
+}
+
 #[test]
 fn a_controller_the_server_never_hears_never_converges() {
     // The other side of the case above, and what keeps it from passing because nothing could fail:
@@ -148,7 +239,7 @@ fn a_controller_the_server_never_hears_never_converges() {
         Outcome::Fail {
             reason: Reason::new("did not converge")
                 .unwrap_or_else(|e| panic!("a reason is a reason: {e}")),
-            step: 3,
+            step: 4,
         },
         "named at the last step, the state the run ended in"
     );
@@ -173,11 +264,19 @@ fn different_seeds_run_different_loops() {
 
 #[test]
 #[ignore = "a sweep over many seeds; `make local-validation` runs it"]
-fn every_seed_converges_without_loss_and_a_lost_teardown_always_waits_a_pass() {
+fn only_a_delayed_create_loses_data_and_a_lost_teardown_always_waits_a_pass() {
     // The partition cases above are the same on every seed by construction, and this is where that
     // is checked rather than assumed: whatever the wire draws, a loop left alone converges, and a
     // loop that loses its teardown converges a pass later and no sooner.
+    //
+    // It is also where the evacuation is held to being out of reach without a fault — on every seed
+    // tried, not on the arithmetic that says east is always in sync by then — and where a delayed
+    // create is held to the one way of failing it has. The count of seeds that lose is recorded:
+    // it feels the wire's draws, the server's and the schedule, and nothing about how a state is
+    // encoded, which the pinned trace above is what holds.
     let lost = faults(LOST_TEARDOWN);
+    let delayed = faults(DELAYED_CREATES);
+    let mut losing = 0;
     for seed in 0..SWEEP {
         // A pass is the verdict's word that no wanted database lost its data and that every
         // replica ended where it was asked for, ready.
@@ -194,5 +293,16 @@ fn every_seed_converges_without_loss_and_a_lost_teardown_always_waits_a_pass() {
             when(&trace, "delete orders in west") >= NEXT_PASS_SECONDS * 1_000_000_000,
             "seed {seed} retried on the next pass"
         );
+
+        let (trace, outcome) = runs(seed, &delayed);
+        if outcome != Outcome::Pass {
+            assert_eq!(
+                outcome,
+                lost_data(&trace),
+                "seed {seed} with its creates delayed"
+            );
+            losing += 1;
+        }
     }
+    assert_eq!(losing, LOST_IN_SWEEP);
 }
