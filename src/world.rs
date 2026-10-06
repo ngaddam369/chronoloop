@@ -55,6 +55,11 @@
 //! What it does **not** do is read a branch. A branch's children are hashes rather than bytes, so
 //! what is under one is a question for a store rather than for a decoder, and a report that meets
 //! a branch prints the name it answers to and leaves the descent to whoever wants it.
+//!
+//! A whole tree is another matter, and a [`World`]'s has an inverse too: [`World::try_from`] reads
+//! a [`Node`] that a store has rebuilt back into the resources and fields it was written from. That
+//! is what lets something judge a recorded state without the system that recorded it handing over
+//! anything but the trace — the question [`crate::invariant`] asks of every step.
 
 use core::fmt;
 use core::str::FromStr;
@@ -537,6 +542,117 @@ impl Snapshot for World {
                 .map(|(name, resource)| (name.clone(), resource.snapshot()))
                 .collect(),
         )
+    }
+}
+
+/// Errors returned when reading a [`World`] back from the tree its snapshot is.
+///
+/// Each names the place in the tree that is not what a world writes there, as the path a comparison
+/// would print to it, so a caller holding a state some other code built can say which part of it is
+/// not a world's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DecodeWorldError {
+    /// A world is a branch of resources, and this is a leaf.
+    NotAWorld,
+    /// A resource is a branch of fields, and this one is a leaf.
+    NotAResource {
+        /// The resource that is a leaf.
+        resource: Name,
+    },
+    /// A field holds a value, and this one holds a branch.
+    NotAValue {
+        /// The resource the field belongs to.
+        resource: Name,
+        /// The field that holds a branch.
+        field: Name,
+    },
+    /// A field's bytes are not a value this module writes.
+    Value {
+        /// The resource the field belongs to.
+        resource: Name,
+        /// The field whose bytes could not be read.
+        field: Name,
+        /// What is wrong with them.
+        error: DecodeValueError,
+    },
+}
+
+impl fmt::Display for DecodeWorldError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAWorld => write!(f, "a world is a branch of resources, and this is a leaf"),
+            Self::NotAResource { resource } => {
+                write!(f, "{resource} is a leaf where a resource's fields belong")
+            }
+            Self::NotAValue { resource, field } => {
+                write!(f, "{resource}.{field} is a branch where a value belongs")
+            }
+            Self::Value {
+                resource,
+                field,
+                error,
+            } => write!(f, "{resource}.{field}: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeWorldError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Value { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl TryFrom<&Node> for World {
+    type Error = DecodeWorldError;
+
+    /// Reads back what [`Snapshot::snapshot`] wrote for a world, and refuses anything else.
+    ///
+    /// ```
+    /// use chronoloop::world::{Name, Resource, Snapshot, Value, World};
+    ///
+    /// let cache = Resource::new().with_field(Name::new("warm")?, Value::Flag(true));
+    /// let world = World::new().with_resource(Name::new("cache")?, cache);
+    ///
+    /// assert_eq!(World::try_from(&world.snapshot()), Ok(world));
+    ///
+    /// // A value on its own is a leaf, and a world is never one.
+    /// assert!(World::try_from(&Value::Flag(true).snapshot()).is_err());
+    /// # Ok::<(), chronoloop::world::NameError>(())
+    /// ```
+    fn try_from(node: &Node) -> Result<Self, Self::Error> {
+        let Node::Branch(resources) = node else {
+            return Err(DecodeWorldError::NotAWorld);
+        };
+        let mut world = Self::new();
+        for (resource, node) in resources {
+            let Node::Branch(fields) = node else {
+                return Err(DecodeWorldError::NotAResource {
+                    resource: resource.clone(),
+                });
+            };
+            let mut read = Resource::new();
+            for (field, node) in fields {
+                let Node::Leaf(bytes) = node else {
+                    return Err(DecodeWorldError::NotAValue {
+                        resource: resource.clone(),
+                        field: field.clone(),
+                    });
+                };
+                let value =
+                    Value::try_from(bytes.as_slice()).map_err(|error| DecodeWorldError::Value {
+                        resource: resource.clone(),
+                        field: field.clone(),
+                        error,
+                    })?;
+                read.insert(field.clone(), value);
+            }
+            world.insert(resource.clone(), read);
+        }
+        Ok(world)
     }
 }
 
@@ -1252,5 +1368,78 @@ mod tests {
         assert_eq!(world.len(), 1);
         assert_eq!(World::new().len(), 0);
         assert!(World::new().is_empty());
+    }
+
+    #[test]
+    fn a_world_reads_back_as_the_world_it_was_written_from() {
+        let cases = [
+            ("a world of nothing", World::new()),
+            (
+                "a resource with no fields",
+                World::new().with_resource(name("empty"), Resource::new()),
+            ),
+            (
+                "every kind of value",
+                base().with_resource(
+                    name("clock"),
+                    Resource::new()
+                        .with_field(name("at"), Value::Instant(VirtualTime::from_nanos(7)))
+                        .with_field(name("label"), Value::Text(String::new())),
+                ),
+            ),
+        ];
+        for (case, world) in cases {
+            assert_eq!(World::try_from(&world.snapshot()), Ok(world), "{case}");
+        }
+    }
+
+    #[test]
+    fn a_tree_a_world_would_not_write_is_refused() {
+        let leaf = |value: Value| value.snapshot();
+        let branch = |children: Vec<(&str, Node)>| {
+            Node::Branch(
+                children
+                    .into_iter()
+                    .map(|(child, node)| (name(child), node))
+                    .collect(),
+            )
+        };
+        let cases = [
+            (
+                "a leaf where the world belongs",
+                leaf(Value::Count(1)),
+                DecodeWorldError::NotAWorld,
+            ),
+            (
+                "a leaf where a resource belongs",
+                branch(vec![("cache", leaf(Value::Flag(true)))]),
+                DecodeWorldError::NotAResource {
+                    resource: name("cache"),
+                },
+            ),
+            (
+                "a branch where a value belongs",
+                branch(vec![("cache", branch(vec![("warm", branch(vec![]))]))]),
+                DecodeWorldError::NotAValue {
+                    resource: name("cache"),
+                    field: name("warm"),
+                },
+            ),
+            (
+                "bytes that are not a value",
+                branch(vec![(
+                    "cache",
+                    branch(vec![("warm", Node::Leaf(b"anything".to_vec()))]),
+                )]),
+                DecodeWorldError::Value {
+                    resource: name("cache"),
+                    field: name("warm"),
+                    error: DecodeValueError::UnknownKind { tag: b'a' },
+                },
+            ),
+        ];
+        for (case, node, expected) in cases {
+            assert_eq!(World::try_from(&node), Err(expected), "{case}");
+        }
     }
 }

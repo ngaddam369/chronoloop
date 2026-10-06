@@ -136,6 +136,15 @@
 //! primary away once it has stepped down — and the same sweep, under the very same faults, finds
 //! nothing.
 //!
+//! Every verdict so far was written inside the system it judges, read off notes the system kept
+//! while it ran. An [`Invariant`] is one written **outside** it: a promise about the [`World`] each
+//! step left the run in, which [`check`] reads back out of the store the trace already points into,
+//! so judging a run asks nothing of a system beyond the trace it records. A **safety** invariant
+//! holds after every step; a **liveness** one may stop holding for a while and must hold again
+//! within a span of virtual time, and a run that ends before it does has broken it. What comes back
+//! is every broken invariant's first breach, naming the step and the state it left the run in, and
+//! each becomes an [`Outcome`] — so a reduction, a repro and a sweep take it as they are.
+//!
 //! [`fork`]: fork::fork
 //! [`ring`]: systems::ring
 //! [`drawn_faults`]: systems::reconciler::drawn_faults
@@ -154,6 +163,8 @@
 //! [`VirtualNetwork`]: net::VirtualNetwork
 //! [`FaultSchedule`]: fault::FaultSchedule
 //! [`Outcome`]: outcome::Outcome
+//! [`Invariant`]: invariant::Invariant
+//! [`check`]: invariant::check
 //! [`shrink`]: shrink::shrink
 //! [`sweep`]: sweep::sweep
 //! [`Reduction`]: shrink::Reduction
@@ -173,6 +184,7 @@ pub mod executor;
 pub mod fault;
 pub mod fork;
 pub mod history;
+pub mod invariant;
 pub mod net;
 pub mod outcome;
 pub mod repro;
