@@ -20,18 +20,20 @@
 //! committed entries in order, and applying is not something a replica can take back. Any message
 //! from a later term makes its receiver a follower in that term.
 //!
-//! # What is missing, on purpose
+//! # Why a stale replica cannot lead
 //!
-//! A candidate asks for a vote with its term and nothing else, and a replica grants the first
-//! candidate to ask in a term whatever that candidate's log holds. Raft does not: a replica refuses
-//! a candidate whose log is behind its own, which is what keeps every committed entry in every
-//! later leader's log. Without it, a replica that spent a partition alone — timing out, standing,
-//! failing, standing again, its term climbing all the while — comes back with a term every other
-//! replica must defer to and a log missing whatever was committed while it was away. If it wins the
-//! election that follows, the no-op it appends lands where a committed entry already is, and the
-//! followers it copies its log to give that entry up. The draws decide whether it wins: whichever
-//! replica's timeout runs out first after the heal stands first, and a stale replica standing first
-//! is elected as readily as any other.
+//! A candidate asks for a vote with its term and with where its log ends: the index of its last
+//! entry and the term that entry is from. A replica refuses a candidate whose log is behind its
+//! own — last entry from an earlier term, or from the same term and shorter — and a refusal does
+//! not spend its vote for the term. A committed entry is held by a majority, and a leader needs a
+//! majority's votes, so at least one of its voters holds the entry. Together with a leader counting
+//! only its own term's entries towards a commit, that is Raft's argument that every later leader's
+//! log holds every committed entry — an argument this module relies on and does not prove.
+//! Without the rule, a replica that spent a partition alone — timing out, standing, failing,
+//! standing again, its term climbing all the while — would come back with a term every other
+//! replica must defer to and a log missing whatever was committed while it was away, and win as
+//! readily as any other. With it, it stands, takes the others to its term, and is turned away by
+//! each of them.
 //!
 //! # The run
 //!
@@ -346,8 +348,13 @@ enum Answer {
 /// What travels between the replicas, and between a replica and a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Message {
-    /// A candidate asking for a vote in its term — with its term, and nothing about its log.
-    RequestVote { term: u64 },
+    /// A candidate asking for a vote in its term, saying where its log ends: the index of its last
+    /// entry and the term that entry is from, both 0 for an empty log.
+    RequestVote {
+        term: u64,
+        last_index: u64,
+        last_term: u64,
+    },
     /// A replica's answer to a candidate, with the replica's term.
     Vote { term: u64, ballot: Ballot },
     /// A leader copying its log from `prev_index` on, and saying how much of it is committed.
@@ -371,7 +378,7 @@ impl Message {
     /// The term a message between replicas was sent in; the clients' messages are in none.
     fn term(&self) -> Option<u64> {
         match self {
-            Self::RequestVote { term }
+            Self::RequestVote { term, .. }
             | Self::Vote { term, .. }
             | Self::Append { term, .. }
             | Self::Appended { term, .. } => Some(*term),
@@ -471,6 +478,14 @@ impl Replica {
         index(self.recorded.log.len())
     }
 
+    /// Where the log ends: the term of its last entry, then its index, both 0 for an empty log.
+    ///
+    /// In that order so that comparing two of them compares how up to date two logs are.
+    fn last(&self) -> (u64, u64) {
+        let index = self.last_index();
+        (self.term_at(index).unwrap_or(0), index)
+    }
+
     /// The term of the entry at `at`: 0 before the first entry, and nothing past the last.
     fn term_at(&self, at: u64) -> Option<u64> {
         let Some(offset) = at.checked_sub(1) else {
@@ -504,13 +519,21 @@ impl Replica {
         self.leader = None;
         self.votes = BTreeSet::from([self.me]);
         let term = self.recorded.term;
+        let last = self.last();
         self.note(
             &mut out,
             format!("{} became candidate for term {term}", node(self.me)),
         );
         for (other, peer) in self.peers.iter().enumerate() {
             if other != self.me {
-                out.sends.push((*peer, Message::RequestVote { term }));
+                out.sends.push((
+                    *peer,
+                    Message::RequestVote {
+                        term,
+                        last_index: last.1,
+                        last_term: last.0,
+                    },
+                ));
             }
         }
         out.rearm = Rearm::Election;
@@ -531,7 +554,11 @@ impl Replica {
             self.adopt(term, &mut out);
         }
         match message {
-            Message::RequestVote { term } => self.on_request_vote(from, term, &mut out),
+            Message::RequestVote {
+                term,
+                last_index,
+                last_term,
+            } => self.on_request_vote(from, term, (last_term, last_index), &mut out),
             Message::Vote { term, ballot } => self.on_vote(from, term, ballot, &mut out),
             Message::Append {
                 term,
@@ -586,16 +613,19 @@ impl Replica {
         }
     }
 
-    /// A candidate asked for this replica's vote in `term`.
+    /// A candidate asked for this replica's vote in `term`, its log ending at `last` — the last
+    /// entry's term, then its index.
     ///
-    /// The vote goes to the first candidate to ask in the replica's term. Nothing about the
-    /// candidate's log is asked, because nothing about it was sent — the gap the module's docs
-    /// describe.
-    fn on_request_vote(&mut self, from: NodeId, term: u64, out: &mut Out) {
+    /// The vote goes to the first candidate to ask in the replica's term whose log is at least as
+    /// up to date as this replica's own: its last entry from a later term, or from the same term
+    /// and no shorter. A candidate refused for its log has not had the vote, so the term's one vote
+    /// is still there for a candidate that holds everything, and the timer runs on as it was.
+    fn on_request_vote(&mut self, from: NodeId, term: u64, last: (u64, u64), out: &mut Out) {
         let Some(candidate) = self.peer(from) else {
             return;
         };
         let ballot = if term == self.recorded.term
+            && last >= self.last()
             && self
                 .recorded
                 .voted_for
@@ -1641,19 +1671,30 @@ mod tests {
 
     #[test]
     fn a_follower_whose_timer_runs_out_stands_and_asks_everyone_else() {
+        // With a log whose last entry is from an earlier term than the one before it would suggest,
+        // so the request is seen to carry the last entry's own term and not the replica's.
         let mut follower = replica(2);
+        follower.recorded.term = 4;
+        follower.recorded.log = vec![command(1, 1), command(2, 2)];
         let out = follower.on_timer();
 
-        assert_eq!(follower.recorded.term, 1);
+        assert_eq!(follower.recorded.term, 5);
         assert_eq!(follower.recorded.role, Role::Candidate);
         assert_eq!(follower.recorded.voted_for, Some(2), "it votes for itself");
-        assert_eq!(said(&out), ["node-5 became candidate for term 1"]);
+        assert_eq!(said(&out), ["node-5 became candidate for term 5"]);
         assert_eq!(
             sent(&out),
             [0, 1, 3, 4]
-                .map(|other| (peer(other), Message::RequestVote { term: 1 }))
+                .map(|other| (
+                    peer(other),
+                    Message::RequestVote {
+                        term: 5,
+                        last_index: 2,
+                        last_term: 2
+                    }
+                ))
                 .to_vec(),
-            "everyone but itself"
+            "everyone but itself, with where its log ends"
         );
         assert_eq!(
             out.rearm,
@@ -1674,7 +1715,8 @@ mod tests {
             voted_after: Option<usize>,
             notes: usize,
         }
-        // The candidate is always the replica at 1, asking the replica at 0.
+        // The candidate is always the replica at 1, asking the replica at 0. Both logs are empty, so
+        // the candidate's is as up to date as the voter's and only the terms and the ballot decide.
         let cases = [
             Case {
                 name: "the first to ask in a term has the vote",
@@ -1735,6 +1777,8 @@ mod tests {
                 peer(1),
                 Message::RequestVote {
                     term: case.asked_in,
+                    last_index: 0,
+                    last_term: 0,
                 },
             );
 
@@ -1757,27 +1801,146 @@ mod tests {
     }
 
     #[test]
-    fn a_vote_is_granted_without_asking_anything_of_the_candidates_log() {
-        // The gap the module's docs describe, held where it lives: a replica holding three
-        // committed entries grants its vote to a candidate that holds none, because a request for a
-        // vote carries a term and nothing else. Raft's own rule would refuse it.
-        let mut voter = replica(0);
-        voter.recorded.term = 2;
-        voter.recorded.log = vec![command(1, 1), command(1, 2), command(2, 3)];
-        voter.recorded.commit = 3;
-        let out = voter.on_message(peer(4), Message::RequestVote { term: 9 });
+    fn a_vote_goes_only_to_a_candidate_whose_log_is_at_least_as_up_to_date() {
+        struct Case {
+            name: &'static str,
+            last_index: u64,
+            last_term: u64,
+            ballot: Ballot,
+        }
+        // The voter holds three entries, the last of them from term 2, and has not voted in term 9.
+        // Whichever log's last entry is from the later term is the more up to date, and between two
+        // whose last entries share a term the longer one is.
+        let cases = [
+            Case {
+                name: "a candidate holding nothing is refused",
+                last_index: 0,
+                last_term: 0,
+                ballot: Ballot::Refused,
+            },
+            Case {
+                name: "a longer log ending in an earlier term is refused",
+                last_index: 7,
+                last_term: 1,
+                ballot: Ballot::Refused,
+            },
+            Case {
+                name: "a shorter log ending in the same term is refused",
+                last_index: 2,
+                last_term: 2,
+                ballot: Ballot::Refused,
+            },
+            Case {
+                name: "a log ending where the voter's does has the vote",
+                last_index: 3,
+                last_term: 2,
+                ballot: Ballot::Granted,
+            },
+            Case {
+                name: "a longer log ending in the same term has the vote",
+                last_index: 4,
+                last_term: 2,
+                ballot: Ballot::Granted,
+            },
+            Case {
+                name: "a shorter log ending in a later term has the vote",
+                last_index: 2,
+                last_term: 3,
+                ballot: Ballot::Granted,
+            },
+        ];
+        for case in cases {
+            let mut voter = replica(0);
+            voter.recorded.term = 2;
+            voter.recorded.log = vec![command(1, 1), command(1, 2), command(2, 3)];
+            voter.recorded.commit = 3;
+            let out = voter.on_message(
+                peer(4),
+                Message::RequestVote {
+                    term: 9,
+                    last_index: case.last_index,
+                    last_term: case.last_term,
+                },
+            );
 
+            assert_eq!(
+                sent(&out),
+                [(
+                    peer(4),
+                    Message::Vote {
+                        term: 9,
+                        ballot: case.ballot
+                    }
+                )],
+                "{}",
+                case.name
+            );
+            assert_eq!(voter.recorded.term, 9, "the later term is taken either way");
+            let granted = case.ballot == Ballot::Granted;
+            assert_eq!(
+                voter.recorded.voted_for,
+                granted.then_some(4),
+                "{}",
+                case.name
+            );
+            let expected: &[&str] = if granted {
+                &["node-3 voted for node-7 in term 9"]
+            } else {
+                &["node-3 is a follower in term 9"]
+            };
+            assert_eq!(said(&out), expected, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn a_refused_candidate_leaves_the_vote_for_one_that_is_up_to_date_and_the_timer_running() {
+        // A refusal is not a vote: the stale candidate is turned away without spending the term's
+        // one vote, so a candidate that does hold everything can still have it — and the voter's
+        // timer is not put back by a candidate it would never follow.
+        let mut voter = replica(0);
+        voter.recorded.term = 9;
+        voter.recorded.log = vec![command(1, 1), command(2, 2)];
+        let stale = voter.on_message(
+            peer(4),
+            Message::RequestVote {
+                term: 9,
+                last_index: 1,
+                last_term: 1,
+            },
+        );
         assert_eq!(
-            sent(&out),
+            sent(&stale),
             [(
                 peer(4),
+                Message::Vote {
+                    term: 9,
+                    ballot: Ballot::Refused
+                }
+            )]
+        );
+        assert_eq!(voter.recorded.voted_for, None);
+        assert_eq!(stale.rearm, Rearm::Keep);
+
+        let current = voter.on_message(
+            peer(3),
+            Message::RequestVote {
+                term: 9,
+                last_index: 2,
+                last_term: 2,
+            },
+        );
+        assert_eq!(
+            sent(&current),
+            [(
+                peer(3),
                 Message::Vote {
                     term: 9,
                     ballot: Ballot::Granted
                 }
             )]
         );
-        assert_eq!(said(&out), ["node-3 voted for node-7 in term 9"]);
+        assert_eq!(voter.recorded.voted_for, Some(3));
+        assert_eq!(current.rearm, Rearm::Election);
     }
 
     #[test]
