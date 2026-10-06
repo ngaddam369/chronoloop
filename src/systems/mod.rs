@@ -17,6 +17,7 @@ use crate::world::NameError;
 pub mod pingpong;
 pub mod quorum;
 pub mod reconciler;
+pub mod replog;
 pub mod ring;
 
 /// A system a schedule of faults can be thrown at, named the way a written repro names it.
