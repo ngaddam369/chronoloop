@@ -1,4 +1,5 @@
-//! A replicated log: five replicas electing a leader and copying a client's commands to each other.
+//! A replicated log: five replicas electing a leader and copying three clients' commands to each
+//! other.
 //!
 //! The reconciler is a control loop, and everything else in this crate before it was a protocol
 //! too small to go wrong in an interesting way. This is a system with nothing in common with the
@@ -11,7 +12,7 @@
 //! numbered **term**. A follower that hears nothing from a leader for an election timeout becomes a
 //! candidate in the next term, votes for itself and asks every other replica for its vote; a
 //! replica votes at most once a term, and a candidate that collects a majority leads that term. A
-//! leader appends a no-op to its log the moment it is elected, takes each command the client sends
+//! leader appends a no-op to its log the moment it is elected, takes each command a client sends
 //! it as the next entry of its log, and copies its log to every follower on a heartbeat. A follower
 //! accepts entries only after the entry they follow, which it must already hold, and an entry that
 //! conflicts with what the follower holds replaces it and everything after it. An entry is
@@ -34,13 +35,19 @@
 //!
 //! # The run
 //!
-//! [`run`] starts the five replicas and a client over the simulated network. The client is node 0
-//! and the replicas nodes 1 to 5, written `node-1` to `node-5` wherever the run writes them down,
-//! so a fault on `node 3 -> node 1` is about the replicas the trace calls `node-3` and `node-1`.
-//! The client sends [`COMMANDS`] commands one after another, each no earlier than its own place on
-//! a fixed period, to whichever replica it believes leads; it follows a replica's hint to the
-//! leader, and moves on to the next replica when it is given none or hears nothing back in time.
-//! It is told a command is done only once the command is committed.
+//! [`run`] starts three clients and the five replicas over the simulated network. The clients are
+//! nodes 0 to 2 and the replicas nodes 3 to 7, and each is written with its own node number
+//! wherever the run writes it down — `client-0` to `client-2`, `node-3` to `node-7` — so a fault on
+//! `node 7 -> node 3` is about the replicas the trace calls `node-7` and `node-3`.
+//!
+//! The clients send [`ROUNDS`] rounds of commands, one command each a round, numbered across all
+//! three: client `c`'s command in round `k` is `3(k - 1) + c + 1`. Every client's command in a round
+//! is sent no earlier than the round's own place on a fixed period, and later only if that client's
+//! command before it is not done yet. A client is sequential on its own and the three overlap with
+//! each other, so each round puts three commands in flight together and the log is free to order
+//! them however it likes. A client sends to whichever replica it believes leads; it follows a
+//! replica's hint to the leader, and moves on to the next replica when it is given none or hears
+//! nothing back in time. It is told a command is done only once the command is committed.
 //!
 //! The wire is **dependable**, for the reason `quorum` gives: it takes time and nothing else, so an
 //! injected [`FaultSchedule`] is the only trouble a run meets. With none, the first leader keeps its
@@ -48,16 +55,17 @@
 //! reaches a run through how long each message spends on the wire and through each replica's
 //! election timeouts, drawn afresh every time a replica's timer is set, from a generator of the
 //! replica's own. The network's generator is drawn from the run's seed first and the replicas'
-//! after it, in node order, and that order is part of every history this module records.
+//! after it, in node order, and that order is part of every history this module records. The
+//! clients draw nothing.
 //!
-//! Every change a replica makes to what it holds is a step of the trace, and so are the client
+//! Every change a replica makes to what it holds is a step of the trace, and so are a client
 //! sending a command and hearing it is done. Each loop stops at a fixed instant, since heartbeats
 //! keep the wire busy for as long as a leader stands and a replica waiting for quiet would wait
 //! forever.
 //!
 //! # The verdict
 //!
-//! A run is judged by three [`Invariant`]s over the world each step recorded, and the verdict is
+//! A run is judged by four [`Invariant`]s over the world each step recorded, and the verdict is
 //! the first breach [`invariant::check`] finds:
 //!
 //! - **"two leaders in one term"**, a safety promise: each replica carries a `led-<term>` flag for
@@ -65,10 +73,26 @@
 //!   replicas carrying the same one is visible in a single world.
 //! - **"a committed entry changed"**, a safety promise: every replica's `applied-<index>` agrees
 //!   with every other's at that index, and with what that replica's own log holds there.
+//! - **"not linearizable"**, a safety promise judged from the clients' side rather than the
+//!   replicas': every replica applied each command at most once, applied only commands a client
+//!   sent, and never applied a command ahead of one that was done before it was sent.
 //! - **"did not commit every command"**, a liveness promise with a span too long for virtual time,
-//!   so only the end of the run can break it: every command the client sent was answered, and every
+//!   so only the end of the run can break it: every command a client sent was answered, and every
 //!   replica has applied it.
-
+//!
+//! # Linearizability, for a log
+//!
+//! A history is linearizable when its operations can be put in one order, each taking effect at a
+//! single moment between being sent and being answered, that a log on its own would have produced.
+//! A command here answers with nothing but "done", so the only order there is to choose is the
+//! order the entries were applied in — and the replicas wrote that down. Checking it against what
+//! the clients saw is therefore the whole of the check, not a shortcut through a search: a command
+//! answered before another was sent must be applied before it, commands in flight together may go
+//! either way, and a command not yet answered may have taken effect or not.
+//!
+//! What it does not reach: each client is sequential on its own, so the only commands in flight
+//! together are different clients' commands in one round, and a reply carries no value a later
+//! read could contradict.
 use core::cell::RefCell;
 use core::fmt;
 use core::ops::RangeInclusive;
@@ -96,11 +120,15 @@ const REPLICAS: usize = 5;
 /// commit an entry.
 const MAJORITY: usize = 3;
 
-/// How many commands the client sends.
-const COMMANDS: u64 = 5;
+/// How many clients send commands. They are the first nodes the run adds, ahead of the replicas.
+const CLIENTS: usize = 3;
 
-/// How far apart the client's commands are, at the least. Command `n` is sent no earlier than `n`
-/// of these after the start of the run, and later only if the one before it is not done yet.
+/// How many commands each client sends, one a round.
+const ROUNDS: u64 = 5;
+
+/// How far apart the rounds are, at the least. A client's command in round `k` is sent no earlier
+/// than `k` of these after the start of the run, and later only if its command before it is not
+/// done yet.
 const PERIOD: Duration = Duration::from_secs(2);
 
 /// How often a leader copies its log to its followers, whether or not it has anything new.
@@ -118,7 +146,7 @@ const HEARTBEAT: Duration = Duration::from_millis(500);
 const ELECTION: RangeInclusive<Duration> =
     Duration::from_millis(1_500)..=Duration::from_millis(3_000);
 
-/// How long the client waits to hear that a command is done before asking another replica.
+/// How long a client waits to hear that a command is done before asking another replica.
 ///
 /// Longer than a request across, a round of copying and the answer back, each as slow as the wire
 /// can be, so a leader that can reach a majority answers in time.
@@ -126,15 +154,16 @@ const PATIENCE: Duration = Duration::from_secs(1);
 
 /// The instant every loop in the run stops at, counted from its start.
 ///
-/// The last command is sent at ten seconds, so this leaves twenty for whatever trouble a run is
+/// The last round is sent at ten seconds, so this leaves twenty for whatever trouble a run is
 /// put through to clear and for every replica to hear the last commit.
 const STOP: Duration = Duration::from_secs(30);
 
 /// What the dependable wire takes to carry a message.
 const LATENCY: RangeInclusive<Duration> = Duration::from_millis(10)..=Duration::from_millis(100);
 
-/// What the client is called where the run writes down what it knows.
-const CLIENT: &str = "client";
+/// What each client is called where the run writes down what it knows, with its node number after
+/// it.
+const CLIENT: &str = "client-";
 
 /// What each replica is called there, with its node number after it.
 const NODE: &str = "node-";
@@ -166,18 +195,29 @@ const APPLIED: &str = "applied-";
 /// The start of the flag a replica carries for each term it led, with the term after it.
 const LED: &str = "led-";
 
-/// The start of the fields describing one of the client's commands, with its number after it.
+/// The start of the fields describing one of a client's commands, with its number after it.
 const COMMAND: &str = "command-";
 
-/// The end of the field holding when the client first sent a command.
+/// The end of the field holding when a client first sent a command.
 const SENT: &str = "-sent";
 
-/// The end of the field holding when the client heard a command was done.
+/// The end of the field holding when a client heard a command was done.
 const DONE: &str = "-done";
 
-/// Returns the instant command `command` may be sent from.
-fn opens(command: u64) -> VirtualTime {
-    VirtualTime::from_nanos(command.saturating_mul(as_nanos(PERIOD)))
+/// Returns the instant the commands of round `round` may be sent from.
+fn opens(round: u64) -> VirtualTime {
+    VirtualTime::from_nanos(round.saturating_mul(as_nanos(PERIOD)))
+}
+
+/// Returns the number of the command the client at `client` sends in round `round`, counting
+/// rounds from one: the clients' commands in one round are numbered one after another.
+fn numbered(round: u64, client: usize) -> u64 {
+    let client = index(client);
+    round
+        .saturating_sub(1)
+        .saturating_mul(index(CLIENTS))
+        .saturating_add(client)
+        .saturating_add(1)
 }
 
 /// Returns the instant every loop stops at.
@@ -201,9 +241,15 @@ fn after(at: VirtualTime, duration: Duration) -> VirtualTime {
         .unwrap_or(VirtualTime::from_nanos(u64::MAX))
 }
 
-/// Returns what the replica at `index` among the replicas is called.
+/// Returns what the replica at `index` among the replicas is called: its node number, which comes
+/// after every client's.
 fn node(index: usize) -> String {
-    format!("{NODE}{}", index.saturating_add(1))
+    format!("{NODE}{}", index.saturating_add(CLIENTS))
+}
+
+/// Returns what the client at `index` among the clients is called, which is its node number.
+fn client(index: usize) -> String {
+    format!("{CLIENT}{index}")
 }
 
 /// Returns "entry 4" or "entries 4 to 6", for the entries from `first` to `last`.
@@ -225,8 +271,21 @@ fn index(count: usize) -> u64 {
 enum Op {
     /// Nothing: the entry a leader appends the moment it is elected.
     Noop,
-    /// One of the client's commands, by its number.
+    /// One of the clients' commands, by its number.
     Command(u64),
+}
+
+impl Op {
+    /// Reads back what [`Op`]'s `Display` wrote, or nothing if `text` is not something it writes.
+    fn read(text: &str) -> Option<Self> {
+        if text == "no-op" {
+            return Some(Self::Noop);
+        }
+        text.strip_prefix("command ")?
+            .parse()
+            .ok()
+            .map(Self::Command)
+    }
 }
 
 impl fmt::Display for Op {
@@ -275,7 +334,7 @@ enum Ballot {
     Refused,
 }
 
-/// A replica's answer to the client.
+/// A replica's answer to a client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Answer {
     /// The command is committed.
@@ -284,7 +343,7 @@ enum Answer {
     NotLeader(Option<NodeId>),
 }
 
-/// What travels between the replicas, and between a replica and the client.
+/// What travels between the replicas, and between a replica and a client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Message {
     /// A candidate asking for a vote in its term — with its term, and nothing about its log.
@@ -302,14 +361,14 @@ enum Message {
     /// A follower's answer to a leader: how far its log now matches the leader's, or nothing if the
     /// entry the copy followed was not one it holds.
     Appended { term: u64, matched: Option<u64> },
-    /// The client asking for a command to be committed.
+    /// A client asking for a command to be committed.
     Submit { command: u64 },
-    /// A replica's answer to the client about a command.
+    /// A replica's answer to a client about a command.
     Submitted { command: u64, answer: Answer },
 }
 
 impl Message {
-    /// The term a message between replicas was sent in; the client's messages are in none.
+    /// The term a message between replicas was sent in; the clients' messages are in none.
     fn term(&self) -> Option<u64> {
         match self {
             Self::RequestVote { term }
@@ -513,7 +572,7 @@ impl Replica {
 
     /// Moves into the later term `term` as a follower with its vote unspent.
     ///
-    /// A replica that was standing or leading drops whatever it was counting or owed: the client is
+    /// A replica that was standing or leading drops whatever it was counting or owed: a client is
     /// told nothing, and finds out by hearing nothing in time.
     fn adopt(&mut self, term: u64, out: &mut Out) {
         self.recorded.term = term;
@@ -587,7 +646,7 @@ impl Replica {
     /// Takes the lead of the replica's term: appends a no-op, and copies the log out at once.
     ///
     /// The no-op is what lets a new leader commit anything at all: it counts only entries of its
-    /// own term towards a commit, and the client may have nothing more to send.
+    /// own term towards a commit, and the clients may have nothing more to send.
     fn lead(&mut self, out: &mut Out) {
         let term = self.recorded.term;
         self.recorded.role = Role::Leader;
@@ -742,7 +801,7 @@ impl Replica {
     }
 
     /// Commits the furthest entry of the leader's own term that a majority holds, if that is further
-    /// than it has committed, and answers the client for what that commits.
+    /// than it has committed, and answers each client for what that commits.
     ///
     /// Only an entry of the leader's own term is counted. An entry from an earlier term held by a
     /// majority can still be replaced by a later leader that never saw it, so counting its copies
@@ -786,7 +845,7 @@ impl Replica {
         self.recorded.log.get(offset).map(|entry| entry.op)
     }
 
-    /// The client asked for `command` to be committed.
+    /// A client asked for `command` to be committed.
     ///
     /// A leader takes it as the next entry, unless its log already holds it — a retry — in which
     /// case it answers at once if that entry is committed and once it is otherwise. Anyone else
@@ -862,18 +921,18 @@ impl Replica {
     }
 }
 
-/// Where the client stands with one of its commands.
+/// Where a client stands with one of its commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Submission {
     sent: VirtualTime,
     done: Option<VirtualTime>,
 }
 
-/// Everything the run knows at one step: each replica that has started, and the client's commands.
+/// Everything the run knows at one step: each replica that has started, and each client's commands.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct View {
     replicas: BTreeMap<usize, Recorded>,
-    client: BTreeMap<u64, Submission>,
+    clients: BTreeMap<usize, BTreeMap<u64, Submission>>,
 }
 
 /// Something that happened, and what the run knew once it had.
@@ -884,7 +943,7 @@ struct Observation {
 }
 
 /// Writes the run's view as a world: one resource for each replica that has started, and one for
-/// the client once it has sent anything.
+/// each client once it has sent anything.
 ///
 /// An index, a term and a command number are written four digits wide in a field's name, so the
 /// fields of one resource list in order for the runs this module makes. Nothing reads the width
@@ -920,21 +979,21 @@ fn world(view: &View) -> Result<World, NameError> {
         }
         world.insert(Name::new(node(me))?, replica);
     }
-    if !view.client.is_empty() {
-        let mut client = Resource::new();
-        for (command, submission) in &view.client {
-            client.insert(
+    for (&me, commands) in &view.clients {
+        let mut asking = Resource::new();
+        for (command, submission) in commands {
+            asking.insert(
                 Name::new(format!("{COMMAND}{command:04}{SENT}"))?,
                 Value::Instant(submission.sent),
             );
             if let Some(done) = submission.done {
-                client.insert(
+                asking.insert(
                     Name::new(format!("{COMMAND}{command:04}{DONE}"))?,
                     Value::Instant(done),
                 );
             }
         }
-        world.insert(Name::new(CLIENT)?, client);
+        world.insert(Name::new(client(me))?, asking);
     }
     Ok(world)
 }
@@ -945,6 +1004,43 @@ fn replicas(world: &World) -> impl Iterator<Item = &Resource> {
         .resources()
         .filter(|(name, _)| name.as_str().starts_with(NODE))
         .map(|(_, replica)| replica)
+}
+
+/// The resources of a recorded world that are clients, which are the ones named for a client.
+fn clients(world: &World) -> impl Iterator<Item = &Resource> {
+    world
+        .resources()
+        .filter(|(name, _)| name.as_str().starts_with(CLIENT))
+        .map(|(_, client)| client)
+}
+
+/// Every command the clients sent, by its number: when it was sent, and when it was answered if it
+/// has been.
+///
+/// Read off a recorded world: a command was sent when some client has its `command-<n>-sent`, and
+/// answered when that client has its `command-<n>-done`.
+fn asked(world: &World) -> BTreeMap<u64, (VirtualTime, Option<VirtualTime>)> {
+    let mut asked = BTreeMap::new();
+    for asking in clients(world) {
+        for (name, value) in asking.fields() {
+            let Some(number) = name
+                .as_str()
+                .strip_prefix(COMMAND)
+                .and_then(|rest| rest.strip_suffix(SENT))
+            else {
+                continue;
+            };
+            let (Ok(command), Value::Instant(sent)) = (number.parse(), value) else {
+                continue;
+            };
+            let done = match field(asking, &format!("{COMMAND}{number}{DONE}")) {
+                Some(Value::Instant(done)) => Some(*done),
+                _ => None,
+            };
+            asked.insert(command, (*sent, done));
+        }
+    }
+    asked
 }
 
 /// The value of the field of `resource` called `field`, if it has one.
@@ -990,32 +1086,14 @@ fn committed_entries_hold(world: &World) -> bool {
     })
 }
 
-/// Whether every command the client sent was answered and has been applied by every replica.
+/// Whether every command a client sent was answered and has been applied by every replica.
 ///
-/// Read off a recorded world: a command was sent when the client has its `command-<n>-sent`,
-/// answered when it has its `command-<n>-done`, and applied by a replica when some
-/// `applied-<index>` of that replica names it.
+/// Read off a recorded world: a command was sent and answered as [`asked`] reads them, and applied
+/// by a replica when some `applied-<index>` of that replica names it.
 fn every_command_committed(world: &World) -> bool {
-    let Some(client) = world
-        .resources()
-        .find(|(name, _)| name.as_str() == CLIENT)
-        .map(|(_, client)| client)
-    else {
-        return true;
-    };
-    client.fields().all(|(name, _)| {
-        let Some(number) = name
-            .as_str()
-            .strip_prefix(COMMAND)
-            .and_then(|rest| rest.strip_suffix(SENT))
-        else {
-            return true;
-        };
-        let Ok(command) = number.parse() else {
-            return false;
-        };
+    asked(world).into_iter().all(|(command, (_, done))| {
         let wanted = Value::Text(Op::Command(command).to_string());
-        field(client, &format!("{COMMAND}{number}{DONE}")).is_some()
+        done.is_some()
             && replicas(world).all(|replica| {
                 replica
                     .fields()
@@ -1024,17 +1102,89 @@ fn every_command_committed(world: &World) -> bool {
     })
 }
 
+/// The commands `replica` applied, in the order it applied them, with the no-ops left out; or
+/// nothing if something it applied is neither.
+///
+/// Read off a recorded world: what a replica applied at an index is its `applied-<index>`. The
+/// indices are read as numbers rather than taken in the order the fields list in, which the width
+/// they are written at keeps right only for the logs this module makes.
+fn applied_commands(replica: &Resource) -> Option<Vec<u64>> {
+    let mut applied = BTreeMap::new();
+    for (name, value) in replica.fields() {
+        let Some(at) = name.as_str().strip_prefix(APPLIED) else {
+            continue;
+        };
+        let (Ok(at), Value::Text(text)) = (at.parse::<u64>(), value) else {
+            return None;
+        };
+        applied.insert(at, Op::read(text)?);
+    }
+    Some(
+        applied
+            .into_values()
+            .filter_map(|op| match op {
+                Op::Noop => None,
+                Op::Command(command) => Some(command),
+            })
+            .collect(),
+    )
+}
+
+/// Whether every replica applied the clients' commands in an order each client could have seen.
+///
+/// The order the entries were applied in is the only order a log whose answers carry nothing but
+/// "done" has to offer, so it is the order judged. Every replica applied each command at most
+/// once, applied only commands some client sent, and applied a command only after every command
+/// that was done by the instant it was sent. Commands in flight together may be applied either
+/// way round, and a command not yet answered may have been applied or not.
+///
+/// "Done by the instant it was sent" counts an answer at the very instant as before. That is the
+/// client's own order: a client whose command ran late sends its next one the instant it hears,
+/// and the next one cannot have taken effect first. Nor can counting it so order two commands the
+/// log was free to put either way round, since a command is answered only a crossing of the wire
+/// after it is committed, and so after it is applied by the leader that committed it.
+///
+/// Read off a recorded world: what was sent and answered is what [`asked`] reads, and what each
+/// replica applied is what [`applied_commands`] reads.
+fn linearizable(world: &World) -> bool {
+    let asked = asked(world);
+    replicas(world).all(|replica| {
+        let Some(order) = applied_commands(replica) else {
+            return false;
+        };
+        let mut place = BTreeMap::new();
+        if !order
+            .iter()
+            .enumerate()
+            .all(|(at, command)| place.insert(*command, at).is_none())
+        {
+            return false;
+        }
+        order.iter().enumerate().all(|(at, command)| {
+            let Some(&(sent, _)) = asked.get(command) else {
+                return false;
+            };
+            asked.iter().all(|(earlier, &(_, done))| {
+                done.is_none_or(|done| done > sent)
+                    || place.get(earlier).is_some_and(|&before| before < at)
+            })
+        })
+    })
+}
+
 /// What the replicated log promises, judged over the world each step of its run recorded.
 ///
-/// The two safety promises stand first, so a run that breaks one at its last step is reported for
-/// that rather than for falling short.
-fn invariants() -> Result<[Invariant; 3], ReasonError> {
+/// The safety promises stand first, so a run that breaks one at its last step is reported for that
+/// rather than for falling short; and among them the replicas' own stand before the clients', so a
+/// step that breaks both is reported for the cause rather than for what the clients saw of it.
+fn invariants() -> Result<[Invariant; 4], ReasonError> {
     Ok([
         Invariant::safety(Reason::new("two leaders in one term")?, one_leader_a_term),
         Invariant::safety(
             Reason::new("a committed entry changed")?,
             committed_entries_hold,
         ),
+        Invariant::safety(Reason::new("not linearizable")?, linearizable),
         Invariant::liveness(
             Reason::new("did not commit every command")?,
             Duration::MAX,
@@ -1043,7 +1193,7 @@ fn invariants() -> Result<[Invariant; 3], ReasonError> {
     ])
 }
 
-/// Runs the five replicas and the client under `seed`, with `faults` to get in their way.
+/// Runs the five replicas and the three clients under `seed`, with `faults` to get in their way.
 ///
 /// Returns what the run passed through, the states it passed through, and how it went. A run that
 /// meets no faults elects one leader and commits every command on every replica:
@@ -1083,8 +1233,8 @@ fn observe(seed: u64, faults: &FaultSchedule) -> Result<Vec<Observation>, RunErr
         VirtualNetwork::new(executor.handle(), SeededRng::from_seed(seeds.next_u64()))
             .with_default_link(Link::new(LATENCY));
 
-    // The client is added first, so it is node 0 and the replicas are the nodes after it.
-    let client = network.add_node();
+    // The clients are added first, so they are nodes 0 to 2 and the replicas the nodes after them.
+    let askers: Vec<_> = (0..CLIENTS).map(|_| network.add_node()).collect();
     let endpoints: Vec<_> = (0..REPLICAS).map(|_| network.add_node()).collect();
     let peers: Rc<[NodeId]> = endpoints.iter().map(Network::id).collect();
     network.set_faults(faults.clone());
@@ -1100,11 +1250,14 @@ fn observe(seed: u64, faults: &FaultSchedule) -> Result<Vec<Observation>, RunErr
         });
     }
 
-    let clock = executor.handle();
-    let observations = Rc::clone(&log);
-    executor.spawn(async move {
-        submit(&clock, &client, &peers, &observations).await;
-    });
+    for (me, endpoint) in askers.into_iter().enumerate() {
+        let clock = executor.handle();
+        let replicas = Rc::clone(&peers);
+        let observations = Rc::clone(&log);
+        executor.spawn(async move {
+            submit(&clock, me, &endpoint, &replicas, &observations).await;
+        });
+    }
 
     executor.run()?;
     // Every task is finished and nothing is polling, so nothing else holds the log open.
@@ -1115,10 +1268,10 @@ fn observe(seed: u64, faults: &FaultSchedule) -> Result<Vec<Observation>, RunErr
 enum Change {
     /// A replica's state, as it stood straight after the change.
     Replica(usize, Recorded),
-    /// The client sent a command for the first time.
-    Sent(u64),
-    /// The client heard a command was done.
-    Done(u64),
+    /// The client at the first number sent the command at the second for the first time.
+    Sent(usize, u64),
+    /// The client at the first number heard the command at the second was done.
+    Done(usize, u64),
 }
 
 /// Writes down what changed, on top of what the run knew before.
@@ -1139,8 +1292,8 @@ fn write(
         Change::Replica(me, recorded) => {
             view.replicas.insert(me, recorded);
         }
-        Change::Sent(command) => {
-            view.client.insert(
+        Change::Sent(me, command) => {
+            view.clients.entry(me).or_default().insert(
                 command,
                 Submission {
                     sent: at,
@@ -1148,8 +1301,12 @@ fn write(
                 },
             );
         }
-        Change::Done(command) => {
-            if let Some(submission) = view.client.get_mut(&command) {
+        Change::Done(me, command) => {
+            if let Some(submission) = view
+                .clients
+                .get_mut(&me)
+                .and_then(|commands| commands.get_mut(&command))
+            {
                 submission.done = Some(at);
             }
         }
@@ -1210,9 +1367,11 @@ async fn replicate<C, R, N>(
     }
 }
 
-/// The client: send each command in turn, and keep asking until it is done or the run ends.
+/// The client at `me` among the clients: send its command of each round in turn, and keep asking
+/// until it is done or the run ends.
 async fn submit<C, N>(
     clock: &C,
+    me: usize,
     endpoint: &N,
     replicas: &[NodeId],
     observations: &RefCell<Vec<Observation>>,
@@ -1222,16 +1381,17 @@ async fn submit<C, N>(
 {
     let end = stop();
     let mut target = 0;
-    for command in 1..=COMMANDS {
-        clock.sleep_until(opens(command)).await;
+    for round in 1..=ROUNDS {
+        clock.sleep_until(opens(round)).await;
         if clock.now() >= end {
             return;
         }
+        let command = numbered(round, me);
         write(
             observations,
             clock.now(),
-            format!("client sent command {command}"),
-            Change::Sent(command),
+            format!("{} sent command {command}", client(me)),
+            Change::Sent(me, command),
         );
         loop {
             if clock.now() >= end {
@@ -1253,8 +1413,8 @@ async fn submit<C, N>(
                     write(
                         observations,
                         clock.now(),
-                        format!("client heard command {command} is done"),
-                        Change::Done(command),
+                        format!("{} heard command {command} is done", client(me)),
+                        Change::Done(me, command),
                     );
                     break;
                 }
@@ -1324,14 +1484,15 @@ mod tests {
     /// The seed the cases run, since none of them is about a particular one.
     const SEED: u64 = 20_261_006;
 
-    /// The client's address, which is the first node the run adds.
-    fn client() -> NodeId {
-        NodeId::from_index(0)
+    /// The address of the client at `index` among the clients, which are the first nodes the run
+    /// adds.
+    fn asker(index: usize) -> NodeId {
+        NodeId::from_index(index as u64)
     }
 
     /// The address of the replica at `index` among the replicas, counting from zero.
     fn peer(index: usize) -> NodeId {
-        NodeId::from_index(index as u64 + 1)
+        NodeId::from_index((index + CLIENTS) as u64)
     }
 
     /// Every replica's address, in the order the run adds them.
@@ -1441,15 +1602,15 @@ mod tests {
                 who.strip_prefix(NODE)?
                     .parse::<usize>()
                     .ok()?
-                    .checked_sub(1)
+                    .checked_sub(CLIENTS)
             })
             .unwrap_or_else(|| panic!("a run with a leader names it"))
     }
 
     /// A schedule cutting `cut` off from every other node, both ways, for `during`.
     fn isolating(cut: &[usize], during: Window) -> FaultSchedule {
-        let others =
-            (0..=REPLICAS as u64).filter(|node| !cut.iter().any(|c| *c as u64 + 1 == *node));
+        let others = (0..(CLIENTS + REPLICAS) as u64)
+            .filter(|node| !cut.iter().any(|c| peer(*c) == NodeId::from_index(*node)));
         let mut faults = Vec::new();
         for other in others {
             for &replica in cut {
@@ -1486,7 +1647,7 @@ mod tests {
         assert_eq!(follower.recorded.term, 1);
         assert_eq!(follower.recorded.role, Role::Candidate);
         assert_eq!(follower.recorded.voted_for, Some(2), "it votes for itself");
-        assert_eq!(said(&out), ["node-3 became candidate for term 1"]);
+        assert_eq!(said(&out), ["node-5 became candidate for term 1"]);
         assert_eq!(
             sent(&out),
             [0, 1, 3, 4]
@@ -1616,7 +1777,7 @@ mod tests {
                 }
             )]
         );
-        assert_eq!(said(&out), ["node-1 voted for node-5 in term 9"]);
+        assert_eq!(said(&out), ["node-3 voted for node-7 in term 9"]);
     }
 
     #[test]
@@ -1652,7 +1813,7 @@ mod tests {
 
         let won = candidate.on_message(peer(3), granted);
         assert_eq!(candidate.recorded.role, Role::Leader);
-        assert_eq!(said(&won), ["node-1 became leader of term 1"]);
+        assert_eq!(said(&won), ["node-3 became leader of term 1"]);
         assert_eq!(
             candidate.recorded.log,
             [LogEntry {
@@ -1688,7 +1849,7 @@ mod tests {
     #[test]
     fn a_leader_that_hears_of_a_later_term_steps_down_and_forgets_who_it_owed_answers() {
         let mut stale = leader(0, 2, vec![command(2, 1)]);
-        stale.pending.insert(1, (client(), 1));
+        stale.pending.insert(1, (asker(0), 1));
         let out = stale.on_message(
             peer(3),
             Message::Appended {
@@ -1705,7 +1866,7 @@ mod tests {
             sent(&out).is_empty(),
             "the client finds out by hearing nothing"
         );
-        assert_eq!(said(&out), ["node-1 is a follower in term 4"]);
+        assert_eq!(said(&out), ["node-3 is a follower in term 4"]);
         assert_eq!(out.rearm, Rearm::Election);
     }
 
@@ -1732,7 +1893,7 @@ mod tests {
                 log_after: vec![command(1, 1)],
                 commit_after: 0,
                 matched: None,
-                said: vec!["node-2 is a follower in term 2"],
+                said: vec!["node-4 is a follower in term 2"],
             },
             CopyCase {
                 name: "a copy after an entry from another term is refused",
@@ -1752,7 +1913,7 @@ mod tests {
                 log_after: vec![command(1, 1), command(2, 4)],
                 commit_after: 1,
                 matched: Some(2),
-                said: vec!["node-2 dropped entries after 1 and appended entry 2"],
+                said: vec!["node-4 dropped entries after 1 and appended entry 2"],
             },
             CopyCase {
                 name: "an entry it already holds keeps what follows it",
@@ -1773,8 +1934,8 @@ mod tests {
                 commit_after: 2,
                 matched: Some(2),
                 said: vec![
-                    "node-2 appended entries 1 to 2",
-                    "node-2 committed through 2",
+                    "node-4 appended entries 1 to 2",
+                    "node-4 committed through 2",
                 ],
             },
             CopyCase {
@@ -1910,7 +2071,7 @@ mod tests {
             },
         );
         assert_eq!(leading.recorded.commit, 3);
-        assert_eq!(said(&out), ["node-1 committed through 3"]);
+        assert_eq!(said(&out), ["node-3 committed through 3"]);
         assert_eq!(
             leading.recorded.applied,
             [Op::Command(1), Op::Command(2), Op::Command(3)]
@@ -1927,19 +2088,19 @@ mod tests {
                 op: Op::Noop,
             }],
         );
-        let took = leading.on_message(client(), Message::Submit { command: 4 });
-        assert_eq!(said(&took), ["node-1 took command 4 as entry 2"]);
+        let took = leading.on_message(asker(0), Message::Submit { command: 4 });
+        assert_eq!(said(&took), ["node-3 took command 4 as entry 2"]);
         assert_eq!(
             took.sends.len(),
             REPLICAS - 1,
             "the new entry is copied out at once"
         );
         assert!(
-            took.sends.iter().all(|(to, _)| *to != client()),
+            took.sends.iter().all(|(to, _)| *to != asker(0)),
             "nothing is said to the client until it is committed"
         );
 
-        let again = leading.on_message(client(), Message::Submit { command: 4 });
+        let again = leading.on_message(asker(0), Message::Submit { command: 4 });
         assert_eq!(leading.recorded.log.len(), 2, "a retry is not taken twice");
         assert!(again.notes.is_empty());
 
@@ -1954,7 +2115,7 @@ mod tests {
             if follower == 2 {
                 assert!(
                     out.sends.contains(&(
-                        client(),
+                        asker(0),
                         Message::Submitted {
                             command: 4,
                             answer: Answer::Committed
@@ -1965,11 +2126,11 @@ mod tests {
             }
         }
 
-        let late = leading.on_message(client(), Message::Submit { command: 4 });
+        let late = leading.on_message(asker(0), Message::Submit { command: 4 });
         assert_eq!(
             sent(&late),
             [(
-                client(),
+                asker(0),
                 Message::Submitted {
                     command: 4,
                     answer: Answer::Committed
@@ -2001,12 +2162,12 @@ mod tests {
         for case in cases {
             let mut follower = replica(1);
             follower.leader = case.leader;
-            let out = follower.on_message(client(), Message::Submit { command: 2 });
+            let out = follower.on_message(asker(0), Message::Submit { command: 2 });
 
             assert_eq!(
                 sent(&out),
                 [(
-                    client(),
+                    asker(0),
                     Message::Submitted {
                         command: 2,
                         answer: case.answer
@@ -2066,22 +2227,25 @@ mod tests {
         }
     }
 
+    /// One command a case's clients sent: the client, the command, the instant it was sent, and the
+    /// instant it was answered if it was.
+    type Asked = (usize, u64, u64, Option<u64>);
+
     /// The world a view of these replicas and these commands is written as.
-    fn written(replicas: Vec<Recorded>, client: &[(u64, bool)]) -> World {
+    fn written(replicas: Vec<Recorded>, asked: &[Asked]) -> World {
+        let mut clients: BTreeMap<usize, BTreeMap<u64, Submission>> = BTreeMap::new();
+        for &(me, command, sent, done) in asked {
+            clients.entry(me).or_default().insert(
+                command,
+                Submission {
+                    sent: VirtualTime::from_nanos(sent),
+                    done: done.map(VirtualTime::from_nanos),
+                },
+            );
+        }
         let view = View {
             replicas: replicas.into_iter().enumerate().collect(),
-            client: client
-                .iter()
-                .map(|&(command, done)| {
-                    (
-                        command,
-                        Submission {
-                            sent: VirtualTime::from_nanos(command),
-                            done: done.then_some(VirtualTime::from_nanos(command + 1)),
-                        },
-                    )
-                })
-                .collect(),
+            clients,
         };
         world(&view).unwrap_or_else(|e| panic!("a view is written with names: {e}"))
     }
@@ -2091,15 +2255,15 @@ mod tests {
         let mut leading = recorded(vec![command(2, 7)], vec![Op::Command(7)], &[2]);
         leading.role = Role::Leader;
         leading.voted_for = Some(0);
-        let world = written(vec![leading], &[(7, true)]);
+        let world = written(vec![leading], &[(1, 7, 7, Some(8))]);
 
         let replica = world
-            .get(&name("node-1"))
+            .get(&name("node-3"))
             .unwrap_or_else(|| panic!("the replica is written down"));
         for (field, value) in [
             ("term", Value::Count(1)),
             ("role", Value::Text("leader".to_owned())),
-            ("voted-for", Value::Text("node-1".to_owned())),
+            ("voted-for", Value::Text("node-3".to_owned())),
             ("commit", Value::Count(1)),
             ("entry-0001-term", Value::Count(2)),
             ("entry-0001-op", Value::Text("command 7".to_owned())),
@@ -2109,8 +2273,8 @@ mod tests {
             assert_eq!(replica.get(&name(field)), Some(&value), "{field}");
         }
         let client = world
-            .get(&name("client"))
-            .unwrap_or_else(|| panic!("the client is written down"));
+            .get(&name("client-1"))
+            .unwrap_or_else(|| panic!("the client is written down under its own name"));
         assert_eq!(
             client.get(&name("command-0007-sent")),
             Some(&Value::Instant(VirtualTime::from_nanos(7)))
@@ -2119,18 +2283,43 @@ mod tests {
             client.get(&name("command-0007-done")),
             Some(&Value::Instant(VirtualTime::from_nanos(8)))
         );
+        assert_eq!(
+            world.get(&name("client-0")),
+            None,
+            "a client that has sent nothing is not written down"
+        );
     }
 
-    /// A recorded world, and what each invariant should say of it.
+    /// One of the promises the run is judged by, named for the predicate that keeps it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Promise {
+        OneLeader,
+        Committed,
+        Linearizable,
+        Finished,
+    }
+
+    impl Promise {
+        /// Whether the promise holds of `world`.
+        fn holds(self, world: &World) -> bool {
+            match self {
+                Self::OneLeader => one_leader_a_term(world),
+                Self::Committed => committed_entries_hold(world),
+                Self::Linearizable => linearizable(world),
+                Self::Finished => every_command_committed(world),
+            }
+        }
+    }
+
+    /// A recorded world, and which promises it breaks.
     struct WorldCase {
         name: &'static str,
         world: World,
-        one_leader: bool,
-        committed: bool,
-        finished: bool,
+        broken: &'static [Promise],
     }
 
-    /// The cases of `each_invariant_breaks_on_the_world_it_is_about_and_holds_on_the_others`.
+    /// The cases of `each_invariant_breaks_on_the_world_it_is_about_and_holds_on_the_others` about
+    /// the replicas: who led, what they applied, and whether they caught up.
     fn world_cases() -> Vec<WorldCase> {
         let applied = |ops: &[u64]| -> Vec<Op> { ops.iter().map(|&op| Op::Command(op)).collect() };
         let log = |ops: &[u64]| -> Vec<LogEntry> { ops.iter().map(|&op| command(1, op)).collect() };
@@ -2140,13 +2329,11 @@ mod tests {
                 world: written(
                     vec![
                         recorded(log(&[1, 2]), applied(&[1, 2]), &[1]),
-                        recorded(log(&[1, 2]), applied(&[1]), &[]),
+                        recorded(log(&[1, 2]), applied(&[1, 2]), &[]),
                     ],
-                    &[(1, true)],
+                    &[(0, 1, 1, Some(2)), (0, 2, 3, Some(4))],
                 ),
-                one_leader: true,
-                committed: true,
-                finished: true,
+                broken: &[],
             },
             WorldCase {
                 name: "two replicas each leading a term of its own",
@@ -2157,9 +2344,7 @@ mod tests {
                     ],
                     &[],
                 ),
-                one_leader: true,
-                committed: true,
-                finished: true,
+                broken: &[],
             },
             WorldCase {
                 name: "two replicas that led one term",
@@ -2170,43 +2355,42 @@ mod tests {
                     ],
                     &[],
                 ),
-                one_leader: false,
-                committed: true,
-                finished: true,
+                broken: &[Promise::OneLeader],
             },
             WorldCase {
                 name: "two replicas that applied different things at one index",
                 world: written(
                     vec![
-                        recorded(log(&[1]), applied(&[1]), &[]),
-                        recorded(log(&[2]), applied(&[2]), &[]),
+                        recorded(log(&[1, 2]), applied(&[1, 2]), &[]),
+                        recorded(log(&[2, 1]), applied(&[2, 1]), &[]),
                     ],
-                    &[],
+                    &[(0, 1, 1, Some(4)), (1, 2, 1, Some(4))],
                 ),
-                one_leader: true,
-                committed: false,
-                finished: true,
+                broken: &[Promise::Committed],
             },
             WorldCase {
                 name: "a replica whose log no longer holds what it applied",
-                world: written(vec![recorded(log(&[2]), applied(&[1]), &[])], &[]),
-                one_leader: true,
-                committed: false,
-                finished: true,
+                world: written(
+                    vec![recorded(log(&[2]), applied(&[1]), &[])],
+                    &[(0, 1, 1, Some(2))],
+                ),
+                broken: &[Promise::Committed],
             },
             WorldCase {
                 name: "a replica whose log is shorter than what it applied",
-                world: written(vec![recorded(log(&[]), applied(&[1]), &[])], &[]),
-                one_leader: true,
-                committed: false,
-                finished: true,
+                world: written(
+                    vec![recorded(log(&[]), applied(&[1]), &[])],
+                    &[(0, 1, 1, Some(2))],
+                ),
+                broken: &[Promise::Committed],
             },
             WorldCase {
                 name: "a command sent and never answered",
-                world: written(vec![recorded(log(&[1]), applied(&[1]), &[])], &[(1, false)]),
-                one_leader: true,
-                committed: true,
-                finished: false,
+                world: written(
+                    vec![recorded(log(&[1]), applied(&[1]), &[])],
+                    &[(0, 1, 1, None)],
+                ),
+                broken: &[Promise::Finished],
             },
             WorldCase {
                 name: "a command answered that one replica has not applied",
@@ -2215,36 +2399,137 @@ mod tests {
                         recorded(log(&[1]), applied(&[1]), &[]),
                         recorded(log(&[1]), applied(&[]), &[]),
                     ],
-                    &[(1, true)],
+                    &[(0, 1, 1, Some(2))],
                 ),
-                one_leader: true,
-                committed: true,
-                finished: false,
+                broken: &[Promise::Finished],
+            },
+        ]
+    }
+
+    /// The cases of `each_invariant_breaks_on_the_world_it_is_about_and_holds_on_the_others` about
+    /// the order the clients' commands were applied in.
+    fn order_cases() -> Vec<WorldCase> {
+        let applied = |ops: &[u64]| -> Vec<Op> { ops.iter().map(|&op| Op::Command(op)).collect() };
+        let log = |ops: &[u64]| -> Vec<LogEntry> { ops.iter().map(|&op| command(1, op)).collect() };
+        // One replica that applied `ops` in that order, its log holding them.
+        let applying = |ops: &[u64]| vec![recorded(log(ops), applied(ops), &[])];
+        vec![
+            WorldCase {
+                name: "two commands in flight together, applied in the order they were sent",
+                world: written(applying(&[1, 2]), &[(0, 1, 1, Some(4)), (1, 2, 2, Some(5))]),
+                broken: &[],
+            },
+            WorldCase {
+                name: "two commands in flight together, applied the other way round",
+                world: written(applying(&[2, 1]), &[(0, 1, 1, Some(4)), (1, 2, 2, Some(5))]),
+                broken: &[],
+            },
+            WorldCase {
+                name: "no-ops between the commands, which are no command's place",
+                world: written(
+                    vec![recorded(
+                        vec![
+                            LogEntry {
+                                term: 1,
+                                op: Op::Noop,
+                            },
+                            command(1, 1),
+                            LogEntry {
+                                term: 2,
+                                op: Op::Noop,
+                            },
+                            command(2, 2),
+                        ],
+                        vec![Op::Noop, Op::Command(1), Op::Noop, Op::Command(2)],
+                        &[],
+                    )],
+                    &[(0, 1, 1, Some(2)), (1, 2, 3, Some(4))],
+                ),
+                broken: &[],
+            },
+            WorldCase {
+                name: "a command applied ahead of one that was done before it was sent",
+                world: written(applying(&[2, 1]), &[(0, 1, 1, Some(2)), (1, 2, 3, Some(4))]),
+                broken: &[Promise::Linearizable],
+            },
+            WorldCase {
+                name: "a client's next command, sent the instant its last was done, applied ahead of it",
+                world: written(applying(&[2, 1]), &[(0, 1, 1, Some(3)), (0, 2, 3, Some(4))]),
+                broken: &[Promise::Linearizable],
+            },
+            WorldCase {
+                name: "a command applied twice",
+                world: written(applying(&[1, 1]), &[(0, 1, 1, Some(2))]),
+                broken: &[Promise::Linearizable],
+            },
+            WorldCase {
+                name: "a command applied that no client sent",
+                world: written(applying(&[1]), &[]),
+                broken: &[Promise::Linearizable],
+            },
+            WorldCase {
+                // Falling short at the end of the run as well, since command 1 was answered and
+                // never applied; but a replica applying command 2 without it is wrong at once.
+                name: "a command applied while one done before it was sent is missing",
+                world: written(applying(&[2]), &[(0, 1, 1, Some(2)), (1, 2, 3, Some(4))]),
+                broken: &[Promise::Linearizable, Promise::Finished],
+            },
+            WorldCase {
+                name: "a command not yet answered that no replica has applied",
+                world: written(applying(&[1]), &[(0, 1, 1, Some(2)), (1, 2, 3, None)]),
+                broken: &[Promise::Finished],
             },
         ]
     }
 
     #[test]
     fn each_invariant_breaks_on_the_world_it_is_about_and_holds_on_the_others() {
-        for case in world_cases() {
-            assert_eq!(
-                one_leader_a_term(&case.world),
-                case.one_leader,
-                "{}",
-                case.name
-            );
-            assert_eq!(
-                committed_entries_hold(&case.world),
-                case.committed,
-                "{}",
-                case.name
-            );
-            assert_eq!(
-                every_command_committed(&case.world),
-                case.finished,
-                "{}",
-                case.name
-            );
+        let promises = [
+            Promise::OneLeader,
+            Promise::Committed,
+            Promise::Linearizable,
+            Promise::Finished,
+        ];
+        for case in world_cases().into_iter().chain(order_cases()) {
+            for promise in promises {
+                assert_eq!(
+                    promise.holds(&case.world),
+                    !case.broken.contains(&promise),
+                    "{}: {promise:?}",
+                    case.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_clients_have_commands_in_flight_together_in_every_round() {
+        // Without this the order the log applies commands in is settled by one client's own order,
+        // and the linearizability check has nothing to judge that a single client would not. Read off
+        // the last recorded world rather than from the module's numbering, so a run whose clients
+        // went one after another fails here whatever the numbers say.
+        let (trace, store, outcome) = runs(SEED, &FaultSchedule::default());
+        assert_eq!(outcome, Outcome::Pass);
+        let asked = asked(&last_world(&trace, &store));
+        assert_eq!(index(asked.len()), index(CLIENTS) * ROUNDS);
+
+        for round in 1..=ROUNDS {
+            let commands: Vec<_> = (0..CLIENTS)
+                .map(|me| {
+                    let (sent, done) = asked[&numbered(round, me)];
+                    (
+                        sent,
+                        done.unwrap_or_else(|| panic!("round {round} is done")),
+                    )
+                })
+                .collect();
+            let together = commands.iter().enumerate().any(|(one, &(sent, done))| {
+                commands
+                    .iter()
+                    .skip(one + 1)
+                    .any(|&(other_sent, other_done)| sent < other_done && other_sent < done)
+            });
+            assert!(together, "round {round}: {commands:?}");
         }
     }
 
@@ -2273,7 +2558,7 @@ mod tests {
                 .filter(|(field, _)| field.as_str().starts_with(APPLIED))
                 .map(|(_, value)| value)
                 .collect();
-            for command in 1..=COMMANDS {
+            for command in 1..=numbered(ROUNDS, CLIENTS - 1) {
                 assert!(
                     applied.contains(&&Value::Text(format!("command {command}"))),
                     "{} applied command {command}",
@@ -2284,12 +2569,14 @@ mod tests {
     }
 
     #[test]
-    fn a_client_no_replica_hears_leaves_every_command_uncommitted() {
-        let cut: Vec<Fault> = (0..REPLICAS)
-            .map(|replica| Fault::Partition {
-                from: client(),
-                to: peer(replica),
-                during: Window::forever_from(VirtualTime::ZERO),
+    fn clients_no_replica_hears_leave_every_command_uncommitted() {
+        let cut: Vec<Fault> = (0..CLIENTS)
+            .flat_map(|me| {
+                (0..REPLICAS).map(move |replica| Fault::Partition {
+                    from: asker(me),
+                    to: peer(replica),
+                    during: Window::forever_from(VirtualTime::ZERO),
+                })
             })
             .collect();
         let (trace, _, outcome) = runs(SEED, &FaultSchedule::new(cut));
