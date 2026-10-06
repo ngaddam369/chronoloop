@@ -23,8 +23,9 @@ use chronoloop::clock::VirtualTime;
 use chronoloop::fault::{Fault, FaultSchedule, Window};
 use chronoloop::outcome::Outcome;
 use chronoloop::shrink::{Reduction, shrink};
+use chronoloop::store::StateStore;
 use chronoloop::systems::quorum;
-use chronoloop::trace::Step;
+use chronoloop::trace::Trace;
 
 /// The seed the recorded cases run, since none of them is about a particular one.
 const SEED: u64 = 20_260_921;
@@ -52,7 +53,8 @@ const REDUCED: &str = "chronoloop faults\n\
 ///
 /// The measurements that settled how the dropping works were taken at fifty faults, and the three
 /// that matter sit at the tenth, twenty-sixth and forty-second entries — no contiguous chunk holds
-/// them, so nothing but dropping entry by entry can arrive at them.
+/// them, so no single coarse cut arrives at them. The chunks between them go many entries at a
+/// time; it is only around each of the three that the dropping has to get down to single entries.
 ///
 /// Three rules make the forty-seven decoration rather than cause, and all three are structural
 /// rather than lucky:
@@ -62,7 +64,7 @@ const REDUCED: &str = "chronoloop faults\n\
 ///   node 2's answer, round 4 node 2's and node 3's, round 5 node 1's and node 5's. Three
 ///   acknowledgements is a quorum, so every one of those rounds closes with exactly the three it
 ///   needs. The faults that are drawn against only ever fall on a replica an outage has already
-///   silenced, so no draw can make a third.
+///   silenced, so no draw can make a third. The gated sweep below holds this round by round.
 /// - **Nothing but the three touches the third round.** No decoration falls on a direction between
 ///   the coordinator and a replica between 15s, when the round opens, and 17s, when it gives up —
 ///   so no decoration can join the set the failure needs.
@@ -140,6 +142,12 @@ const REDUCED_LOSSY: &str = "chronoloop faults\n\
                              loss 1 in 2 on node 0 -> node 3 from 15.000000000s until 15.000000001s\n\
                              partition on node 0 -> node 4 from 15.000000000s until 15.000000001s\n";
 
+/// How many acknowledgements a round needs, which is three of the coordinator's five replicas.
+const QUORUM: u64 = 3;
+
+/// The round the fifty-fault schedule's three outages cost its quorum, and the only one.
+const FAILING_ROUND: u64 = 3;
+
 /// How many seeds the sweep over the fifty-fault schedule walks.
 ///
 /// Wider than the sweep below because a run is cheap where a reduction is not: this one runs the
@@ -159,20 +167,34 @@ fn schedule(text: &str) -> FaultSchedule {
         .unwrap_or_else(|e| panic!("the schedule these cases are written in is a schedule: {e}"))
 }
 
-/// How the run of `faults` under `seed` went, failing the test rather than returning an error.
-fn runs(seed: u64, faults: &FaultSchedule) -> Outcome {
-    quorum::run(seed, faults)
-        .unwrap_or_else(|e| panic!("seed {seed} did not finish: {e}"))
-        .2
+/// The run of `faults` under `seed`, failing the test rather than returning an error.
+fn ran(seed: u64, faults: &FaultSchedule) -> (Trace, StateStore, Outcome) {
+    quorum::run(seed, faults).unwrap_or_else(|e| panic!("seed {seed} did not finish: {e}"))
 }
 
-/// What the run of `faults` under `seed` passed through, failing the test rather than returning.
-fn steps(seed: u64, faults: &FaultSchedule) -> Vec<Step> {
-    quorum::run(seed, faults)
-        .unwrap_or_else(|e| panic!("seed {seed} did not finish: {e}"))
-        .0
+/// How the run of `faults` under `seed` went.
+fn runs(seed: u64, faults: &FaultSchedule) -> Outcome {
+    ran(seed, faults).2
+}
+
+/// How many acknowledgements each round of a run closed with, read off the steps it wrote.
+fn acknowledgements(trace: &Trace) -> Vec<(u64, u64)> {
+    trace
         .steps()
-        .to_vec()
+        .iter()
+        .filter_map(|step| {
+            let closed = step.event().message().strip_prefix("round ")?;
+            let (round, acks) = closed.split_once(" closed with ")?;
+            let (acks, _) = acks.split_once(" of ")?;
+            Some((
+                round
+                    .parse()
+                    .unwrap_or_else(|e| panic!("a round is numbered: {e}")),
+                acks.parse()
+                    .unwrap_or_else(|e| panic!("a round counts what it heard: {e}")),
+            ))
+        })
+        .collect()
 }
 
 /// Reduces `faults` against a real run of the system under `seed`.
@@ -302,10 +324,12 @@ fn the_window_a_reduction_keeps_is_the_shortest_that_still_cuts_the_round() {
 #[test]
 fn a_failing_run_of_fifty_faults_reduces_to_the_three_that_caused_it() {
     // The scale the dropping was measured at, against the real system. What makes this more than
-    // the six-fault case with padding on the end is the answer: two schedules with nothing in
-    // common but three entries reduce to one recorded text, so what comes back is a fact about the
-    // failure rather than about the list it was found in.
-    let reduction = reduce(SEED, &schedule(FIFTY));
+    // the six-fault case with padding on the end is the answer: two schedules with four lines in
+    // common — the three that matter, and one outage on a link nothing ever uses — reduce to one
+    // recorded text, so what comes back is a fact about the failure rather than about the list it
+    // was found in.
+    let fifty = schedule(FIFTY);
+    let reduction = reduce(SEED, &fifty);
 
     assert_eq!(reduction.schedule().to_string(), REDUCED);
     assert_eq!(
@@ -319,8 +343,8 @@ fn a_failing_run_of_fifty_faults_reduces_to_the_three_that_caused_it() {
     // three alone — a reduction that had merely dropped forty-seven faults nothing ever consulted
     // would leave this equal.
     assert_ne!(
-        steps(SEED, &schedule(FIFTY)),
-        steps(SEED, reduction.schedule()),
+        ran(SEED, &fifty).0.steps(),
+        ran(SEED, reduction.schedule()).0.steps(),
         "the decorations reach the run, and the reduction takes them out anyway"
     );
 
@@ -335,38 +359,19 @@ fn reducing_a_reduction_changes_nothing() {
     // What the reduction's own loop is for, through a real system rather than a scripted predicate.
     // The two sides are one reduction and two of them, not one value compared with itself.
     //
-    // The second schedule is what makes this able to fail at all, and it took a mutation to find
-    // out: a reduction made to stop after the first entries it takes out still lands exactly on
-    // the six-fault schedule's three, because those three are one contiguous half of it. Fifty is
-    // where stopping short shows — the result is then not one no single entry can be taken from,
-    // and reducing it again gets further.
-    struct Case {
-        name: &'static str,
-        faults: &'static str,
-    }
-    let cases = [
-        Case {
-            name: "six faults, three of them needed",
-            faults: FAULTS,
-        },
-        Case {
-            name: "fifty faults, the same three needed",
-            faults: FIFTY,
-        },
-    ];
+    // What this cannot feel, and a mutation is what said so: a reduction made to stop after the
+    // first entries it takes out still lands exactly on the six-fault schedule's three, because
+    // those three are one contiguous half of it, so this stays green under it. Fifty is where
+    // stopping short shows, and the pinned text in
+    // `a_failing_run_of_fifty_faults_reduces_to_the_three_that_caused_it` is what holds it. Asking
+    // the fifty for a fixed point here as well would cost a second reduction of them on every run
+    // and could not add anything: while that pin holds, the reduction of the fifty *is* the
+    // reduction of the six, and reducing it again is exactly what this case already does.
+    let once = reduce(SEED, &schedule(FAULTS));
+    let twice = reduce(SEED, once.schedule());
 
-    for case in cases {
-        let once = reduce(SEED, &schedule(case.faults));
-        let twice = reduce(SEED, once.schedule());
-
-        assert_eq!(
-            twice.schedule().to_string(),
-            once.schedule().to_string(),
-            "{}",
-            case.name
-        );
-        assert_eq!(twice.outcome(), once.outcome(), "{}", case.name);
-    }
+    assert_eq!(twice.schedule().to_string(), once.schedule().to_string());
+    assert_eq!(twice.outcome(), once.outcome());
 }
 
 #[test]
@@ -448,24 +453,36 @@ fn no_seed_finds_a_failure_among_the_fifty_but_the_one_they_are_scattered_around
     // forty-seven leave at most two of the five replicas impaired in any round but the third, and
     // three of five answering is a quorum, so no draw can turn one of them into a cause. A
     // decoration that could cost a round its quorum on some seed would be a fault the reduction is
-    // entitled to keep, and the case above would be pinning a fact about one seed's draws.
+    // entitled to keep, and `a_failing_run_of_fifty_faults_reduces_to_the_three_that_caused_it`
+    // would be pinning a fact about one seed's draws.
     //
-    // Compared through `reproduces`, which asks the reason and not the step: the step a failure
-    // surfaces at moves with every draw, and what must not move is which round went short.
+    // It is asked **round by round**, off the step every round writes when it closes, and not
+    // through the verdict. The verdict names only the first round that went short, and round 3
+    // always does, so a decoration costing round 4 or 5 its quorum would leave the verdict saying
+    // exactly what it says now. That was established by doing it: making the outage of no odds in
+    // round 4 one of every message leaves a sweep asking the verdict green on all five hundred
+    // seeds, and turns this one red at seed 0.
     //
-    // It is the only thing holding that premise, which was established by breaking it: moving one
-    // decoration onto a link that would silence a third replica in round 1 turns this red at seed
-    // 0 and leaves every other case in the repository green — seed 20260921 does not happen to
-    // lose that coin, so the case above cannot tell a fixture that is sound from one that is
-    // lucky.
+    // It is the only thing holding that premise, which was established by breaking it: moving round
+    // 1's coin from node 5's question to node 3's, so it can silence a third replica, turns this red
+    // at seed 2 and leaves every other case in the repository green — seed 20260921 does not happen
+    // to lose that coin, so the fifty-fault case cannot tell a fixture that is sound from one that
+    // is lucky.
     let faults = schedule(FIFTY);
-    let expected = runs(SEED, &faults);
 
     for seed in 0..FIFTY_SWEEP {
-        let outcome = runs(seed, &faults);
-        assert!(
-            outcome.reproduces(&expected),
-            "seed {seed} went {outcome}, where {SEED} went {expected}"
+        let closed = acknowledgements(&ran(seed, &faults).0);
+        assert_eq!(
+            closed.iter().map(|(round, _)| *round).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5],
+            "seed {seed}: every round closes and says so, or what follows holds of nothing"
         );
+        for (round, acks) in closed {
+            assert_eq!(
+                acks >= QUORUM,
+                round != FAILING_ROUND,
+                "seed {seed}: round {round} closed with {acks} acknowledgements"
+            );
+        }
     }
 }

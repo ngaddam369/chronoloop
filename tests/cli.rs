@@ -615,6 +615,17 @@ const LOSSY: &str = "chronoloop faults\n\
                      loss 1 in 2 on node 0 -> node 3 from 15.000000000s until 15.000000001s\n\
                      partition on node 0 -> node 4 from 15.000000000s until 15.000000001s\n";
 
+/// The schedule [`LOSSY`] is the reduction of, which is `tests/shrink.rs`'s own.
+///
+/// [`LOSSY`] is already a fixed point, so a reduction asked of it hands back the bytes it was given,
+/// and asking for that twice runs one command on one input twice. Starting here is what gives a
+/// reduction of odds something to do before its fixed point is asked about.
+const UNREDUCED_LOSSY: &str = "chronoloop faults\n\
+                               loss 1 in 1 on node 0 -> node 1 from 10.000000000s until 20.000000000s\n\
+                               loss 4 in 4 on node 0 -> node 2 from 0.000000000s until forever\n\
+                               loss 1 in 2 on node 0 -> node 3 from 15.000000000s until 20.000000000s\n\
+                               partition on node 0 -> node 4 from 15.000000000s until 20.000000000s\n";
+
 /// How many seeds the sweep cases cover, which is few enough to run in CI.
 const SWEPT: &str = "20";
 
@@ -743,8 +754,9 @@ fn shrinking_the_repro_a_shrink_wrote_writes_the_same_repro() {
     // reduction that moved would move on both of them together. This says the reduction is a fixed
     // point and says nothing about where the fixed point is — the pinned repro above is what holds
     // that, and it was checked rather than assumed. A command handing back the schedule it was
-    // given is a fixed point too, and reddens the case above and not this one; what reddens this
-    // one is the failure line moving below the faults, which is the claim it is here for.
+    // given is a fixed point too, and reddens `shrinking_a_failing_run_writes_the_repro_it_reduces_to`
+    // and not this one; what reddens this one is the failure line moving below the faults, which is
+    // the claim it is here for.
     struct Case {
         name: &'static str,
         file: &'static str,
@@ -757,12 +769,17 @@ fn shrinking_the_repro_a_shrink_wrote_writes_the_same_repro() {
             faults: FAULTS,
         },
         Case {
-            // Already reduced, and reduced against odds rather than outages — the shape where a
-            // fixed point is worth asking about, since a window the draws are standing in is one
-            // the bisection stopped at rather than one it could prove nothing lives below.
+            // Odds rather than outages — the shape where a fixed point is worth asking about, since
+            // a window the draws are standing in is one the bisection stopped at rather than one it
+            // could prove nothing lives below. Unreduced, so the first command has work to do and
+            // the second is handed bytes the first one wrote rather than the ones this file holds.
+            // That makes it a question rather than one command run twice, and nothing more: these
+            // four faults reduce in a single pass, so a reduction made to stop before its fixed
+            // point writes exactly the same repro from them. `tests/shrink.rs`'s fifty-fault case
+            // is what holds that.
             name: "odds and a window the draws hold open",
             file: "idempotent-lossy.faults",
-            faults: LOSSY,
+            faults: UNREDUCED_LOSSY,
         },
     ];
 
