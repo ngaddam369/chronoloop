@@ -3,7 +3,8 @@
 //! [`crate::systems::ring`] leaves a state behind at every step, which is what time travel needed.
 //! What it cannot do is go wrong: every run of it succeeds, and a run that cannot fail is nothing
 //! for a reduction to test against. This is the system that can, and it is the first in the crate
-//! to take a [`FaultSchedule`] — because what Phase 4 reduces is the trouble a run was put through.
+//! to take a [`FaultSchedule`] — because what a reduction cuts down is the trouble a run was put
+//! through.
 //!
 //! Each round the coordinator sends the round's number to every replica and waits, against one
 //! deadline, for the acknowledgements to come back. A round that closes with fewer than a quorum of

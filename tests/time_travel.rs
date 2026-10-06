@@ -1,4 +1,4 @@
-//! The two claims Phase 3's state history rests on, at a scale where neither can be an accident.
+//! The two claims the recorded state history rests on, at a scale where neither can be an accident.
 //!
 //! The files beside the modules hold each piece to account on its own: `tests/fork.rs` forks one run
 //! of one seed at four of its steps, and `tests/store.rs` counts what one run costs to keep. Both
