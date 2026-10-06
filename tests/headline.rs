@@ -24,12 +24,14 @@
 //! seed holds up now, so a run cut off from its seed holds up too, and it is the pinned trace in
 //! `tests/reconciler.rs` that notices.
 
-use core::num::{NonZeroU64, NonZeroUsize};
-
 use chronoloop::outcome::Outcome;
 use chronoloop::repro::Repro;
-use chronoloop::sweep::sweep;
 use chronoloop::systems::{System, reconciler};
+
+#[path = "common/survey.rs"]
+mod survey;
+
+use survey::survey;
 
 /// The repro the hunt and the reduction produced, as `chronoloop corner --seed 5` wrote it against
 /// the controller that asked for every difference at once.
@@ -46,23 +48,12 @@ fn found() -> Repro {
         .unwrap_or_else(|e| panic!("the committed repro is a repro: {e}"))
 }
 
-/// A count, failing the test rather than returning an error no case expects.
-fn seeds(count: u64) -> NonZeroU64 {
-    NonZeroU64::new(count).unwrap_or_else(|| panic!("a hunt covers at least one seed"))
-}
-
 /// Runs the reconciler over `0..count`, each seed under the faults drawn for it, and returns how
 /// many seeds it ran and the failures it found.
 fn hunt(count: u64) -> (u64, Vec<String>) {
-    let jobs = NonZeroUsize::new(4).unwrap_or_else(|| panic!("four is not zero"));
-    let survey = sweep(seeds(count), jobs, |seed| {
+    survey(count, |seed| {
         System::Reconciler.run(seed, &reconciler::drawn_faults(seed))
     })
-    .unwrap_or_else(|e| panic!("every seed finishes: {e}"));
-    (
-        survey.swept(),
-        survey.broke().iter().map(ToString::to_string).collect(),
-    )
 }
 
 #[test]

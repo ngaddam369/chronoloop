@@ -19,9 +19,21 @@
 //! A replica refuses its vote to a candidate whose log is behind its own, which is what keeps the
 //! stale replica from leading. Under a vote that asked nothing of the candidate's log, seed 0 lost
 //! four committed entries and 475 of the gated sweep's 500 seeds lost some under the isolation;
-//! that vote is in git history at `2ff3f46`. The rule is held by the unit table beside the
-//! module, by seed 0's case reading the refusals off the trace, and by the gated sweep. Seed 72 does
-//! not hold it, since node 7 loses that race on timing alone.
+//! that vote is in git history at `2ff3f46`. Which cases hold which part of the rule, by breaking
+//! each part and watching what goes red:
+//!
+//! - **asking nothing of the log**: the unit table, seed 0's case reading the refusals off the
+//!   trace, and the gated sweep.
+//! - **the later last term winning over length**: the unit table, and the stranded leader's case,
+//!   where the candidate holds more entries than anyone and its last is from a term gone by. No run
+//!   under the isolation reaches it, since node 7 comes back holding less than anyone.
+//! - **length deciding between two equal last terms**: the unit table and the gated sweep.
+//! - **a refusal leaving the vote unspent**: the unit cases beside the module alone. No run here
+//!   needs a second candidate to have the vote a stale one was refused in the same term.
+//! - **the candidate naming its last entry's term rather than its own**: the unit candidate case,
+//!   seed 0's case and the gated sweep.
+//!
+//! Seed 72 holds none of it, since node 7 loses that race on timing alone.
 //!
 //! The order the log applied the clients' commands in is checked here a second time, by a route the
 //! module's own check does not take: rebuilt from what each step says — which command a leader took
@@ -29,15 +41,18 @@
 //! the world it recorded. Nothing here makes a run break that order, since nothing in the module
 //! does; the unit cases beside it hold the check to account on worlds built to break it.
 
-use core::num::{NonZeroU64, NonZeroUsize};
 use std::collections::BTreeMap;
 
 use chronoloop::clock::VirtualTime;
 use chronoloop::fault::FaultSchedule;
 use chronoloop::outcome::Outcome;
-use chronoloop::sweep::sweep;
 use chronoloop::systems::replog;
 use chronoloop::trace::Trace;
+
+#[path = "common/survey.rs"]
+mod survey;
+
+use survey::survey;
 
 /// The seed the recorded case runs, since it is not about a particular one.
 const SEED: u64 = 20_261_006;
@@ -66,15 +81,14 @@ const ISOLATED: &str = "chronoloop faults\n\
 /// The instant [`ISOLATED`] heals at, in nanoseconds.
 const HEALED: u64 = 9_000_000_000;
 
-/// The lowest seed under [`ISOLATED`] in which node 7 is the first replica to stand after the heal,
-/// found by running. It stands for term 4 at 9.32s, and under a vote that asked nothing of the
-/// candidate's log it won and four committed entries went with it.
+/// A seed under [`ISOLATED`] in which node 7 is the first replica to stand after the heal, found by
+/// running and asserted by its case. Under the vote in `2ff3f46`, which asked nothing of the
+/// candidate's log, it won here and four committed entries went with it.
 const STANDS_FIRST: u64 = 0;
 
-/// The lowest seed under [`ISOLATED`] in which node 7 stands after the heal and another replica
-/// wins on timing alone, found by running under a vote that asked nothing of the candidate's log:
-/// node 4 stood 38 milliseconds before node 7 and had a majority's votes before node 7's requests
-/// reached anyone.
+/// A seed under [`ISOLATED`] in which another replica stands after the heal before node 7 does, and
+/// node 7 stands too, found by running and asserted by its case. Under the vote in `2ff3f46` the
+/// other replica won here on timing alone, which is what made it the pair to seed 0.
 const HOLDS: u64 = 72;
 
 /// How many seeds the gated sweep covers under each schedule — the same five hundred the vote that
@@ -382,6 +396,48 @@ const DEPOSED: &str = "chronoloop faults\n\
                        partition on node 5 -> node 7 from 3.000000000s until 9.000000000s\n\
                        partition on node 7 -> node 5 from 3.000000000s until 9.000000000s\n";
 
+/// [`DEPOSED`], with the clients reaching **only** node 5 until fifteen seconds and node 5 kept from
+/// node 6 until then too: node 6 is the replica that leads term 2 of [`SEED`]'s run under it, found
+/// by running.
+///
+/// So node 5 goes on taking every command the clients send while it cannot commit one — a log
+/// longer than anyone else's, ending in term 1 — while the replicas that left it behind hold only
+/// the no-op term 2 began with. After the heal it hears of term 2 from the followers it can reach,
+/// hears nothing from the leader it cannot, and stands. Length alone would pick it.
+const STRANDED: &str = "chronoloop faults\n\
+                        partition on node 5 -> node 3 from 3.000000000s until 9.000000000s\n\
+                        partition on node 3 -> node 5 from 3.000000000s until 9.000000000s\n\
+                        partition on node 5 -> node 4 from 3.000000000s until 9.000000000s\n\
+                        partition on node 4 -> node 5 from 3.000000000s until 9.000000000s\n\
+                        partition on node 5 -> node 7 from 3.000000000s until 9.000000000s\n\
+                        partition on node 7 -> node 5 from 3.000000000s until 9.000000000s\n\
+                        partition on node 5 -> node 6 from 3.000000000s until 15.000000000s\n\
+                        partition on node 6 -> node 5 from 3.000000000s until 15.000000000s\n\
+                        partition on node 0 -> node 3 from 3.000000000s until 15.000000000s\n\
+                        partition on node 3 -> node 0 from 3.000000000s until 15.000000000s\n\
+                        partition on node 1 -> node 3 from 3.000000000s until 15.000000000s\n\
+                        partition on node 3 -> node 1 from 3.000000000s until 15.000000000s\n\
+                        partition on node 2 -> node 3 from 3.000000000s until 15.000000000s\n\
+                        partition on node 3 -> node 2 from 3.000000000s until 15.000000000s\n\
+                        partition on node 0 -> node 4 from 3.000000000s until 15.000000000s\n\
+                        partition on node 4 -> node 0 from 3.000000000s until 15.000000000s\n\
+                        partition on node 1 -> node 4 from 3.000000000s until 15.000000000s\n\
+                        partition on node 4 -> node 1 from 3.000000000s until 15.000000000s\n\
+                        partition on node 2 -> node 4 from 3.000000000s until 15.000000000s\n\
+                        partition on node 4 -> node 2 from 3.000000000s until 15.000000000s\n\
+                        partition on node 0 -> node 6 from 3.000000000s until 15.000000000s\n\
+                        partition on node 6 -> node 0 from 3.000000000s until 15.000000000s\n\
+                        partition on node 1 -> node 6 from 3.000000000s until 15.000000000s\n\
+                        partition on node 6 -> node 1 from 3.000000000s until 15.000000000s\n\
+                        partition on node 2 -> node 6 from 3.000000000s until 15.000000000s\n\
+                        partition on node 6 -> node 2 from 3.000000000s until 15.000000000s\n\
+                        partition on node 0 -> node 7 from 3.000000000s until 15.000000000s\n\
+                        partition on node 7 -> node 0 from 3.000000000s until 15.000000000s\n\
+                        partition on node 1 -> node 7 from 3.000000000s until 15.000000000s\n\
+                        partition on node 7 -> node 1 from 3.000000000s until 15.000000000s\n\
+                        partition on node 2 -> node 7 from 3.000000000s until 15.000000000s\n\
+                        partition on node 7 -> node 2 from 3.000000000s until 15.000000000s\n";
+
 #[test]
 fn a_leader_its_clients_reach_and_its_followers_do_not_tells_them_nothing_it_has_not_committed() {
     // The run the clients' side of the verdict is for. Node 5 goes on believing it leads, takes
@@ -428,19 +484,22 @@ fn a_replica_back_from_a_partition_with_a_stale_log_stands_first_and_is_refused_
         .unwrap_or_else(|| panic!("node 7 stood: {healed:?}"));
 
     // Read off the steps rather than the world: a vote granted is written down as one, and no
-    // replica wrote one for node 7. Each of them took its term, which is the request reaching it.
+    // replica wrote one for node 7.
+    let granted = format!(" voted for node-7 in term {term}");
+    assert!(
+        !healed.iter().any(|message| message.ends_with(&granted)),
+        "none of them gave it the vote: {healed:?}"
+    );
+    // And the refusals were not for want of asking: node 7 alone began this term, so every
+    // replica that reached it did so through node 7's request, whether it heard the request itself
+    // or the term from a replica that had.
     for replica in ["node-3", "node-4", "node-5", "node-6"] {
         let message = format!("{replica} is a follower in term {term}");
         assert!(
             healed.contains(&message.as_str()),
-            "{replica} heard node 7 ask: {healed:?}"
+            "{replica} reached node 7's term: {healed:?}"
         );
     }
-    let granted = format!(" voted for node-7 in term {term}");
-    assert!(
-        !healed.iter().any(|message| message.ends_with(&granted)),
-        "and none of them gave it the vote: {healed:?}"
-    );
     let leader = first_to(&healed, " became leader of term ");
     assert!(
         leader.is_some_and(|leader| leader != "node-7"),
@@ -480,6 +539,76 @@ fn a_stale_replica_that_stands_and_loses_the_race_leaves_every_committed_entry_i
 }
 
 #[test]
+fn a_deposed_leader_with_a_longer_log_from_an_older_term_stands_and_is_refused_every_vote() {
+    // The vote's other half from the isolation's: node 7 came back holding less than anyone, and
+    // node 5 comes back here holding more, from a term since gone by. Both are behind, by the
+    // order the vote compares in; only the second is behind by length too little to tell.
+    let (trace, outcome) = runs(SEED, &faults(STRANDED));
+    let steps: Vec<(u64, &str)> = trace
+        .steps()
+        .iter()
+        .map(|step| (step.event().at().as_nanos(), step.event().message()))
+        .collect();
+    let stood = steps
+        .iter()
+        .find(|(at, message)| *at >= HEALED && message.starts_with("node-5 became candidate"))
+        .unwrap_or_else(|| panic!("node 5 stood after the heal: {trace}"));
+    let term = stood
+        .1
+        .strip_prefix("node-5 became candidate for term ")
+        .unwrap_or_else(|| panic!("a candidate's step names its term: {}", stood.1));
+
+    // Read off the steps rather than any replica's log: the longest log node 5 took for itself
+    // before it stood, against the furthest any other replica had appended by then.
+    let before: Vec<&str> = steps
+        .iter()
+        .filter(|(at, _)| *at < stood.0)
+        .map(|(_, message)| *message)
+        .collect();
+    let took = before
+        .iter()
+        .filter(|message| message.starts_with("node-5 took command "))
+        .filter_map(|message| last_number(message))
+        .max();
+    let held = before
+        .iter()
+        .filter(|message| !message.starts_with("node-5 ") && message.contains(" appended entr"))
+        .filter_map(|message| last_number(message))
+        .max();
+    assert!(
+        took.zip(held).is_some_and(|(took, held)| took > held),
+        "node 5's log was the longer one when it stood: {took:?} against {held:?}"
+    );
+    assert!(
+        before
+            .iter()
+            .any(|message| message.ends_with(" became leader of term 2")
+                && !message.starts_with("node-5 ")),
+        "and another replica had begun a later term without it: {before:?}"
+    );
+
+    let granted = format!(" voted for node-5 in term {term}");
+    assert!(
+        !steps.iter().any(|(_, message)| message.ends_with(&granted)),
+        "none of them gave it the vote: {trace}"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|(at, message)| *at > stood.0
+                && message.starts_with("node-5 dropped entries after ")),
+        "and what it took and could not commit was cut back by a replica that led instead: {trace}"
+    );
+    assert_eq!(outcome, Outcome::Pass, "{trace}");
+}
+
+/// The number a step's message ends with: the entry a command was taken as, or the last entry a
+/// copy appended.
+fn last_number(message: &str) -> Option<u64> {
+    message.rsplit(' ').next()?.parse().ok()
+}
+
+#[test]
 #[ignore = "a sweep of fifteen hundred runs; `make local-validation` runs it in both profiles"]
 fn every_invariant_holds_on_every_seed_with_or_without_a_partition() {
     // The before and after on one range: under the vote that asked nothing of the candidate's log,
@@ -489,22 +618,17 @@ fn every_invariant_holds_on_every_seed_with_or_without_a_partition() {
     //
     // What it cannot feel: a sweep reporting nothing says only that no run broke a promise, not
     // what any run did, and every seed holding up means a run cut off from its seed holds up too.
-    // The pinned trace is what feels the seed, and the two cases above are what say the isolation
-    // still puts a stale replica up for election.
-    let count =
-        NonZeroU64::new(SWEEP).unwrap_or_else(|| panic!("a sweep covers at least one seed"));
-    let jobs = NonZeroUsize::new(4).unwrap_or_else(|| panic!("four is not zero"));
+    // The pinned trace is what feels the seed, and the cases above on the isolation and the
+    // stranded leader are what say a stale replica is still put up for election at all.
     let schedules = [
         ("no faults", FaultSchedule::default()),
         ("the isolation", faults(ISOLATED)),
         ("the deposed leader", faults(DEPOSED)),
     ];
     for (name, schedule) in schedules {
-        let survey = sweep(count, jobs, |seed| {
+        let swept = survey(SWEEP, |seed| {
             replog::run(seed, &schedule).map(|(_, _, outcome)| outcome)
-        })
-        .unwrap_or_else(|e| panic!("every seed finishes under {name}: {e}"));
-        let broke: Vec<String> = survey.broke().iter().map(ToString::to_string).collect();
-        assert_eq!((survey.swept(), broke), (SWEEP, Vec::new()), "under {name}");
+        });
+        assert_eq!(swept, (SWEEP, Vec::new()), "under {name}");
     }
 }
