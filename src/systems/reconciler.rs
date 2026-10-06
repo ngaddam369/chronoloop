@@ -50,8 +50,10 @@
 //! found the runs where the draws went the wrong way.
 //!
 //! So [`reconcile`] does not ask for the delete at all while the replica is its database's primary.
-//! It asks for the promote; the promote steps the old primary down to a standby that is, by then, in
-//! sync; and the delete is asked for by a later look, once a listing shows the step down has landed.
+//! It asks for the promote, which only goes to a standby that has caught up, so the data has
+//! somewhere to live before anything is taken away; the promote steps the old primary down to a
+//! standby; and the delete is asked for by a later look, once a listing shows the step down has
+//! landed.
 //! The dependency is kept by looking, not by ordering messages, which the wire would not honour. To
 //! keep that from costing a whole resync period, a look that asked for something is followed a
 //! moment later by another, the way an operator requeues a resource it has just changed.
@@ -64,8 +66,8 @@
 //! of the region holding its primary, into the region holding its standby — and the server applies
 //! whatever it is asked to, and moves every replica on through its phases as their time comes. The
 //! **controller** wakes on a fixed resync period — and again a moment after any look that asked for
-//! something — asks for a listing, works out what to do and sends it. Every change the server makes, whether asked for or the passage of time, is a step of the
-//! trace.
+//! something — asks for a listing, works out what to do and sends it. Every change the server
+//! makes, whether asked for or the passage of time, is a step of the trace.
 //!
 //! The wire is **dependable**, for the reason `quorum` gives: it takes time and nothing else, so an
 //! injected [`FaultSchedule`] is the only thing that can keep a request from arriving, and a failure
@@ -118,7 +120,9 @@ const PATIENCE: Duration = Duration::from_secs(2);
 /// for the next pass.
 ///
 /// Longer than the slowest message the wire carries, so whatever the look asked for has landed — or
-/// been lost — by the time the next listing is answered, and that listing shows it. It is what lets
+/// been lost — by the time the requeued look's listing is answered, and that listing shows it. A
+/// look with too little of its pass left to requeue gives way to the next pass instead, which opens
+/// on the period and can be answered before the last look's actions have landed. It is what lets
 /// a move that depends on another be asked for once the first is seen to have landed, at the cost of
 /// a second instead of a period.
 const REQUEUE: Duration = Duration::from_secs(1);
@@ -140,13 +144,15 @@ const CATCHING_UP: RangeInclusive<Duration> = Duration::from_secs(2)..=Duration:
 /// What is asked for over the run: at a whole number of seconds, a database, the region its primary
 /// is wanted in, and the regions its standbys are wanted in.
 ///
-/// Each change falls between two passes, so the pass after it is the first to see it. The last one
-/// evacuates west: `users`' primary is wanted in east, where its standby is, and west is wanted for
-/// nothing. It falls late enough that with nothing in the way the standby in east has always caught
-/// up by the time the pass after it acts: asked for on the first pass, it exists by 7.4s at the
-/// latest and is in sync by 23.4s, and that pass opens at 25s. So only a run held up on its way
-/// there finds east still catching up — the run a controller asking for everything at once lost the
-/// data on, and the run this one waits out.
+/// Each change falls between two passes, so the pass after it sees it — or a look requeued late in
+/// the pass before, which can open as late as 23s. The last one evacuates west: `users`' primary is
+/// wanted in east, where its standby is, and west is wanted for nothing. It was placed for a
+/// controller with no requeue that asked for the promote and the delete at once: asked for on the
+/// first pass, east exists by 7.4s at the latest and is in sync by 23.4s, and the pass after the
+/// change opens at 25s, so only a run held up on its way there found east still catching up — the
+/// run that controller lost the data on. This one does not need the placement: whichever look first
+/// sees the evacuation, it promotes east only once east is ready and leaves west until it has
+/// stepped down.
 const TIMELINE: &[(u64, &str, &str, &[&str])] = &[
     (0, "orders", "east", &["west"]),
     (0, "users", "west", &["east"]),
@@ -454,8 +460,8 @@ impl Observed {
                 if !promotable {
                     return false;
                 }
-                // The standby is in sync, so the primary it replaces holds nothing it does not, and
-                // steps down to a standby that is in sync too.
+                // The standby is in sync, so the primary it replaces holds nothing it does not. It
+                // steps down to a standby in whatever phase it was in.
                 for ((owner, _), replica) in &mut self.replicas {
                     if owner == database && replica.role == Role::Primary {
                         replica.role = Role::Standby;
@@ -602,11 +608,13 @@ impl fmt::Display for Action {
 /// since there is nothing left to keep it for.
 ///
 /// So whatever order the actions of one call land in, none of them destroys a wanted database's
-/// data. A delete decided on a listing that has since gone stale cannot land on a primary either:
-/// a promote only ever goes to the region wanted as primary and a delete only to a region wanted for
-/// nothing, and a request, its answer and whatever is asked on it all land within the patience a
-/// look has, so no action outlives the look that asked for it. That is an argument about this loop's
-/// timings rather than something a case reaches.
+/// data. Actions can outlive the look that asked for them — a look that requeues late in its pass
+/// sends them up to two seconds before the next pass opens, and one can still be on the wire when
+/// that pass's listing is answered — so a later call may act on a listing that does not show them
+/// yet. A delete decided on such a listing still cannot land on a primary: a promote only ever goes
+/// to the region wanted as primary and a delete only to a region wanted for nothing, so the replica
+/// a stale delete names is one no promote is heading for. That is an argument about this decision
+/// rather than something a case reaches.
 ///
 /// ```
 /// use chronoloop::systems::reconciler::{Desired, Observed, Placement, Region, reconcile};
@@ -1011,10 +1019,11 @@ where
         return 0;
     };
     let actions = reconcile(&desired, &observed);
-    for action in &actions {
-        endpoint.send(server, Message::Apply(action.clone()));
+    let asked = actions.len();
+    for action in actions {
+        endpoint.send(server, Message::Apply(action));
     }
-    actions.len()
+    asked
 }
 
 /// What the server holds, and the replicas it has still to move on.

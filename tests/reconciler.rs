@@ -79,8 +79,11 @@ step 23 32.132124105s 3a6e5fb3588cc43381759d5f81383f30e785e2a46d5dc4eaa88dcf789f
 ///
 /// The pass asks for its listing at exactly 25 seconds, so the listing goes through and the window
 /// opens a nanosecond later — in time to lose the teardown the pass decides on, which is the first
-/// pass to see the standby in west is no longer wanted. Two seconds because a listing can take most
-/// of one to come back and the teardown sent on it has to fall inside the window on every seed.
+/// look to see the standby in west is no longer wanted. A look requeued late in the pass before
+/// could see it sooner, but none is: nothing wanted changes between 12 and 22 seconds, so that pass
+/// finds nothing to ask for and does not requeue — which the gated sweep's retried teardown holds on
+/// every seed it runs. Two seconds because a listing can take most of one to come back and the
+/// teardown sent on it has to fall inside the window on every seed.
 ///
 /// The same pass is the first to see west evacuated for `users`, so that pass's promote and create
 /// are lost too and asked for again once the way is clear.
@@ -185,10 +188,9 @@ fn evacuating_a_region_waits_for_the_new_primary_before_deleting_the_old() {
     // things in.
     let (trace, outcome) = runs(LOSES, &faults(DELAYED_CREATES));
     assert_eq!(outcome, Outcome::Pass);
-    assert!(
-        when(&trace, "users in east ready") < when(&trace, "promote users in east"),
-        "east is promoted once it is in sync"
-    );
+    // East being ready before its promote is not asserted: the world refuses to promote a standby
+    // that is not, and writes no step for a refused action, so no trace could say otherwise —
+    // letting `reconcile` ask for the promote in any phase leaves such an assertion green.
     assert!(
         when(&trace, "promote users in east") < when(&trace, "delete users in west"),
         "and west is deleted only once the promote has landed and stepped it down"
@@ -212,7 +214,8 @@ fn the_old_primary_goes_a_moment_after_the_promote_and_not_a_pass_after() {
 
 #[test]
 fn a_controller_the_server_never_hears_never_converges() {
-    // The other side of the case above, and what keeps it from passing because nothing could fail:
+    // The other side of `a_recorded_run_is_the_run_this_seed_produces`, and what keeps it from
+    // passing because nothing could fail:
     // a loop that is never heard is still short of everything when it stops.
     let (trace, outcome) = runs(SEED, &faults(NEVER_HEARD));
 

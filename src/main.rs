@@ -567,6 +567,11 @@ fn swept(
 /// The blind half of the reconciler's pipeline: nothing about the faults is chosen by whoever asks,
 /// so a seed this finds is one the trouble found rather than one somebody aimed it at. Otherwise
 /// [`swept`] in every respect, bad news included.
+///
+/// Which system this runs and which faults it throws are held by nothing in the suite. Every seed
+/// of the reconciler holds up now, so a hunt reports good news whatever it ran — the coordinator, or
+/// no faults at all, would say the same. The cases that held both were the ones that found the lost
+/// data, and they live in the history before the controller was fixed.
 fn hunted(seeds: NonZeroU64, jobs: NonZeroUsize) -> Result<String, CliError> {
     let survey = sweep(seeds, jobs, |seed| {
         System::Reconciler.run(seed, &reconciler::drawn_faults(seed))
@@ -611,6 +616,11 @@ fn reduced(system: System, seed: u64, faults: &FaultSchedule) -> Result<String, 
 /// The second half of [`hunted`]: a hunt names a seed, and the faults that broke it are the ones
 /// drawn from it, so the seed is all this needs. The repro carries the faults themselves rather than
 /// the seed they were drawn from, so it does not depend on how they were drawn.
+///
+/// Like [`hunted`], held by nothing in which system it runs or which faults it cuts down: no seed of
+/// the reconciler fails now, so the only answer reachable is the refusal, and the coordinator under
+/// the same faults is refused in the same words. The case that held it was the one writing the
+/// committed repro, which lives in the history before the controller was fixed.
 fn cornered(seed: u64) -> Result<String, CliError> {
     reduced(System::Reconciler, seed, &reconciler::drawn_faults(seed))
 }
@@ -1784,7 +1794,8 @@ mod tests {
     fn hunting_says_so_when_every_seed_held_up() {
         // The good-news side of the one question `hunt` asks, over the range holding the seed that
         // once lost data. The bad-news side is `held_up`'s, which `hunt` shares with `sweep`, and the
-        // cases asking `sweep` about the coordinator are what reach it.
+        // cases asking `sweep` about the coordinator are what reach it. Good news is all a hunt can
+        // give now, so this does not hold which system or faults `hunted` uses; see its docs.
         assert_eq!(
             hunted(range(HUNTED + 1), workers(2)).unwrap_or_else(|e| panic!("{e}")),
             "hunted 6 seeds under faults drawn from each: every one held up\n"
@@ -1793,6 +1804,8 @@ mod tests {
 
     #[test]
     fn a_seed_whose_drawn_faults_break_nothing_has_nothing_to_corner() {
+        // A refusal is all `corner` can give now, so this does not hold which system or faults
+        // `cornered` uses; see its docs.
         let refused = cornered(HUNTED)
             .err()
             .unwrap_or_else(|| panic!("seed {HUNTED} holds up under its own faults"));

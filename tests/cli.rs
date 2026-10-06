@@ -965,7 +965,8 @@ const LOST_DATA: &str = include_str!("fixtures/lost-data.repro");
 #[test]
 fn hunting_the_range_holding_the_found_seed_holds_up_and_succeeds() {
     // The six seeds whose hunt once named seed 5 as losing data, under the same drawn faults: every
-    // one holds up now, which is good news on standard output.
+    // one holds up now, which is good news on standard output. Good news is all a hunt can give
+    // now, so this does not hold which system or faults the command uses.
     let hunted = chronoloop(&["hunt", "--seeds", "6", "--jobs", "2"]);
     assert!(hunted.status.success(), "{}", stderr(&hunted));
     assert_eq!(
@@ -978,7 +979,8 @@ fn hunting_the_range_holding_the_found_seed_holds_up_and_succeeds() {
 #[test]
 fn cornering_a_seed_that_holds_up_is_refused() {
     // The seed the committed repro was cut down from has nothing left to cut down: a refusal, on
-    // standard error, and a failing exit code.
+    // standard error, and a failing exit code. A refusal is all `corner` can give now, so this does
+    // not hold which system or faults the command uses: the coordinator would be refused alike.
     let cornered = chronoloop(&["corner", "--seed", "5"]);
     assert!(
         !cornered.status.success(),

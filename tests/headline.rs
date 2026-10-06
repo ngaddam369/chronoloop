@@ -80,8 +80,8 @@ fn the_committed_repro_no_longer_reproduces() {
 
 #[test]
 fn the_seed_that_lost_data_now_promotes_before_it_deletes() {
-    // Why it holds up, read off the run rather than its verdict: under the committed fault, east is
-    // promoted once it has caught up, and west is deleted only after that.
+    // Why it holds up, read off the run rather than its verdict: under the committed fault, west is
+    // deleted only after east has been promoted.
     let repro = found();
     let (trace, _, _) = reconciler::run(repro.seed(), repro.faults())
         .unwrap_or_else(|e| panic!("seed {} finishes: {e}", repro.seed()));
@@ -92,7 +92,8 @@ fn the_seed_that_lost_data_now_promotes_before_it_deletes() {
             .position(|step| step.event().message() == message)
             .unwrap_or_else(|| panic!("seed {} runs {message:?}", repro.seed()))
     };
-    assert!(at("users in east ready") < at("promote users in east"));
+    // Not east being ready before its promote: the world refuses an early promote and writes no
+    // step for it, so that order holds of every trace and says nothing about the controller.
     assert!(
         at("promote users in east") < at("delete users in west"),
         "west goes as a standby, after the promote has stepped it down"
