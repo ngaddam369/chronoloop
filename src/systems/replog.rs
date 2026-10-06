@@ -787,6 +787,10 @@ impl Replica {
     ///
     /// The no-op is what lets a new leader commit anything at all: it counts only entries of its
     /// own term towards a commit, and the clients may have nothing more to send.
+    ///
+    /// It stops asking whether it could stand, too: an election timed out before its votes came in
+    /// can leave it asking about the next term, and the yeses to that question would have it stand
+    /// against itself.
     fn lead(&mut self, out: &mut Out) {
         let term = self.recorded.term;
         self.recorded.role = Role::Leader;
@@ -794,6 +798,7 @@ impl Replica {
         self.recorded.log.push(LogEntry { term, op: Op::Noop });
         self.leader = Some(self.me);
         self.votes.clear();
+        self.prevotes.clear();
         let last = self.last_index();
         self.next = vec![last; REPLICAS];
         self.matched = vec![0; REPLICAS];
@@ -1920,6 +1925,37 @@ mod tests {
         }
         assert_eq!(asking.recorded.role, Role::Follower);
         assert_eq!(asking.recorded.term, 6);
+    }
+
+    #[test]
+    fn a_candidate_that_wins_while_asking_again_does_not_stand_on_the_answers() {
+        // Its election for term 1 timed out and it asked about term 2; the votes for term 1 then
+        // came in late and made it leader. The yeses to the question it was asking arrive after
+        // that, from replicas its first copy has not reached yet — they would have it stand against
+        // itself.
+        let mut candidate = replica(0);
+        stand(&mut candidate);
+        candidate.on_timer();
+        for other in [3, 4] {
+            candidate.on_message(
+                peer(other),
+                Message::Vote {
+                    term: 1,
+                    ballot: Ballot::Granted,
+                },
+            );
+        }
+        assert_eq!(candidate.recorded.role, Role::Leader);
+
+        for other in [1, 2] {
+            let out = candidate.on_message(peer(other), pre_voted(1, 2, Ballot::Granted));
+            assert!(
+                sent(&out).is_empty() && said(&out).is_empty(),
+                "{other}'s yes is about an election a leader does not stand in"
+            );
+        }
+        assert_eq!(candidate.recorded.role, Role::Leader);
+        assert_eq!(candidate.recorded.term, 1);
     }
 
     #[test]
