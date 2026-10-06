@@ -1769,65 +1769,37 @@ mod tests {
         );
     }
 
-    /// The lowest seed whose own drawn faults cost the reconciler a database's data.
+    /// The seed whose own drawn faults cost the reconciler a database's data when its controller asked
+    /// for every difference at once.
     const HUNTED: u64 = 5;
 
-    /// What `corner` writes for [`HUNTED`].
-    fn cornered_text() -> String {
-        cornered(HUNTED)
-            .unwrap_or_else(|e| panic!("seed {HUNTED} breaks under its own faults: {e}"))
-    }
+    /// A reconciler repro of a loop the server never hears: written by hand, since no drawn schedule
+    /// lasts long enough to keep the loop from converging and so `corner` has nothing to write.
+    const NEVER_HEARD: &str = "chronoloop repro reconciler seed 5\n\
+                               failed at step 4: did not converge\n\
+                               chronoloop faults\n\
+                               partition on node 0 -> node 1 from 0.000000000s until forever\n";
 
     #[test]
-    fn hunting_says_which_seeds_broke_and_says_so_when_none_did() {
-        // Both sides of the one question `hunt` asks. Every seed below the one it finds holds up
-        // under the faults drawn for it, which is what makes the range below a range a fixed
-        // reconciler and this one answer differently over.
+    fn hunting_says_so_when_every_seed_held_up() {
+        // The good-news side of the one question `hunt` asks, over the range holding the seed that
+        // once lost data. The bad-news side is `held_up`'s, which `hunt` shares with `sweep`, and the
+        // cases asking `sweep` about the coordinator are what reach it.
         assert_eq!(
-            hunted(range(HUNTED), workers(2)).unwrap_or_else(|e| panic!("{e}")),
-            "hunted 5 seeds under faults drawn from each: every one held up\n"
-        );
-
-        let found = hunted(range(HUNTED + 1), workers(2))
-            .err()
-            .unwrap_or_else(|| panic!("seed {HUNTED} loses data under its own faults"));
-        assert_eq!(
-            found.to_string(),
-            "1 of 6 seeds broke\n  seed 5: failed at step 16: lost data",
-            "the count, and then the seed to hand to `corner`"
-        );
-    }
-
-    #[test]
-    fn cornering_writes_a_repro_of_the_reconciler() {
-        let written = cornered_text();
-        let repro: Repro = written
-            .parse()
-            .unwrap_or_else(|e| panic!("what `corner` writes is a repro: {e}"));
-
-        assert_eq!(repro.system(), System::Reconciler);
-        assert_eq!(repro.seed(), HUNTED);
-        assert!(
-            repro.faults().len() < reconciler::drawn_faults(HUNTED).len(),
-            "{} faults were drawn and {} came out",
-            reconciler::drawn_faults(HUNTED).len(),
-            repro.faults().len()
-        );
-        assert!(
-            reproduced(&written).is_ok(),
-            "and the failure it names is the one the faults it kept produce"
+            hunted(range(HUNTED + 1), workers(2)).unwrap_or_else(|e| panic!("{e}")),
+            "hunted 6 seeds under faults drawn from each: every one held up\n"
         );
     }
 
     #[test]
     fn a_seed_whose_drawn_faults_break_nothing_has_nothing_to_corner() {
-        let refused = cornered(0)
+        let refused = cornered(HUNTED)
             .err()
-            .unwrap_or_else(|| panic!("seed 0 holds up under its own faults"));
+            .unwrap_or_else(|| panic!("seed {HUNTED} holds up under its own faults"));
 
         assert_eq!(
             refused.to_string(),
-            "seed 0 held up under the faults it was given, so there is nothing to reduce"
+            "seed 5 held up under the faults it was given, so there is nothing to reduce"
         );
     }
 
@@ -1836,12 +1808,13 @@ mod tests {
         // Each repro, its header made to name the other system, is a repro the other system does
         // not reproduce — so `reproduce` reaching one system for both would turn one of these red.
         // The coordinator's six faults cut node 0 off from three replicas, which the controller,
-        // being node 0 and talking to node 1 alone, takes as a pass that goes nowhere; and the
-        // reconciler's one fault leaves every round of the coordinator its quorum.
+        // being node 0 and talking to node 1 alone, takes as a pass that goes nowhere; and cutting
+        // node 0 off from node 1 alone, which the controller never comes back from, leaves every
+        // round of the coordinator its quorum.
         let swaps = [
             (shrunk(), "repro quorum seed", "repro reconciler seed"),
             (
-                cornered_text(),
+                String::from(NEVER_HEARD),
                 "repro reconciler seed",
                 "repro quorum seed",
             ),

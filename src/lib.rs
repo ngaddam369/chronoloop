@@ -122,16 +122,19 @@
 //! for: replicas take their time to be provisioned, and a standby takes longer still to catch up.
 //! That is what gives the order of things consequences, and the world keeps the worst of them as a
 //! fact: a primary taken away while none of its standbys has caught up destroys the database's data.
-//! The decision is a plain diff that asks for everything at once, and the timeline it runs moves a
-//! primary — so a run held up on its way there can take the old primary away before the new one has
-//! caught up.
+//! The timeline it runs moves a primary, and a decision that asked for every difference at once
+//! took the old primary away in the same breath as it promoted the new one — so a run held up on
+//! its way there could lose the data whenever the delete landed first.
 //!
-//! Nothing has to be told that for it to be found. [`drawn_faults`] throws each seed its own trouble
+//! Nothing had to be told that for it to be found. [`drawn_faults`] throws each seed its own trouble
 //! on the link between controller and server — drawn from the seed, knowing only the link and when
-//! the passes are, and over before the last of them — and a sweep of the reconciler under it finds
-//! seeds that lose the data, and nothing else. The lowest of them cuts down to one fault: a stretch
+//! the passes are, and over before the last of them — and a sweep of the reconciler under it found
+//! seeds that lost the data, and nothing else. The lowest of them cut down to one fault: a stretch
 //! of loss eating the first pass's creates, the very thing a schedule written by hand would have had
-//! to know to aim at.
+//! to know to aim at. That repro is still committed. The decision now never deletes a still-wanted
+//! database's primary: it promotes the standby, looks again a moment later, and takes the old
+//! primary away once it has stepped down — and the same sweep, under the very same faults, finds
+//! nothing.
 //!
 //! [`fork`]: fork::fork
 //! [`ring`]: systems::ring

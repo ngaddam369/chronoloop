@@ -39,13 +39,22 @@
 //! not there, changes nothing — so an action decided on a listing that has since gone stale does
 //! nothing the next pass cannot put right.
 //!
-//! The decision asks for every difference it sees at once, and says nothing about the order they
-//! should land in. That is safe for every move but one, and the timeline this module runs reaches
-//! that one: when a database's primary is moved out of a region that is wanted for nothing, the
-//! same pass asks for the old primary to be deleted and the new one promoted, and if the delete
-//! lands while the standby to be promoted is still catching up, the data goes with it. Whether it
-//! is still catching up is a matter of how long it took to be created and how long it is taking to
-//! catch up, so what reaches the hazard is a run's draws together with whatever held it up.
+//! # The one move that has to wait for another
+//!
+//! Every action is a message of its own, and the wire carries each in its own time, so whatever
+//! order a pass asks for things in, they land in any order at all. That is harmless for every move
+//! but one, and the timeline this module runs reaches it: when a database's primary is moved out of
+//! a region that is wanted for nothing, the old primary has to go and the new one has to be
+//! promoted, and if the delete lands while the standby to be promoted is still catching up, the data
+//! goes with it. A decision that asks for both at once leaves that to the draws, and a blind sweep
+//! found the runs where the draws went the wrong way.
+//!
+//! So [`reconcile`] does not ask for the delete at all while the replica is its database's primary.
+//! It asks for the promote; the promote steps the old primary down to a standby that is, by then, in
+//! sync; and the delete is asked for by a later look, once a listing shows the step down has landed.
+//! The dependency is kept by looking, not by ordering messages, which the wire would not honour. To
+//! keep that from costing a whole resync period, a look that asked for something is followed a
+//! moment later by another, the way an operator requeues a resource it has just changed.
 //!
 //! # The run
 //!
@@ -54,8 +63,8 @@
 //! standby in a third region and then loses the standby it started with, and the other is moved out
 //! of the region holding its primary, into the region holding its standby — and the server applies
 //! whatever it is asked to, and moves every replica on through its phases as their time comes. The
-//! **controller** wakes on a fixed resync period, asks for a listing, works out what to do and sends
-//! it. Every change the server makes, whether asked for or the passage of time, is a step of the
+//! **controller** wakes on a fixed resync period — and again a moment after any look that asked for
+//! something — asks for a listing, works out what to do and sends it. Every change the server makes, whether asked for or the passage of time, is a step of the
 //! trace.
 //!
 //! The wire is **dependable**, for the reason `quorum` gives: it takes time and nothing else, so an
@@ -94,13 +103,25 @@ use crate::world::{Name, NameError, Resource, Snapshot, Value, World};
 const PERIOD: Duration = Duration::from_secs(5);
 
 /// How many passes the controller makes before it stops.
-const PASSES: u64 = 8;
+///
+/// Enough that the last [`CLEAR_PASSES`] of them can finish any evacuation the trouble left
+/// undone; see there for the arithmetic.
+const PASSES: u64 = 10;
 
 /// How long the controller waits for a listing before giving the pass up.
 ///
 /// Comfortably longer than a request across and a listing back, each as slow as the wire can be,
 /// and comfortably shorter than [`PERIOD`], so no pass outlives its own.
 const PATIENCE: Duration = Duration::from_secs(2);
+
+/// How long after a look that asked for something the controller looks again, rather than waiting
+/// for the next pass.
+///
+/// Longer than the slowest message the wire carries, so whatever the look asked for has landed — or
+/// been lost — by the time the next listing is answered, and that listing shows it. It is what lets
+/// a move that depends on another be asked for once the first is seen to have landed, at the cost of
+/// a second instead of a period.
+const REQUEUE: Duration = Duration::from_secs(1);
 
 /// How long the server waits for a request, once nothing more is going to be asked of it and no
 /// replica has anywhere left to go, before deciding nothing more is coming.
@@ -124,8 +145,8 @@ const CATCHING_UP: RangeInclusive<Duration> = Duration::from_secs(2)..=Duration:
 /// nothing. It falls late enough that with nothing in the way the standby in east has always caught
 /// up by the time the pass after it acts: asked for on the first pass, it exists by 7.4s at the
 /// latest and is in sync by 23.4s, and that pass opens at 25s. So only a run held up on its way
-/// there can reach the unsafe delete, which `tests/reconciler.rs` checks over a sweep of seeds
-/// rather than leaving to this arithmetic.
+/// there finds east still catching up — the run a controller asking for everything at once lost the
+/// data on, and the run this one waits out.
 const TIMELINE: &[(u64, &str, &str, &[&str])] = &[
     (0, "orders", "east", &["west"]),
     (0, "users", "west", &["east"]),
@@ -147,10 +168,16 @@ const TENTHS: u32 = 10;
 /// How many of the controller's last passes a drawn schedule leaves alone.
 ///
 /// A controller owes convergence once the trouble stops and not before, so a schedule that is still
-/// cutting the way to the server on the last pass is asking for a failure nobody could avoid. Three
-/// clear passes is a choice about the **passes** — enough for a pass to look, a pass to act on what
-/// it saw and one more to spare — and nothing about it knows what the timeline asks for or when.
-const CLEAR_PASSES: u64 = 3;
+/// cutting the way to the server on the last pass is asking for a failure nobody could avoid. How
+/// many clear passes that takes is arithmetic about this loop and the world's slowest draws, not
+/// about the timeline. The latest a standby can be first asked for is the first clear pass: the
+/// listing there and the create sent on it take up to three of the slowest messages between them,
+/// so the standby exists by 2.4s after the pass opens, and it is in sync at most 16s after that.
+/// 18.4s is first seen by the fifth clear pass, opening 20s after the first; that pass promotes it,
+/// and the look requeued a moment later takes the old primary away. Three were enough for a
+/// controller that asked for everything at once only because the runs that needed more lost their
+/// data before they could run out of passes.
+const CLEAR_PASSES: u64 = 5;
 
 /// The field holding whether a database's data has been destroyed.
 const LOST: &str = "lost";
@@ -568,7 +595,18 @@ impl fmt::Display for Action {
 ///
 /// Nothing else is asked for. A replica on its way through its phases needs only time, and one
 /// standing where a standby is wanted steps down by itself when the primary that is wanted is
-/// promoted. Every difference is asked for at once, in no order that keeps a database safe.
+/// promoted. A primary standing where nothing is wanted is **not** deleted while its database is
+/// still wanted: deleting it before a standby has caught up destroys the data, and no order a call
+/// puts its actions in survives the wire. It is left for a promotion to step down, and a later call
+/// finds it a standby and deletes it then. A database wanted nowhere at all is torn down whole,
+/// since there is nothing left to keep it for.
+///
+/// So whatever order the actions of one call land in, none of them destroys a wanted database's
+/// data. A delete decided on a listing that has since gone stale cannot land on a primary either:
+/// a promote only ever goes to the region wanted as primary and a delete only to a region wanted for
+/// nothing, and a request, its answer and whatever is asked on it all land within the patience a
+/// look has, so no action outlives the look that asked for it. That is an argument about this loop's
+/// timings rather than something a case reaches.
 ///
 /// ```
 /// use chronoloop::systems::reconciler::{Desired, Observed, Placement, Region, reconcile};
@@ -629,6 +667,15 @@ pub fn reconcile(desired: &Desired, observed: &Observed) -> Vec<Action> {
                     database: database.clone(),
                     region: region.clone(),
                 },
+                // A database that is still wanted keeps its primary until a promotion has stepped it
+                // down; it is then a standby, and the arm below takes it away on a later pass.
+                (
+                    None,
+                    Some(Replica {
+                        role: Role::Primary,
+                        ..
+                    }),
+                ) if desired.databases.contains_key(database) => return None,
                 (None, Some(_)) => Action::Delete {
                     database: database.clone(),
                     region: region.clone(),
@@ -914,11 +961,14 @@ fn observe(seed: u64, faults: &FaultSchedule) -> Result<Vec<Observation>, RunErr
     Ok(core::mem::take(&mut *log.borrow_mut()))
 }
 
-/// The controller: on every pass, look, decide, and ask.
+/// The controller: on every pass, look, decide, and ask — and look again soon after asking.
 ///
-/// Written against the capabilities alone, and holding nothing from one pass to the next — the
-/// listing a pass acts on is the one it asked for itself. A pass whose listing does not come back
-/// in time does nothing, and the next pass looks again.
+/// Written against the capabilities alone, and holding nothing from one look to the next — the
+/// listing a look acts on is the one it asked for itself. A look whose listing does not come back in
+/// time does nothing, and the next pass looks again. A look that asked for something is followed
+/// [`REQUEUE`] later by another, the way an operator requeues a resource it has just changed, for as
+/// long as there is time left before the next pass opens; a look that asked for nothing waits for the
+/// next pass.
 async fn control<C, N>(clock: &C, endpoint: &N, server: NodeId)
 where
     C: Clock,
@@ -927,27 +977,44 @@ where
     for pass in 1..=PASSES {
         // A pass opens on the period rather than whenever the last one finished, so which pass a
         // window of simulated time falls in is not something the run's draws can move.
-        clock.sleep_until(opens(pass)).await;
-        endpoint.send(server, Message::List);
-
-        let deadline = after(opens(pass), PATIENCE);
-        // Only the server talks to the controller and it only ever sends a listing, so the first
-        // thing to arrive is this pass's. A listing from a pass gone by could not still be on the
-        // wire — a pass gives up well inside its period — and acting on one would do no harm
-        // anyway, which is the point of deciding on what is rather than on what changed.
-        let Ok(delivery) = clock
-            .timeout(until(clock.now(), deadline), endpoint.recv())
-            .await
-        else {
-            continue;
-        };
-        let Message::Listed(desired, observed) = delivery.into_message() else {
-            continue;
-        };
-        for action in reconcile(&desired, &observed) {
-            endpoint.send(server, Message::Apply(action));
+        let mut at = opens(pass);
+        while after(at, PATIENCE) <= opens(pass + 1) {
+            clock.sleep_until(at).await;
+            if look(clock, endpoint, server, after(at, PATIENCE)).await == 0 {
+                break;
+            }
+            at = after(clock.now(), REQUEUE);
         }
     }
+}
+
+/// Asks for a listing, and asks for whatever it shows is needed, returning how many things were
+/// asked for — none if the listing did not come back by `deadline`.
+async fn look<C, N>(clock: &C, endpoint: &N, server: NodeId, deadline: VirtualTime) -> usize
+where
+    C: Clock,
+    N: Network<Message = Message>,
+{
+    endpoint.send(server, Message::List);
+    // Only the server talks to the controller and it only ever sends a listing, so the first thing to
+    // arrive is this look's. A listing from a look gone by could not still be on the wire — a request
+    // and its answer take at most twice the slowest message, inside the patience a look has — and
+    // acting on one would do no harm anyway, which is the point of deciding on what is rather than on
+    // what changed.
+    let Ok(delivery) = clock
+        .timeout(until(clock.now(), deadline), endpoint.recv())
+        .await
+    else {
+        return 0;
+    };
+    let Message::Listed(desired, observed) = delivery.into_message() else {
+        return 0;
+    };
+    let actions = reconcile(&desired, &observed);
+    for action in &actions {
+        endpoint.send(server, Message::Apply(action.clone()));
+    }
+    actions.len()
 }
 
 /// What the server holds, and the replicas it has still to move on.
@@ -1282,7 +1349,25 @@ mod tests {
                 name: "a primary wanted where the database already has one is made a standby first",
                 desired: desired("west", &[]),
                 observed: &[("east", Primary, Ready)],
-                expected: &["delete orders in east", "create orders in west as standby"],
+                expected: &["create orders in west as standby"],
+            },
+            Case {
+                name: "a primary no longer wanted waits for its replacement to be promoted",
+                desired: desired("west", &[]),
+                observed: &[("east", Primary, Ready), ("west", Standby, Ready)],
+                expected: &["promote orders in west"],
+            },
+            Case {
+                name: "a primary that has stepped down is a standby, and goes like one",
+                desired: desired("west", &[]),
+                observed: &[("east", Standby, Ready), ("west", Primary, Ready)],
+                expected: &["delete orders in east"],
+            },
+            Case {
+                name: "a database wanted nowhere is torn down, primary and all",
+                desired: Desired::new(),
+                observed: &[("east", Primary, Ready), ("west", Standby, Ready)],
+                expected: &["delete orders in east", "delete orders in west"],
             },
             Case {
                 name: "a standby in sync where the primary is wanted is promoted",
@@ -1313,20 +1398,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn from_every_state_the_loop_settles_where_it_was_asked() {
-        // The level-triggered claim, asked of every state a controller could find one database in
-        // across three regions: nothing there, a standby in each phase, or a primary in each phase,
-        // with at most one primary since the world allows no more. A controller that restarts finds
-        // one of these with no memory of how it got there. Passes alternate with the passage of
-        // time, and three are enough from anywhere: one to create, one to promote what was created,
-        // and one to find nothing left to do.
-        //
-        // What this does not ask is whether the world got there *safely*. Some of these starts hold
-        // a primary in the region nobody wants, and the decision deletes it in the same pass as it
-        // creates the standby that will replace it — so from those, the data is destroyed on the way.
-        // Getting there is the decision's claim; the order is not one it makes.
-        let want = desired("east", &["west"]);
+    /// Every state a controller could find `orders` in across three regions: nothing there, a
+    /// standby in each phase, or a primary in each phase, with at most one primary since the world
+    /// allows no more.
+    fn every_state() -> Vec<Vec<(&'static str, Role, Phase)>> {
         let options: [Option<(Role, Phase)>; 6] = [
             None,
             Some((Standby, Provisioning)),
@@ -1336,25 +1411,60 @@ mod tests {
             Some((Primary, Ready)),
         ];
         let regions = ["east", "south", "west"];
-        let mut tried = 0;
-        for code in 0..options.len().pow(3) {
-            let mut rest = code;
-            let chosen: Vec<(&str, Role, Phase)> = regions
-                .iter()
-                .filter_map(|&place| {
-                    let option = options[rest % options.len()];
-                    rest /= options.len();
-                    option.map(|(role, phase)| (place, role, phase))
+        (0..options.len().pow(3))
+            .map(|code| {
+                let mut rest = code;
+                regions
+                    .iter()
+                    .filter_map(|&place| {
+                        let option = options[rest % options.len()];
+                        rest /= options.len();
+                        option.map(|(role, phase)| (place, role, phase))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .filter(|chosen| {
+                chosen
+                    .iter()
+                    .filter(|&&(_, role, _)| role == Primary)
+                    .count()
+                    <= 1
+            })
+            .collect()
+    }
+
+    /// Every order `actions` could land in.
+    fn orders(actions: &[Action]) -> Vec<Vec<Action>> {
+        if actions.is_empty() {
+            return vec![Vec::new()];
+        }
+        (0..actions.len())
+            .flat_map(|first| {
+                let mut rest = actions.to_vec();
+                let head = rest.remove(first);
+                orders(&rest).into_iter().map(move |mut tail| {
+                    tail.insert(0, head.clone());
+                    tail
                 })
-                .collect();
-            if chosen
-                .iter()
-                .filter(|&&(_, role, _)| role == Primary)
-                .count()
-                > 1
-            {
-                continue;
-            }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn from_every_state_the_loop_settles_where_it_was_asked() {
+        // The level-triggered claim, asked of every state a controller could find one database in.
+        // A controller that restarts finds one of these with no memory of how it got there. Passes
+        // alternate with the passage of time, and three are enough from anywhere: one to create,
+        // one to promote what was created, and one to take away the primary that stepped down.
+        // And it gets there without destroying the data on the way, from every one of them.
+        let want = desired("east", &["west"]);
+        let states = every_state();
+        assert_eq!(
+            states.len(),
+            160,
+            "every one of the states with at most one primary, not a corner of them"
+        );
+        for chosen in states {
             let mut world = observed(&chosen);
             let mut passes = 0;
             while !converged(&want, &world) {
@@ -1369,12 +1479,41 @@ mod tests {
                 reconcile(&want, &world).is_empty(),
                 "from {chosen:?}, nothing left to ask"
             );
-            tried += 1;
+            assert!(
+                !world.is_lost(&name("orders")),
+                "from {chosen:?}, the data was destroyed on the way"
+            );
         }
-        assert_eq!(
-            tried, 160,
-            "every one of the states with at most one primary, not a corner of them"
-        );
+    }
+
+    #[test]
+    fn no_pass_loses_data_whatever_order_its_actions_land_in() {
+        // The ordering claim. Each action is a message of its own and the wire lands them in any
+        // order, so what keeps a database safe has to hold in every one of them — not in the order
+        // the list happens to be in. A pass never leaves a database with two primaries, so the state
+        // after one is again one of these, and asking one pass from every state asks every pass.
+        //
+        // Two placements, because the second is what tells "a still-wanted primary is never deleted"
+        // from the weaker "a primary is deleted only while a standby is in sync": with east wanted
+        // and nothing else, a primary in west and a standby in sync in south are both unwanted, and
+        // a pass deleting both loses the data whenever the standby goes first.
+        for want in [desired("east", &["west"]), desired("east", &[])] {
+            for chosen in every_state() {
+                let before = observed(&chosen);
+                let actions = reconcile(&want, &before);
+                for order in orders(&actions) {
+                    let mut world = before.clone();
+                    for action in &order {
+                        world.apply(action);
+                    }
+                    assert!(
+                        !world.is_lost(&name("orders")),
+                        "from {chosen:?} wanting {want:?}, landing as {:?}",
+                        shown(&order)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

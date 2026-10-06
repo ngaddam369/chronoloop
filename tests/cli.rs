@@ -113,11 +113,11 @@ static COVERED: [Covered; 12] = [
     },
     Covered {
         command: "hunt",
-        case: "hunting_names_every_seed_its_own_faults_broke_and_fails",
+        case: "hunting_the_range_holding_the_found_seed_holds_up_and_succeeds",
     },
     Covered {
         command: "corner",
-        case: "cornering_a_hunted_seed_writes_the_committed_repro",
+        case: "cornering_a_seed_that_holds_up_is_refused",
     },
 ];
 
@@ -958,44 +958,51 @@ fn a_seed_a_sweep_found_is_a_seed_the_rest_of_the_family_takes() {
     );
 }
 
-/// The reconciler's repro the headline rests on, as `corner` wrote it and as it is committed.
+/// The reconciler's repro the headline rests on, as `corner` wrote it against the controller that
+/// asked for every difference at once, and as it is still committed.
 const LOST_DATA: &str = include_str!("fixtures/lost-data.repro");
 
 #[test]
-fn hunting_names_every_seed_its_own_faults_broke_and_fails() {
-    // Both sides of the one question `hunt` asks, as `sweep` asks it: the five seeds below the one
-    // it finds hold up, which is good news on standard output; six include it, which is bad news on
-    // standard error, naming the seed to hand to `corner`.
-    let clear = chronoloop(&["hunt", "--seeds", "5", "--jobs", "2"]);
-    assert!(clear.status.success(), "{}", stderr(&clear));
+fn hunting_the_range_holding_the_found_seed_holds_up_and_succeeds() {
+    // The six seeds whose hunt once named seed 5 as losing data, under the same drawn faults: every
+    // one holds up now, which is good news on standard output.
+    let hunted = chronoloop(&["hunt", "--seeds", "6", "--jobs", "2"]);
+    assert!(hunted.status.success(), "{}", stderr(&hunted));
     assert_eq!(
-        stdout(&clear),
-        "hunted 5 seeds under faults drawn from each: every one held up\n"
+        stdout(&hunted),
+        "hunted 6 seeds under faults drawn from each: every one held up\n"
     );
+    assert_eq!(stderr(&hunted), "");
+}
 
-    let found = chronoloop(&["hunt", "--seeds", "6", "--jobs", "2"]);
-    assert!(!found.status.success(), "a seed that lost data is bad news");
-    assert_eq!(stdout(&found), "");
+#[test]
+fn cornering_a_seed_that_holds_up_is_refused() {
+    // The seed the committed repro was cut down from has nothing left to cut down: a refusal, on
+    // standard error, and a failing exit code.
+    let cornered = chronoloop(&["corner", "--seed", "5"]);
+    assert!(
+        !cornered.status.success(),
+        "seed 5 holds up, so it is refused"
+    );
+    assert_eq!(stdout(&cornered), "");
     assert_eq!(
-        stderr(&found),
-        "chronoloop: 1 of 6 seeds broke\n  seed 5: failed at step 16: lost data\n"
+        stderr(&cornered),
+        "chronoloop: seed 5 held up under the faults it was given, so there is nothing to reduce\n"
     );
 }
 
 #[test]
-fn cornering_a_hunted_seed_writes_the_committed_repro() {
-    // The seed a hunt named goes in, and the committed fixture comes out byte for byte — the same
-    // text `tests/headline.rs` reaches through the library, reached here through a process. Then a
-    // third process reads it back off a file and runs the system its header names.
-    let cornered = chronoloop(&["corner", "--seed", "5"]);
-    assert!(cornered.status.success(), "{}", stderr(&cornered));
-    assert_eq!(stdout(&cornered), LOST_DATA);
-
-    let path = scratch_file("lost-data.repro", &stdout(&cornered));
+fn the_committed_lost_data_repro_no_longer_reproduces() {
+    // The after half of the headline through a process: the file a hunt and a reduction wrote is read
+    // back off disk, the system its header names is run, and the failure it names does not come back.
+    let path = scratch_file("lost-data.repro", LOST_DATA);
     let reproduced = chronoloop(&["reproduce", arg(&path)]);
-    assert!(reproduced.status.success(), "{}", stderr(&reproduced));
+    assert!(!reproduced.status.success(), "the bug is fixed");
+    assert_eq!(stdout(&reproduced), "");
     assert_eq!(
-        stdout(&reproduced),
-        "seed 5: failed at step 17: lost data, as the repro expects\n"
+        stderr(&reproduced),
+        "chronoloop: seed 5 does not reproduce what the repro names\n  \
+         expected: failed at step 17: lost data\n  \
+         produced: passed\n"
     );
 }

@@ -1,50 +1,42 @@
-//! A bug found blind, cut down to what caused it, and kept.
+//! A bug found blind, kept as a file, and fixed — with the file still saying what it was.
 //!
-//! The reconciler decides every difference it sees at once and says nothing about the order they
-//! land in, and its timeline moves `users`' primary out of west into east at 23 seconds. If the
-//! delete of west lands while east is still catching up, the data goes with it. Nothing here was
-//! told that. Every seed is thrown its own trouble — six faults on the link between controller and
-//! server, drawn from the seed by [`reconciler::drawn_faults`] knowing only the link and when the
-//! passes are — and the sweep reports whatever broke.
+//! The reconciler's timeline moves `users`' primary out of west into east at 23 seconds. A controller
+//! that asks for every difference at once asks for the promote of east and the delete of west in one
+//! pass, and each is a message of its own, so the wire lands them in either order; if the delete
+//! lands while east is still catching up, the data goes with it. A sweep found that with no hint —
+//! every seed thrown its own trouble by [`reconciler::drawn_faults`], knowing only the link and when
+//! the passes are — on 50 of 500 seeds, and the lowest of them, seed 5, cut down to one fault. That
+//! repro is committed beside this file, written by `chronoloop corner --seed 5` against `712ae86`,
+//! the last commit whose controller asked for everything at once; checking that commit out is how
+//! anyone reproduces the bug.
 //!
-//! What it finds is the data loss, and only the data loss: no seed in the gated five hundred fails
-//! to converge, so a sweep reporting something is a sweep reporting the hazard. The lowest seed it
-//! finds is cut down to the faults its failure needed, and that repro is committed beside this file,
-//! written by `chronoloop corner` and never edited by hand. Its schedule is one fault, a lossy
-//! stretch eating the first pass's creates — the same thing the hand-written schedule in
-//! `tests/reconciler.rs` was aimed at, arrived at here without aiming.
+//! The controller here does not ask for the delete of a still-wanted database's primary at all. It
+//! promotes the standby once the standby is in sync, looks again a moment later, and takes the old
+//! primary away only once that look shows it stepped down. These cases are the other half: the
+//! committed repro no longer reproduces, its seed now promotes before it deletes, and the same hunt
+//! — the same seeds under the very same drawn faults — comes back with nothing in it.
 //!
-//! What these cases can and cannot feel. The hunt and the reduction both feel the seed twice over,
-//! through the run and through the faults drawn for it, so cutting the engine off from its seed
-//! moves the seed they find. The committed repro feels it through its run alone, which is the
-//! weaker claim, and is held by [`HOLDS`]: the same one fault, under another seed, keeps the data.
-//! The heal rule is held at scale by the gated sweep and per draw by the generator's own unit cases;
-//! none of these says anything about the state encoding, which `tests/world.rs` holds.
+//! What these cases can and cannot feel. A hunt reporting nothing is the weakest kind of claim: a
+//! hunt that ran nothing would report nothing too, which is why the run of seed 5 is held to its
+//! order of events and not only to its verdict. None of them feels the world's rule that a primary
+//! deleted with nothing in sync behind it destroys the data — no run of this controller makes that
+//! move — and the unit cases beside the module are what hold it. Nor do they feel the seed: every
+//! seed holds up now, so a run cut off from its seed holds up too, and it is the pinned trace in
+//! `tests/reconciler.rs` that notices.
 
 use core::num::{NonZeroU64, NonZeroUsize};
 
-use chronoloop::fault::FaultSchedule;
 use chronoloop::outcome::Outcome;
 use chronoloop::repro::Repro;
-use chronoloop::shrink::shrink;
 use chronoloop::sweep::sweep;
 use chronoloop::systems::{System, reconciler};
 
-/// The repro the hunt and the reduction produced, as `chronoloop corner --seed 5` wrote it.
+/// The repro the hunt and the reduction produced, as `chronoloop corner --seed 5` wrote it against
+/// the controller that asked for every difference at once.
 const FOUND: &str = include_str!("fixtures/lost-data.repro");
 
-/// The lowest seed whose own drawn faults cost the reconciler a database's data, found by hunting.
-const LOWEST: u64 = 5;
-
-/// A seed that keeps the data under the committed repro's one fault, found by running: its delete
-/// of west lands **before** its promote of east, so what saves it is east having caught up rather
-/// than west having already stepped down — the distinction `tests/reconciler.rs`'s pair draws.
-const HOLDS: u64 = 1;
-
-/// How many of the gated hunt's seeds lose data under their own faults, recorded from an actual run.
-const LOST_IN_HUNT: usize = 50;
-
-/// How many seeds the gated hunt covers.
+/// How many seeds the gated hunt covers — the same five hundred under which the controller that
+/// asked for everything at once lost data on fifty.
 const HUNT: u64 = 500;
 
 /// The committed repro, read back.
@@ -54,127 +46,68 @@ fn found() -> Repro {
         .unwrap_or_else(|e| panic!("the committed repro is a repro: {e}"))
 }
 
-/// How the reconciler's run of `seed` under `faults` went.
-fn outcome(seed: u64, faults: &FaultSchedule) -> Outcome {
-    System::Reconciler
-        .run(seed, faults)
-        .unwrap_or_else(|e| panic!("seed {seed} finishes: {e}"))
-}
-
 /// A count, failing the test rather than returning an error no case expects.
 fn seeds(count: u64) -> NonZeroU64 {
     NonZeroU64::new(count).unwrap_or_else(|| panic!("a hunt covers at least one seed"))
 }
 
-/// Runs the reconciler over `0..count`, each seed under the faults drawn for it.
-fn hunt(count: u64) -> Vec<String> {
+/// Runs the reconciler over `0..count`, each seed under the faults drawn for it, and returns how
+/// many seeds it ran and the failures it found.
+fn hunt(count: u64) -> (u64, Vec<String>) {
     let jobs = NonZeroUsize::new(4).unwrap_or_else(|| panic!("four is not zero"));
-    sweep(seeds(count), jobs, |seed| {
+    let survey = sweep(seeds(count), jobs, |seed| {
         System::Reconciler.run(seed, &reconciler::drawn_faults(seed))
     })
-    .unwrap_or_else(|e| panic!("every seed finishes: {e}"))
-    .broke()
-    .iter()
-    .map(ToString::to_string)
-    .collect()
-}
-
-#[test]
-fn a_blind_hunt_finds_the_lost_data() {
-    assert_eq!(
-        hunt(LOWEST + 1),
-        ["seed 5: failed at step 16: lost data"],
-        "every seed below the one it finds holds up, and the one it finds lost data"
-    );
-}
-
-#[test]
-fn cutting_the_found_seed_down_writes_the_committed_repro() {
-    let drawn = reconciler::drawn_faults(LOWEST);
-    let reduction = shrink(&drawn, |candidate| {
-        System::Reconciler.run(LOWEST, candidate)
-    })
-    .unwrap_or_else(|e| panic!("every candidate finishes: {e}"))
-    .unwrap_or_else(|| panic!("seed {LOWEST} breaks under its own faults"));
-    let repro = Repro::new(
-        System::Reconciler,
-        LOWEST,
-        reduction.schedule().clone(),
-        reduction.outcome().clone(),
+    .unwrap_or_else(|e| panic!("every seed finishes: {e}"));
+    (
+        survey.swept(),
+        survey.broke().iter().map(ToString::to_string).collect(),
     )
-    .unwrap_or_else(|e| panic!("a failure is something to reproduce: {e}"));
-
-    assert_eq!(repro.to_string(), FOUND);
-    assert_eq!(
-        (drawn.len(), repro.faults().len()),
-        (6, 1),
-        "six faults drawn, one needed"
-    );
 }
 
 #[test]
-fn the_committed_repro_still_reproduces() {
+fn the_committed_repro_no_longer_reproduces() {
+    // Not merely a failure of some other kind: the run the file names now holds up outright.
     let repro = found();
     assert_eq!(repro.system(), System::Reconciler);
 
-    let produced = outcome(repro.seed(), repro.faults());
-    assert!(
-        produced.reproduces(repro.expected()),
-        "expected {}, produced {produced}",
-        repro.expected()
-    );
+    let produced = System::Reconciler
+        .run(repro.seed(), repro.faults())
+        .unwrap_or_else(|e| panic!("seed {} finishes: {e}", repro.seed()));
+    assert!(!produced.reproduces(repro.expected()));
+    assert_eq!(produced, Outcome::Pass);
 }
 
 #[test]
-fn the_committed_repro_is_already_as_small_as_it_goes() {
-    // Its own tail handed back to the reduction comes back as the same repro. The other route to
-    // the same bytes from the one above: that case reduces six drawn faults, this one reduces the
-    // committed one.
+fn the_seed_that_lost_data_now_promotes_before_it_deletes() {
+    // Why it holds up, read off the run rather than its verdict: under the committed fault, east is
+    // promoted once it has caught up, and west is deleted only after that.
     let repro = found();
-    let again = shrink(repro.faults(), |candidate| {
-        System::Reconciler.run(repro.seed(), candidate)
-    })
-    .unwrap_or_else(|e| panic!("every candidate finishes: {e}"))
-    .unwrap_or_else(|| panic!("the committed repro still breaks"));
-
-    assert_eq!(again.schedule(), repro.faults());
-    assert_eq!(again.outcome(), repro.expected());
-}
-
-#[test]
-fn the_seed_in_the_committed_repro_is_doing_work() {
-    // The repro's one fault does not lose the data on its own: under another seed it holds up. So
-    // the seed in the file is part of what makes it a repro, and a run that ignored it would be
-    // noticed here — the case `tests/repro.rs`'s lossy pair exists for, on this system.
-    let repro = found();
-    assert_eq!(outcome(HOLDS, repro.faults()), Outcome::Pass);
-
-    let (trace, _, _) = reconciler::run(HOLDS, repro.faults())
-        .unwrap_or_else(|e| panic!("seed {HOLDS} finishes: {e}"));
+    let (trace, _, _) = reconciler::run(repro.seed(), repro.faults())
+        .unwrap_or_else(|e| panic!("seed {} finishes: {e}", repro.seed()));
     let at = |message: &str| {
         trace
             .steps()
             .iter()
             .position(|step| step.event().message() == message)
-            .unwrap_or_else(|| panic!("seed {HOLDS} runs {message:?}"))
+            .unwrap_or_else(|| panic!("seed {} runs {message:?}", repro.seed()))
     };
+    assert!(at("users in east ready") < at("promote users in east"));
     assert!(
-        at("delete users in west") < at("promote users in east"),
-        "west is deleted while it is still the primary, and east being in sync is what keeps it"
+        at("promote users in east") < at("delete users in west"),
+        "west goes as a standby, after the promote has stepped it down"
     );
 }
 
 #[test]
+fn the_seeds_up_to_the_one_that_was_found_all_hold_up() {
+    assert_eq!(hunt(6), (6, Vec::new()), "seed 5 among them");
+}
+
+#[test]
 #[ignore = "a sweep of five hundred runs; `make local-validation` runs it in both profiles"]
-fn a_hunt_finds_data_loss_and_nothing_else() {
-    // The blindness claim at scale: whatever the drawn trouble does to the run, the only failure it
-    // produces is the hazard. A schedule still cutting the link on the last pass would turn up here
-    // as a run that did not converge, which is what the heal rule is for.
-    let broke = hunt(HUNT);
-    let lost = broke
-        .iter()
-        .filter(|line| line.ends_with(": lost data"))
-        .count();
-    assert_eq!(lost, broke.len(), "{broke:#?}");
-    assert_eq!(lost, LOST_IN_HUNT);
+fn the_same_hunt_finds_nothing() {
+    // The before and after on one range: the same seeds under the same drawn faults, and nothing —
+    // neither lost data nor a loop that ran out of passes before it got where it was asked.
+    assert_eq!(hunt(HUNT), (HUNT, Vec::new()));
 }
