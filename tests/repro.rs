@@ -6,9 +6,9 @@
 //! nothing else — cut its schedule down, write the three things that are left into a repro, and then
 //! put another run through what the *text* says. If the file is a repro, that run fails the same way.
 //!
-//! The first text pinned below is 295 bytes long — counted off that literal rather than asserted
+//! The first text pinned below is 302 bytes long — counted off that literal rather than asserted
 //! beside it, since the literal already fixes it. That is the size the artifact is claimed at: a
-//! failing run of a five-node system, in under a third of a kilobyte.
+//! failing run of a five-node system, in under a third of a kilobyte, the system named in it.
 //!
 //! One limit, stated rather than left to be found. The outage schedule below reduces to the same
 //! three partitions under every seed, so the cases built on it stay green with the engine cut off
@@ -26,7 +26,7 @@ use chronoloop::fault::FaultSchedule;
 use chronoloop::outcome::Outcome;
 use chronoloop::repro::Repro;
 use chronoloop::shrink::shrink;
-use chronoloop::systems::quorum;
+use chronoloop::systems::{System, quorum};
 use chronoloop::trace::Trace;
 
 /// The seed the recorded cases run, since none of them is about a particular one.
@@ -46,7 +46,7 @@ const FAULTS: &str = "chronoloop faults\n\
 /// The seed, the failure to expect, and then the three one-nanosecond outages `tests/shrink.rs` pins
 /// as the whole of what went wrong — the same text, reached here through a repro rather than through
 /// a reduction.
-const REPRO: &str = "chronoloop repro seed 20260921\n\
+const REPRO: &str = "chronoloop repro quorum seed 20260921\n\
                      failed at step 14: round 3 lost quorum\n\
                      chronoloop faults\n\
                      partition on node 0 -> node 1 from 15.000000000s until 15.000000001s\n\
@@ -61,7 +61,7 @@ const LOSSY: &str = "chronoloop faults\n\
                      partition on node 0 -> node 4 from 15.000000000s until 20.000000000s\n";
 
 /// The repro that comes of reducing that, recorded from an actual run.
-const LOSSY_REPRO: &str = "chronoloop repro seed 20260921\n\
+const LOSSY_REPRO: &str = "chronoloop repro quorum seed 20260921\n\
      failed at step 13: round 3 lost quorum\n\
      chronoloop faults\n\
      loss 4 in 4 on node 0 -> node 2 from 10.000000000s until 15.000000001s\n\
@@ -102,6 +102,7 @@ fn reduced(faults: &str) -> Repro {
     .unwrap_or_else(|| panic!("seed {SEED} held up under the schedule it was given"));
 
     Repro::new(
+        System::Quorum,
         SEED,
         reduction.schedule().clone(),
         reduction.outcome().clone(),

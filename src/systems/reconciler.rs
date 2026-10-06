@@ -80,9 +80,9 @@ use std::rc::Rc;
 
 use crate::clock::{Clock, VirtualTime};
 use crate::executor::Executor;
-use crate::fault::FaultSchedule;
+use crate::fault::{Fault, FaultSchedule, Window};
 use crate::history::Entry;
-use crate::net::{Link, Network, NodeId, VirtualNetwork};
+use crate::net::{Link, Network, NodeId, Odds, VirtualNetwork};
 use crate::outcome::{Outcome, Reason, ReasonError};
 use crate::rng::{Rng, SeededRng};
 use crate::store::StateStore;
@@ -133,6 +133,24 @@ const TIMELINE: &[(u64, &str, &str, &[&str])] = &[
     (22, "orders", "east", &["south"]),
     (23, "users", "east", &["south"]),
 ];
+
+/// How many faults [`drawn_faults`] draws for a seed.
+const TROUBLE: usize = 6;
+
+/// How long a drawn fault lasts, before it is cut short at [`HEALED_BY`].
+const TROUBLE_LASTS: RangeInclusive<Duration> =
+    Duration::from_millis(100)..=Duration::from_secs(10);
+
+/// The odds a drawn loss drops a message at are some number of these, never none and never all.
+const TENTHS: u32 = 10;
+
+/// How many of the controller's last passes a drawn schedule leaves alone.
+///
+/// A controller owes convergence once the trouble stops and not before, so a schedule that is still
+/// cutting the way to the server on the last pass is asking for a failure nobody could avoid. Three
+/// clear passes is a choice about the **passes** — enough for a pass to look, a pass to act on what
+/// it saw and one more to spare — and nothing about it knows what the timeline asks for or when.
+const CLEAR_PASSES: u64 = 3;
 
 /// The field holding whether a database's data has been destroyed.
 const LOST: &str = "lost";
@@ -781,6 +799,83 @@ pub fn run(seed: u64, faults: &FaultSchedule) -> Result<(Trace, StateStore, Outc
     let outcome = verdict(&observed)?;
     let (steps, store) = collect(observed)?;
     Ok((Trace::new(seed, steps), store, outcome))
+}
+
+/// Draws a schedule of trouble for the run of `seed`, knowing nothing about what the run is for.
+///
+/// This is what lets a sweep look for a failure **blind**. A schedule written by hand is written by
+/// someone who knows where the failure is; this one knows only what any run of this system has —
+/// two nodes and the link between them, and when the controller's passes are — and draws
+/// [`TROUBLE`] faults onto that: each on one direction of the link, each an outage or a loss at some
+/// odds, each starting anywhere from the beginning and lasting between a tenth of a second and ten.
+/// Every one is over by the time the last [`CLEAR_PASSES`] passes open, because a controller owes
+/// convergence once trouble stops and not while it is still going on. Nothing in it is drawn from,
+/// or tuned against, the timeline of what is wanted.
+///
+/// The draws come from a generator of their own: the **third** value the run's root generator
+/// yields, after the network's and the server's. A run never draws a third, so no history recorded
+/// before this existed moves; and the schedule is not the same stream as anything in the run it is
+/// thrown at, which would correlate the trouble with what the trouble lands on. For each fault, in
+/// order: which direction, then outage or loss, then the odds if a loss, then when it starts, then
+/// how long it lasts. That order is part of every schedule this hands back, the way the order of the
+/// draws in a send is part of every history.
+///
+/// ```
+/// use chronoloop::systems::reconciler;
+///
+/// let faults = reconciler::drawn_faults(31);
+///
+/// assert_eq!(faults.len(), 6);
+/// assert_eq!(faults, reconciler::drawn_faults(31));
+/// ```
+pub fn drawn_faults(seed: u64) -> FaultSchedule {
+    let mut seeds = SeededRng::from_seed(seed);
+    // The network's and the server's, in the order `observe` takes them.
+    seeds.next_u64();
+    seeds.next_u64();
+    let mut rng = SeededRng::from_seed(seeds.next_u64());
+
+    let links = [
+        (NodeId::from_index(0), NodeId::from_index(1)),
+        (NodeId::from_index(1), NodeId::from_index(0)),
+    ];
+    let healed = opens(PASSES + 1 - CLEAR_PASSES).as_nanos();
+    let last = u64::try_from(links.len() - 1).unwrap_or(0);
+    let faults = (0..TROUBLE)
+        .map(|_| {
+            // The index is drawn below the array's length, so it is always in range; the fallback is
+            // capped by the line it is on rather than trusted.
+            let (from, to) = usize::try_from(rng.range(0..=last))
+                .ok()
+                .and_then(|index| links.get(index).copied())
+                .unwrap_or(links[0]);
+            let loss = if rng.chance(1, 2) {
+                // Drawn strictly between none and all, so `Odds::new` has nothing to refuse.
+                let numerator = u32::try_from(rng.range(1..=u64::from(TENTHS - 1))).unwrap_or(1);
+                Some(Odds::new(numerator, TENTHS).unwrap_or(Odds::always()))
+            } else {
+                None
+            };
+            let start = rng.range(0..=healed - 1);
+            let end = start
+                .saturating_add(as_nanos(rng.duration_in(TROUBLE_LASTS)))
+                .min(healed);
+            let during = Window::new(VirtualTime::from_nanos(start), VirtualTime::from_nanos(end))
+                // `end` is at least `start`: it is `start` plus a length, capped at an instant
+                // `start` was drawn below.
+                .unwrap_or(Window::forever_from(VirtualTime::from_nanos(start)));
+            match loss {
+                None => Fault::Partition { from, to, during },
+                Some(odds) => Fault::Loss {
+                    from,
+                    to,
+                    during,
+                    odds,
+                },
+            }
+        })
+        .collect();
+    FaultSchedule::new(faults)
 }
 
 /// Runs the whole thing and returns what the server wrote down.
@@ -1667,5 +1762,68 @@ mod tests {
         ] {
             assert!(messages.contains(&expected), "{expected} in {messages:?}");
         }
+    }
+
+    /// The faults drawn for seed 5, recorded from an actual draw.
+    ///
+    /// Pinned rather than compared with a second draw, which would be the same function asked
+    /// twice: this is what holds the order of the draws — direction, kind, odds, start, length — and
+    /// which of the run's root values the schedule is drawn from.
+    const DRAWN_FOR_5: &str = "chronoloop faults\n\
+loss 9 in 10 on node 1 -> node 0 from 23.548411241s until 28.168587270s\n\
+loss 2 in 10 on node 1 -> node 0 from 7.462983351s until 10.234732660s\n\
+partition on node 0 -> node 1 from 10.466233633s until 17.164792136s\n\
+partition on node 0 -> node 1 from 25.751580658s until 30.000000000s\n\
+loss 8 in 10 on node 0 -> node 1 from 5.307097372s until 11.168506268s\n\
+partition on node 0 -> node 1 from 1.121021899s until 9.976940227s\n";
+
+    #[test]
+    fn a_seed_draws_the_faults_it_was_recorded_drawing() {
+        assert_eq!(drawn_faults(5).to_string(), DRAWN_FOR_5);
+    }
+
+    #[test]
+    fn different_seeds_draw_different_trouble() {
+        // Compared as faults rather than as text, though a schedule's text names no seed: the habit
+        // costs nothing and the day it does name one is not the day to remember.
+        let drawn: BTreeSet<String> = (0..50)
+            .map(|seed| format!("{:?}", drawn_faults(seed).faults()))
+            .collect();
+        assert_eq!(drawn.len(), 50);
+    }
+
+    #[test]
+    fn drawn_trouble_stays_on_the_link_and_is_over_before_the_last_passes() {
+        // What a controller is owed: trouble only where trouble can be, and none once the last
+        // passes open. Five hundred seeds of drawing, which costs no runs at all.
+        let healed = opens(PASSES + 1 - CLEAR_PASSES);
+        assert_eq!(healed, VirtualTime::from_nanos(30_000_000_000));
+        let link = [
+            (NodeId::from_index(0), NodeId::from_index(1)),
+            (NodeId::from_index(1), NodeId::from_index(0)),
+        ];
+        let mut kinds = BTreeSet::new();
+        for seed in 0..500 {
+            let drawn = drawn_faults(seed);
+            assert_eq!(drawn.len(), TROUBLE, "seed {seed}");
+            for fault in drawn.faults() {
+                let (from, to, during) = match fault {
+                    Fault::Partition { from, to, during } => {
+                        kinds.insert("partition");
+                        (*from, *to, *during)
+                    }
+                    Fault::Loss {
+                        from, to, during, ..
+                    } => {
+                        kinds.insert("loss");
+                        (*from, *to, *during)
+                    }
+                };
+                assert!(link.contains(&(from, to)), "seed {seed}: {fault}");
+                assert!(during.end() <= healed, "seed {seed}: {fault}");
+                assert!(during.start() < during.end(), "seed {seed}: {fault}");
+            }
+        }
+        assert_eq!(kinds.len(), 2, "both kinds are drawn");
     }
 }

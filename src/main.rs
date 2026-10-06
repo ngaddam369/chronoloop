@@ -11,6 +11,11 @@
 //! holds a later run to it. Those four are one pipeline read left to right — a sweep finds a seed, a
 //! reduction makes its schedule readable, and a repro is what outlives the process that found it.
 //!
+//! The reconciler has the same pipeline with the schedule taken out of the asker's hands: `hunt`
+//! runs a range of seeds each under trouble drawn from the seed itself, and `corner --seed <n>`
+//! cuts the trouble drawn for one of them down to what broke it. A repro names the system it is of,
+//! so `reproduce` reads either kind and runs the one the file names.
+//!
 //! In all three families the recorded side and the re-run side are separate processes reading a
 //! file. A check whose two sides both came from one run would only be comparing a pure function
 //! with itself.
@@ -33,6 +38,11 @@
 //! shape of what is printed, which is one command answering two questions. `replay` is the same
 //! argument one file further on — it reports whether the entries matched, where a repro asks
 //! whether the failure came back, and a repro is no more a recording than a trace is.
+//!
+//! The reconciler's commands are new verbs rather than a flag on the coordinator's for the same
+//! reason: one system per command. `reproduce` is the one exception, and not by a flag — the file
+//! names its system, the way a trace's header names what produces it, and what is printed is the
+//! same shape for either.
 //!
 //! # A trace is read by running again what it names
 //!
@@ -61,7 +71,7 @@ use chronoloop::repro::{ParseReproError, Repro, ReproError};
 use chronoloop::shrink::shrink;
 use chronoloop::store::StateStore;
 use chronoloop::sweep::{Survey, sweep};
-use chronoloop::systems::{RunError, pingpong, quorum, ring};
+use chronoloop::systems::{RunError, System, pingpong, reconciler, ring};
 use chronoloop::trace::{ParseTraceError, Step, Trace};
 
 /// Deterministic simulation of infrastructure control loops.
@@ -121,7 +131,7 @@ enum Command {
         #[arg(long)]
         seed: u64,
     },
-    /// Run many seeds under a schedule of faults, and say which of them broke.
+    /// Run the coordinator over many seeds under a schedule of faults, and say which of them broke.
     Sweep {
         /// How many seeds to run, counting up from zero.
         #[arg(long)]
@@ -145,7 +155,8 @@ enum Command {
         #[arg(long)]
         faults: PathBuf,
     },
-    /// Cut a failing run's faults down to the ones that caused it, and write the repro.
+    /// Cut a failing run of the coordinator's faults down to the ones that caused it, and write the
+    /// repro.
     Shrink {
         /// The seed every choice in the run is drawn from.
         #[arg(long)]
@@ -156,8 +167,26 @@ enum Command {
     },
     /// Run again what a repro names, and check the failure it expects still comes back.
     Reproduce {
-        /// A repro written earlier by `shrink`.
+        /// A repro written earlier by `shrink` or by `corner`.
         path: PathBuf,
+    },
+    /// Run the reconciler over many seeds, each under faults drawn from it, and say which broke.
+    Hunt {
+        /// How many seeds to run, counting up from zero.
+        #[arg(long)]
+        seeds: NonZeroU64,
+        /// How many seeds to run at once.
+        ///
+        /// A cost rather than a choice, exactly as it is for `sweep`.
+        #[arg(long, default_value = "1")]
+        jobs: NonZeroUsize,
+    },
+    /// Cut the faults drawn for one of the reconciler's seeds down to the ones that broke it, and
+    /// write the repro.
+    Corner {
+        /// The seed the run and its faults are both drawn from.
+        #[arg(long)]
+        seed: u64,
     },
 }
 
@@ -503,7 +532,7 @@ fn schedule(path: &Path) -> Result<FaultSchedule, CliError> {
 ///
 /// A run that broke leaves as an error, because the question asked was whether it held up.
 fn checked(seed: u64, faults: &FaultSchedule) -> Result<String, CliError> {
-    let (_, _, outcome) = quorum::run(seed, faults)?;
+    let outcome = System::Quorum.run(seed, faults)?;
     match Broke::new(seed, outcome) {
         None => Ok(format!(
             "seed {seed}: held up under {} faults\n",
@@ -526,36 +555,64 @@ fn swept(
     jobs: NonZeroUsize,
     faults: &FaultSchedule,
 ) -> Result<String, CliError> {
+    let survey = sweep(seeds, jobs, |seed| System::Quorum.run(seed, faults))?;
+    held_up(survey, |count| {
+        format!("swept {count} seeds under {} faults", faults.len())
+    })
+}
+
+/// Runs the reconciler for every seed below `seeds`, each under the faults drawn from it, and says
+/// which of them broke.
+///
+/// The blind half of the reconciler's pipeline: nothing about the faults is chosen by whoever asks,
+/// so a seed this finds is one the trouble found rather than one somebody aimed it at. Otherwise
+/// [`swept`] in every respect, bad news included.
+fn hunted(seeds: NonZeroU64, jobs: NonZeroUsize) -> Result<String, CliError> {
     let survey = sweep(seeds, jobs, |seed| {
-        quorum::run(seed, faults).map(|(_, _, outcome)| outcome)
+        System::Reconciler.run(seed, &reconciler::drawn_faults(seed))
     })?;
+    held_up(survey, |count| {
+        format!("hunted {count} seeds under faults drawn from each")
+    })
+}
+
+/// What a sweep says once it has finished: good news if nothing broke, the survey as bad news if
+/// anything did.
+///
+/// `opening` says what was swept, given how many seeds were.
+fn held_up(survey: Survey, opening: impl FnOnce(u64) -> String) -> Result<String, CliError> {
     if survey.broke().is_empty() {
-        return Ok(format!(
-            "swept {} seeds under {} faults: every one held up\n",
-            survey.swept(),
-            faults.len()
-        ));
+        return Ok(format!("{}: every one held up\n", opening(survey.swept())));
     }
     Err(CliError::SomeSeedsBroke(survey))
 }
 
-/// Cuts `faults` down to what the failure needs, and writes the repro that is left.
+/// Cuts `faults` down to what `system`'s failure needs, and writes the repro that is left.
 ///
 /// A run that held up is refused rather than answered with the schedule it was given: there is no
 /// failure to reduce, and a repro naming a run that held up is one nothing could ever honour.
-fn reduced(seed: u64, faults: &FaultSchedule) -> Result<String, CliError> {
-    let reduction = shrink(faults, |candidate| {
-        quorum::run(seed, candidate).map(|(_, _, outcome)| outcome)
-    })?
-    .ok_or(CliError::NothingToReduce { seed })?;
+fn reduced(system: System, seed: u64, faults: &FaultSchedule) -> Result<String, CliError> {
+    let reduction = shrink(faults, |candidate| system.run(seed, candidate))?
+        .ok_or(CliError::NothingToReduce { seed })?;
     // The outcome is the *reduced* run's, so the step it names is a step of the run this repro
     // produces rather than of the run that went in.
     let repro = Repro::new(
+        system,
         seed,
         reduction.schedule().clone(),
         reduction.outcome().clone(),
     )?;
     Ok(repro.to_string())
+}
+
+/// Cuts the faults drawn for the reconciler's seed `seed` down to what its failure needs, and writes
+/// the repro that is left.
+///
+/// The second half of [`hunted`]: a hunt names a seed, and the faults that broke it are the ones
+/// drawn from it, so the seed is all this needs. The repro carries the faults themselves rather than
+/// the seed they were drawn from, so it does not depend on how they were drawn.
+fn cornered(seed: u64) -> Result<String, CliError> {
+    reduced(System::Reconciler, seed, &reconciler::drawn_faults(seed))
 }
 
 /// Runs again what the repro `text` names, and checks the failure it expects still comes back.
@@ -566,7 +623,9 @@ fn reduced(seed: u64, faults: &FaultSchedule) -> Result<String, CliError> {
 fn reproduced(text: &str) -> Result<String, CliError> {
     let repro: Repro = text.parse()?;
     let seed = repro.seed();
-    let (_, _, produced) = quorum::run(seed, repro.faults())?;
+    // The file names its system, and that is the system run: a repro of one system run against
+    // another would fail to reproduce and read as the bug having gone away.
+    let produced = repro.system().run(seed, repro.faults())?;
     if !produced.reproduces(repro.expected()) {
         return Err(CliError::NotReproduced {
             seed,
@@ -683,8 +742,10 @@ fn execute(command: &Command) -> Result<String, CliError> {
             faults,
         } => swept(*seeds, *jobs, &schedule(faults)?),
         Command::Check { seed, faults } => checked(*seed, &schedule(faults)?),
-        Command::Shrink { seed, faults } => reduced(*seed, &schedule(faults)?),
+        Command::Shrink { seed, faults } => reduced(System::Quorum, *seed, &schedule(faults)?),
         Command::Reproduce { path } => reproduced(&read(path)?),
+        Command::Hunt { seeds, jobs } => hunted(*seeds, *jobs),
+        Command::Corner { seed } => cornered(*seed),
     }
 }
 
@@ -900,6 +961,21 @@ mod tests {
                 argv: &["chronoloop", "reproduce", "bug.repro"],
                 want: "Reproduce { path: \"bug.repro\" }",
             },
+            Accepted {
+                name: "a hunt over a range of seeds on several workers",
+                argv: &["chronoloop", "hunt", "--seeds", "500", "--jobs", "8"],
+                want: "Hunt { seeds: 500, jobs: 8 }",
+            },
+            Accepted {
+                name: "a hunt that says nothing about workers, which is one of them",
+                argv: &["chronoloop", "hunt", "--seeds", "500"],
+                want: "Hunt { seeds: 500, jobs: 1 }",
+            },
+            Accepted {
+                name: "a seed's drawn faults cut down",
+                argv: &["chronoloop", "corner", "--seed", "5"],
+                want: "Corner { seed: 5 }",
+            },
         ]);
     }
 
@@ -1043,6 +1119,44 @@ mod tests {
             Refused {
                 name: "a repro that is not named",
                 argv: &["chronoloop", "reproduce"],
+            },
+            Refused {
+                name: "a hunt with no range to hunt over",
+                argv: &["chronoloop", "hunt"],
+            },
+            Refused {
+                name: "a hunt of no seeds, which would hold up by having run nothing",
+                argv: &["chronoloop", "hunt", "--seeds", "0"],
+            },
+            Refused {
+                name: "a hunt on no workers",
+                argv: &["chronoloop", "hunt", "--seeds", "500", "--jobs", "0"],
+            },
+            Refused {
+                name: "a hunt handed faults, which it draws for itself",
+                argv: &[
+                    "chronoloop",
+                    "hunt",
+                    "--seeds",
+                    "500",
+                    "--faults",
+                    "run.faults",
+                ],
+            },
+            Refused {
+                name: "a cornering of no particular seed",
+                argv: &["chronoloop", "corner"],
+            },
+            Refused {
+                name: "a cornering handed faults, which it draws for itself",
+                argv: &[
+                    "chronoloop",
+                    "corner",
+                    "--seed",
+                    "5",
+                    "--faults",
+                    "run.faults",
+                ],
             },
         ]);
     }
@@ -1488,7 +1602,7 @@ mod tests {
 
     /// What `shrink` writes for the six faults above.
     fn shrunk() -> String {
-        reduced(QUORUM_SEED, &faults(FAULTS))
+        reduced(System::Quorum, QUORUM_SEED, &faults(FAULTS))
             .unwrap_or_else(|e| panic!("seed {QUORUM_SEED} breaks under those faults: {e}"))
     }
 
@@ -1539,7 +1653,7 @@ mod tests {
     fn faults_a_run_holds_up_under_have_no_failure_to_reduce() {
         // Not the schedule handed back as though it had been reduced, and not a repro naming a run
         // that passed — which `Repro::new` would refuse anyway. There is nothing here to cut down.
-        let refused = reduced(HOLDS_UP, &faults(LOSSY))
+        let refused = reduced(System::Quorum, HOLDS_UP, &faults(LOSSY))
             .err()
             .unwrap_or_else(|| panic!("seed {HOLDS_UP} holds up under those faults"));
 
@@ -1646,13 +1760,100 @@ mod tests {
             .unwrap_or_else(|| panic!("the survey holds the failures it counted"))
             .seed();
         assert!(
-            reduced(seed, &lossy).is_ok(),
+            reduced(System::Quorum, seed, &lossy).is_ok(),
             "seed {seed} broke under these faults, so there is a reduction of it"
         );
         assert!(
             checked(seed, &lossy).is_err(),
             "and it is the same failure `check` would have reported for it"
         );
+    }
+
+    /// The lowest seed whose own drawn faults cost the reconciler a database's data.
+    const HUNTED: u64 = 5;
+
+    /// What `corner` writes for [`HUNTED`].
+    fn cornered_text() -> String {
+        cornered(HUNTED)
+            .unwrap_or_else(|e| panic!("seed {HUNTED} breaks under its own faults: {e}"))
+    }
+
+    #[test]
+    fn hunting_says_which_seeds_broke_and_says_so_when_none_did() {
+        // Both sides of the one question `hunt` asks. Every seed below the one it finds holds up
+        // under the faults drawn for it, which is what makes the range below a range a fixed
+        // reconciler and this one answer differently over.
+        assert_eq!(
+            hunted(range(HUNTED), workers(2)).unwrap_or_else(|e| panic!("{e}")),
+            "hunted 5 seeds under faults drawn from each: every one held up\n"
+        );
+
+        let found = hunted(range(HUNTED + 1), workers(2))
+            .err()
+            .unwrap_or_else(|| panic!("seed {HUNTED} loses data under its own faults"));
+        assert_eq!(
+            found.to_string(),
+            "1 of 6 seeds broke\n  seed 5: failed at step 16: lost data",
+            "the count, and then the seed to hand to `corner`"
+        );
+    }
+
+    #[test]
+    fn cornering_writes_a_repro_of_the_reconciler() {
+        let written = cornered_text();
+        let repro: Repro = written
+            .parse()
+            .unwrap_or_else(|e| panic!("what `corner` writes is a repro: {e}"));
+
+        assert_eq!(repro.system(), System::Reconciler);
+        assert_eq!(repro.seed(), HUNTED);
+        assert!(
+            repro.faults().len() < reconciler::drawn_faults(HUNTED).len(),
+            "{} faults were drawn and {} came out",
+            reconciler::drawn_faults(HUNTED).len(),
+            repro.faults().len()
+        );
+        assert!(
+            reproduced(&written).is_ok(),
+            "and the failure it names is the one the faults it kept produce"
+        );
+    }
+
+    #[test]
+    fn a_seed_whose_drawn_faults_break_nothing_has_nothing_to_corner() {
+        let refused = cornered(0)
+            .err()
+            .unwrap_or_else(|| panic!("seed 0 holds up under its own faults"));
+
+        assert_eq!(
+            refused.to_string(),
+            "seed 0 held up under the faults it was given, so there is nothing to reduce"
+        );
+    }
+
+    #[test]
+    fn a_repro_is_run_against_the_system_it_names() {
+        // Each repro, its header made to name the other system, is a repro the other system does
+        // not reproduce — so `reproduce` reaching one system for both would turn one of these red.
+        // The coordinator's six faults cut node 0 off from three replicas, which the controller,
+        // being node 0 and talking to node 1 alone, takes as a pass that goes nowhere; and the
+        // reconciler's one fault leaves every round of the coordinator its quorum.
+        let swaps = [
+            (shrunk(), "repro quorum seed", "repro reconciler seed"),
+            (
+                cornered_text(),
+                "repro reconciler seed",
+                "repro quorum seed",
+            ),
+        ];
+        for (written, from, to) in swaps {
+            assert!(reproduced(&written).is_ok(), "{written}");
+            let elsewhere = written.replacen(from, to, 1);
+            assert!(
+                matches!(reproduced(&elsewhere), Err(CliError::NotReproduced { .. })),
+                "{elsewhere}"
+            );
+        }
     }
 
     #[test]

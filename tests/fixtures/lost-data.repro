@@ -1,0 +1,4 @@
+chronoloop repro reconciler seed 5
+failed at step 17: lost data
+chronoloop faults
+loss 8 in 10 on node 0 -> node 1 from 5.877789004s until 10.000000001s

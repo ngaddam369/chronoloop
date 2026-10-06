@@ -70,7 +70,7 @@ struct Covered {
 }
 
 /// Every command the binary offers, paired with a case here.
-static COVERED: [Covered; 10] = [
+static COVERED: [Covered; 12] = [
     Covered {
         command: "run",
         case: "a_run_of_one_seed_writes_the_same_bytes_every_time",
@@ -110,6 +110,14 @@ static COVERED: [Covered; 10] = [
     Covered {
         command: "reproduce",
         case: "a_repro_the_binary_wrote_puts_a_later_run_through_the_same_failure",
+    },
+    Covered {
+        command: "hunt",
+        case: "hunting_names_every_seed_its_own_faults_broke_and_fails",
+    },
+    Covered {
+        command: "corner",
+        case: "cornering_a_hunted_seed_writes_the_committed_repro",
     },
 ];
 
@@ -377,7 +385,7 @@ fn a_failing_run_that_cannot_be_asked_about_fails_and_says_why() {
         Refused {
             name: "a file that is not a repro",
             args: vec!["reproduce".to_owned(), arg(&unreadable).to_owned()],
-            mentions: "chronoloop repro seed",
+            mentions: "chronoloop repro <system> seed",
         },
         Refused {
             name: "a sweep on no workers, which would never run anything",
@@ -596,7 +604,7 @@ const FAULTS: &str = "chronoloop faults\n\
                       partition on node 0 -> node 3 from 15.000000000s until 20.000000000s\n";
 
 /// The repro reducing it produces, recorded from an actual run.
-const REPRO: &str = "chronoloop repro seed 20260921\n\
+const REPRO: &str = "chronoloop repro quorum seed 20260921\n\
                      failed at step 14: round 3 lost quorum\n\
                      chronoloop faults\n\
                      partition on node 0 -> node 1 from 15.000000000s until 15.000000001s\n\
@@ -690,7 +698,7 @@ fn shrinking_a_failing_run_writes_the_repro_it_reduces_to() {
     assert_eq!(stdout(&shrunk), REPRO);
     assert_eq!(
         stdout(&shrunk).len(),
-        295,
+        302,
         "a failing run of a five-node system, in under a third of a kilobyte"
     );
 }
@@ -803,7 +811,7 @@ fn shrinking_the_repro_a_shrink_wrote_writes_the_same_repro() {
         // The seed goes back in off the file the first command wrote, so what is run again is what
         // the artifact says rather than what this file happens to know.
         let seed = header
-            .strip_prefix("chronoloop repro seed ")
+            .strip_prefix("chronoloop repro quorum seed ")
             .unwrap_or_else(|| panic!("{}: a repro's header names its seed: {header}", case.name));
         let again = scratch_file(&format!("{}.tail", case.file), tail);
 
@@ -947,5 +955,47 @@ fn a_seed_a_sweep_found_is_a_seed_the_rest_of_the_family_takes() {
         stdout(&reproduced).starts_with(&format!("seed {seed}: failed at step ")),
         "the repro puts the seed the sweep found back through its failure: {}",
         stdout(&reproduced)
+    );
+}
+
+/// The reconciler's repro the headline rests on, as `corner` wrote it and as it is committed.
+const LOST_DATA: &str = include_str!("fixtures/lost-data.repro");
+
+#[test]
+fn hunting_names_every_seed_its_own_faults_broke_and_fails() {
+    // Both sides of the one question `hunt` asks, as `sweep` asks it: the five seeds below the one
+    // it finds hold up, which is good news on standard output; six include it, which is bad news on
+    // standard error, naming the seed to hand to `corner`.
+    let clear = chronoloop(&["hunt", "--seeds", "5", "--jobs", "2"]);
+    assert!(clear.status.success(), "{}", stderr(&clear));
+    assert_eq!(
+        stdout(&clear),
+        "hunted 5 seeds under faults drawn from each: every one held up\n"
+    );
+
+    let found = chronoloop(&["hunt", "--seeds", "6", "--jobs", "2"]);
+    assert!(!found.status.success(), "a seed that lost data is bad news");
+    assert_eq!(stdout(&found), "");
+    assert_eq!(
+        stderr(&found),
+        "chronoloop: 1 of 6 seeds broke\n  seed 5: failed at step 16: lost data\n"
+    );
+}
+
+#[test]
+fn cornering_a_hunted_seed_writes_the_committed_repro() {
+    // The seed a hunt named goes in, and the committed fixture comes out byte for byte — the same
+    // text `tests/headline.rs` reaches through the library, reached here through a process. Then a
+    // third process reads it back off a file and runs the system its header names.
+    let cornered = chronoloop(&["corner", "--seed", "5"]);
+    assert!(cornered.status.success(), "{}", stderr(&cornered));
+    assert_eq!(stdout(&cornered), LOST_DATA);
+
+    let path = scratch_file("lost-data.repro", &stdout(&cornered));
+    let reproduced = chronoloop(&["reproduce", arg(&path)]);
+    assert!(reproduced.status.success(), "{}", stderr(&reproduced));
+    assert_eq!(
+        stdout(&reproduced),
+        "seed 5: failed at step 17: lost data, as the repro expects\n"
     );
 }

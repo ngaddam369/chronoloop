@@ -9,6 +9,7 @@ CLAUDE.md
 # Simulation artifacts
 /traces
 *.repro
+!/tests/fixtures/*.repro
 
 # mdBook build output
 docs/book/

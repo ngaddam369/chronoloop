@@ -93,9 +93,9 @@
 //! without, and the failure the run under them produces — which is what turns a schedule a sweep
 //! threw at a run into a repro a person can read.
 //!
-//! A reduction dies with the process that made it, and a [`Repro`] is what outlives one: the seed, the
-//! faults the failure could not do without, and the failure to expect out the other end, written to a
-//! file of a few hundred bytes and read back. It invents no form of its own — the failure is an
+//! A reduction dies with the process that made it, and a [`Repro`] is what outlives one: the system
+//! it is of, the seed, the faults the failure could not do without, and the failure to expect out
+//! the other end, written to a file of a few hundred bytes and read back. It invents no form of its own — the failure is an
 //! [`Outcome`] as an outcome writes itself, and everything under it is a [`FaultSchedule`] as a
 //! schedule writes itself, header and all, so the tail of a repro file is a schedule file. A failing
 //! run of a five-node system comes to under a third of a kilobyte, which is small enough to commit as
@@ -126,8 +126,16 @@
 //! primary — so a run held up on its way there can take the old primary away before the new one has
 //! caught up.
 //!
+//! Nothing has to be told that for it to be found. [`drawn_faults`] throws each seed its own trouble
+//! on the link between controller and server — drawn from the seed, knowing only the link and when
+//! the passes are, and over before the last of them — and a sweep of the reconciler under it finds
+//! seeds that lose the data, and nothing else. The lowest of them cuts down to one fault: a stretch
+//! of loss eating the first pass's creates, the very thing a schedule written by hand would have had
+//! to know to aim at.
+//!
 //! [`fork`]: fork::fork
 //! [`ring`]: systems::ring
+//! [`drawn_faults`]: systems::reconciler::drawn_faults
 //! [`quorum`]: systems::quorum
 //! [`reconciler`]: systems::reconciler
 //!
