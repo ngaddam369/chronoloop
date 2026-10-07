@@ -1190,11 +1190,11 @@ fn asked(world: &World) -> BTreeMap<u64, (VirtualTime, Option<VirtualTime>)> {
 }
 
 /// The value of the field of `resource` called `field`, if it has one.
+///
+/// A `field` that is not a name is a field no resource has: every name asked for here is built
+/// from the same parts the run writes its fields with.
 fn field<'a>(resource: &'a Resource, field: &str) -> Option<&'a Value> {
-    resource
-        .fields()
-        .find(|(name, _)| name.as_str() == field)
-        .map(|(_, value)| value)
+    resource.get(&Name::new(field).ok()?)
 }
 
 /// Whether no two replicas led the same term.
