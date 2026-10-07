@@ -488,6 +488,32 @@ const SEND_ONLY: &str = "chronoloop faults\n\
                          partition on node 5 -> node 7 from 1.000000000s until 20.000000000s\n\
                          partition on node 6 -> node 7 from 1.000000000s until 20.000000000s\n";
 
+/// Node 5, which leads the first term of [`SEED`]'s run, hearing from no other replica from three
+/// seconds to nine while everything it sends still arrives, and while the clients still reach it.
+const DEAF_LEADER: &str = "chronoloop faults\n\
+                           partition on node 3 -> node 5 from 3.000000000s until 9.000000000s\n\
+                           partition on node 4 -> node 5 from 3.000000000s until 9.000000000s\n\
+                           partition on node 6 -> node 5 from 3.000000000s until 9.000000000s\n\
+                           partition on node 7 -> node 5 from 3.000000000s until 9.000000000s\n";
+
+/// Every link the run has, both ways, losing half of what is sent on it from one second to
+/// fifteen: clients and replicas alike, so the clients' asking and the answers they wait for are
+/// lost as often as the replicas' copies, votes and the answers to each.
+///
+/// Over by fifteen seconds, so the last round's commands and everything owed before them have
+/// fifteen seconds of a dependable wire to commit in — the convergence a run is held to is owed
+/// once trouble stops, not while it goes on.
+fn lossy() -> FaultSchedule {
+    let lines: Vec<String> = (0..8_u64)
+        .flat_map(|from| (0..8_u64).map(move |to| (from, to)))
+        .filter(|(from, to)| from != to)
+        .map(|(from, to)| {
+            format!("loss 1 in 2 on node {from} -> node {to} from 1.000000000s until 15.000000000s")
+        })
+        .collect();
+    faults(&format!("chronoloop faults\n{}\n", lines.join("\n")))
+}
+
 /// How many whole seconds [`deposing`] keeps a leader from its followers.
 const DEPOSED_FOR: u64 = 6;
 
@@ -735,6 +761,47 @@ fn a_replica_that_can_send_and_cannot_hear_deposes_nobody() {
 }
 
 #[test]
+fn a_leader_that_can_send_and_cannot_hear_keeps_its_followers_and_commits_nothing() {
+    // The half of the deaf replica's failure the module says it does not handle: with no
+    // check-quorum, a leader nobody's answers reach goes on leading. Its heartbeats arrive, so no
+    // follower's timer runs out and nobody stands; the clients reach it and it takes what they
+    // send, so it has entries it would commit; and no follower's word that it holds them ever
+    // comes back. Pinned so the module's account of itself goes red the day it stops being true:
+    // a leader made by hand to step down on a heartbeat no majority answered turns this red, as
+    // does one that commits on taking a command. What was in flight when the cut began still
+    // lands, so the window opens a wire's crossing after it.
+    let (trace, outcome) = runs(SEED, &faults(DEAF_LEADER));
+    assert_eq!(
+        leading(&trace, 3 * SECOND),
+        Some("node-5"),
+        "the replica the schedule makes deaf is the one leading when it begins"
+    );
+    let during: Vec<&str> = trace
+        .steps()
+        .iter()
+        .filter(|step| (3_100_000_000..HEALED).contains(&step.event().at().as_nanos()))
+        .map(|step| step.event().message())
+        .collect();
+    assert!(
+        during
+            .iter()
+            .any(|message| message.starts_with("node-5 took command ")),
+        "node 5 took commands while it could not hear: {during:?}"
+    );
+    assert_eq!(
+        first_to(&during, " committed through "),
+        None,
+        "and nobody committed any of them: {during:?}"
+    );
+    assert_eq!(
+        elected(&trace, 3 * SECOND..HEALED).next(),
+        None,
+        "nor did anyone else lead, since every follower went on hearing node 5"
+    );
+    assert_eq!(outcome, Outcome::Pass, "{trace}");
+}
+
+#[test]
 fn a_deposed_leader_with_a_longer_log_from_an_older_term_asks_and_is_refused() {
     // The vote's other half from the isolation's: node 7 came back holding less than anyone, and
     // node 5 comes back here holding more, from a term since gone by. Both are behind, by the
@@ -803,7 +870,7 @@ fn last_number(message: &str) -> Option<u64> {
 
 #[test]
 #[ignore = "a sweep of two thousand five hundred runs; `make local-validation` runs it in both profiles"]
-fn every_invariant_holds_on_every_seed_with_or_without_a_partition() {
+fn every_invariant_holds_on_every_seed_with_or_without_faults() {
     // The before and after on one range: under the vote that asked nothing of the candidate's log,
     // 475 of these seeds lost committed entries under the isolation. A pass is the verdict's word
     // that all four invariants held at every step — one leader a term, no committed entry changed,
@@ -813,9 +880,14 @@ fn every_invariant_holds_on_every_seed_with_or_without_a_partition() {
     // what any run did, and every seed holding up means a run cut off from its seed holds up too.
     // The pinned trace is what feels the seed, and the cases above on the isolation and the
     // stranded leader are what say a stale replica is still put up for election at all.
+    //
+    // Loss is the one schedule that holds a replica to asking again after its question went
+    // unanswered: made to stay silent instead, 336 of these seeds fail under loss and none under
+    // any partition here.
     let schedules = [
         ("the isolation", faults(ISOLATED)),
         ("the replica that cannot hear", faults(SEND_ONLY)),
+        ("half of every message lost", lossy()),
     ];
     for (name, schedule) in schedules {
         let swept = survey(SWEEP, |seed| {
