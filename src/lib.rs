@@ -147,6 +147,8 @@
 //! each becomes an [`Outcome`] — so a reduction, a repro and a sweep take it as they are. The
 //! reconciler is judged that way itself: its verdict is two invariants over the world it recorded,
 //! that no wanted database loses its data and that the loop does not end short of what was asked.
+//! So is the coordinator, with one invariant a round named for its round, so that a failure moved
+//! to another round by a reduction is still told apart from the one it started as.
 //!
 //! The reconciler is a control loop, and [`replog`] is there to show the engine is not shaped around
 //! one: a replicated log, Raft-shaped, with five replicas electing a leader and three clients

@@ -26,12 +26,14 @@
 //! and it is what keeps the round a failure falls in from moving when the schedule around it is cut
 //! down.
 //!
-//! # The outcome comes out of what the run wrote down
+//! # The outcome comes out of what the run recorded
 //!
-//! A task has nowhere to report a failure to, so the coordinator records what it observed and the
-//! verdict is read off that same list afterwards, beside the steps that are read off it. The step
-//! an [`Outcome::Fail`] names is therefore a step the trace has, by construction rather than by
-//! agreement between two pieces of code.
+//! The coordinator keeps no notes of its own about how a round went. It records each round's count
+//! and whether it reached a quorum in the world, beside everything else it knows, and the verdict is
+//! its [`Invariant`]s checked over the trace and store the run leaves behind — one safety promise a
+//! round, named for its round, so a failure still says which round it was and a reduction that moved
+//! the failure to another round has found a different one. The step an [`Outcome::Fail`] names is
+//! therefore a step the trace has, because [`invariant::check`] names nothing else.
 
 use core::cell::RefCell;
 use core::ops::RangeInclusive;
@@ -42,6 +44,7 @@ use crate::clock::{Clock, VirtualTime};
 use crate::executor::Executor;
 use crate::fault::FaultSchedule;
 use crate::history::Entry;
+use crate::invariant::{self, Invariant};
 use crate::net::{Link, Network, NodeId, VirtualNetwork};
 use crate::outcome::{Outcome, Reason, ReasonError};
 use crate::rng::{Rng, SeededRng};
@@ -103,15 +106,10 @@ fn opens(round: u64) -> VirtualTime {
 }
 
 /// Something the coordinator wrote down, and the state the run was in once it had.
-///
-/// `lost` is the round this observation closed below a quorum, if it closed one at all. The verdict
-/// and the steps are both read off the same list of these, which is what makes the step a failure
-/// names one the trace has.
 struct Observation {
     at: VirtualTime,
     message: String,
     world: World,
-    lost: Option<u64>,
 }
 
 /// The names a run writes, made once up front so no task is left holding a name it cannot make.
@@ -184,10 +182,10 @@ impl Names {
 /// Returns [`RunError`] if the simulation could not finish, or if the run wrote down something that
 /// could not be read back.
 pub fn run(seed: u64, faults: &FaultSchedule) -> Result<(Trace, StateStore, Outcome), RunError> {
-    let observed = observe(seed, faults)?;
-    let outcome = verdict(&observed)?;
-    let (steps, store) = collect(observed)?;
-    Ok((Trace::new(seed, steps), store, outcome))
+    let (steps, store) = collect(observe(seed, faults)?)?;
+    let trace = Trace::new(seed, steps);
+    let outcome = verdict(&trace, &store)?;
+    Ok((trace, store, outcome))
 }
 
 /// Runs the whole thing and returns what the coordinator wrote down.
@@ -285,7 +283,6 @@ async fn ask<C, N>(
                 format!("{} acknowledged round {round}", replica.as_str()),
                 replica,
                 names.acknowledged(round, at),
-                None,
             );
         }
 
@@ -296,9 +293,6 @@ async fn ask<C, N>(
             format!("round {round} closed with {acks} of {REPLICAS} acknowledgements"),
             names.coordinator.clone(),
             names.closed(round, acks),
-            // What the round is judged on, written down with it rather than worked out afterwards
-            // from the text: the verdict and the steps then come off one list.
-            (acks < QUORUM).then_some(round),
         );
     }
 }
@@ -322,19 +316,13 @@ fn write(
     message: String,
     name: Name,
     resource: Resource,
-    lost: Option<u64>,
 ) {
     let mut log = observations.borrow_mut();
     let mut world = log
         .last()
         .map_or_else(World::new, |last: &Observation| last.world.clone());
     world.insert(name, resource);
-    log.push(Observation {
-        at,
-        message,
-        world,
-        lost,
-    });
+    log.push(Observation { at, message, world });
 }
 
 /// A replica: answer whatever is asked, and stop once the wire has been quiet long enough.
@@ -354,19 +342,71 @@ where
     }
 }
 
-/// Reads the run's verdict off what it wrote down: the first round that closed below a quorum.
-fn verdict(observed: &[Observation]) -> Result<Outcome, ReasonError> {
-    let Some((step, round)) = observed
-        .iter()
-        .enumerate()
-        .find_map(|(step, seen)| seen.lost.map(|round| (step, round)))
+/// Whether the coordinator's record leaves round `N` standing: either it closed with a quorum, or
+/// the record is of some other round.
+///
+/// Read off a recorded world. The coordinator's resource holds the last round it closed and whether
+/// that round reached a quorum, overwritten as each round closes, so the only world that breaks this
+/// is one standing right after round `N` closed short — and the step that wrote it is the step the
+/// round closed at. Replicas carry a round too, and are not asked: a round's quorum is the
+/// coordinator's to count.
+fn reached<const N: u64>(world: &World) -> bool {
+    let Some(coordinator) = Name::new(COORDINATOR)
+        .ok()
+        .and_then(|name| world.get(&name))
     else {
-        return Ok(Outcome::Pass);
+        return true;
     };
-    Ok(Outcome::Fail {
-        reason: Reason::new(format!("round {round} lost quorum"))?,
-        step,
-    })
+    let field = |field: &str| {
+        Name::new(field)
+            .ok()
+            .and_then(|name| coordinator.get(&name))
+    };
+    field(ROUND) != Some(&Value::Count(N)) || field(REACHED) != Some(&Value::Flag(false))
+}
+
+/// What the coordinator promises of each round, in round order: [`reached`] for round one, then
+/// two, and so on.
+///
+/// One promise a round rather than one for the run, because a failure is the same failure only
+/// when its reason is: a reduction that moved the failure from round three to round four has found
+/// a different failure, and a reason naming no round could not tell. Held to [`ROUNDS`] by the
+/// assertion after it, so a change to how many rounds there are that leaves this list behind does
+/// not compile.
+const HELD: [fn(&World) -> bool; 5] = [
+    reached::<1>,
+    reached::<2>,
+    reached::<3>,
+    reached::<4>,
+    reached::<5>,
+];
+
+const _: () = assert!(HELD.len() as u64 == ROUNDS, "one promise for every round");
+
+/// The coordinator's promises as invariants, each a **safety** promise named for its round, so a
+/// breach reads exactly as the round it is about.
+fn invariants() -> Result<Vec<Invariant>, ReasonError> {
+    (1..)
+        .zip(HELD)
+        .map(|(round, held)| {
+            Ok(Invariant::safety(
+                Reason::new(format!("round {round} lost quorum"))?,
+                held,
+            ))
+        })
+        .collect()
+}
+
+/// Judges the run by its invariants, read off the trace and the store it recorded.
+///
+/// [`invariant::check`] orders breaches by step, and a round closes after every round before it, so
+/// the first breach is the first round that closed short.
+fn verdict(trace: &Trace, store: &StateStore) -> Result<Outcome, RunError> {
+    let broken = invariant::check(trace, store, &invariants()?)?;
+    Ok(broken
+        .into_iter()
+        .next()
+        .map_or(Outcome::Pass, Outcome::from))
 }
 
 /// Turns what the run observed into steps, keeping every state it passed through in a store.
@@ -455,6 +495,78 @@ mod tests {
     }
 
     #[test]
+    fn each_rounds_invariant_breaks_only_on_the_world_that_round_closed_short_in() {
+        // Hand-built worlds, so the expectation is reached without running the coordinator: the
+        // invariant for round `n` reads the coordinator's own record, and only a record of round
+        // `n` closing below a quorum breaks it.
+        struct Case {
+            name: &'static str,
+            world: World,
+            broken: Option<usize>,
+        }
+        let names = Names::new().unwrap_or_else(|e| panic!("every name is a name: {e}"));
+        let closed = |round, acks| {
+            let mut world = World::new();
+            world.insert(names.coordinator.clone(), names.closed(round, acks));
+            world
+        };
+        let promises = invariants().unwrap_or_else(|e| panic!("every reason is a reason: {e}"));
+        for (round, promise) in (1..=ROUNDS).zip(&promises) {
+            assert_eq!(
+                promise.name().as_str(),
+                format!("round {round} lost quorum"),
+                "the invariants are in round order and each names its round"
+            );
+        }
+
+        let cases = [
+            Case {
+                name: "nothing closed yet",
+                world: World::new(),
+                broken: None,
+            },
+            Case {
+                name: "round 3 closed with a quorum",
+                world: closed(3, QUORUM),
+                broken: None,
+            },
+            Case {
+                name: "round 3 closed one short",
+                world: closed(3, QUORUM - 1),
+                broken: Some(2),
+            },
+            Case {
+                name: "the last round closed with nothing",
+                world: closed(ROUNDS, 0),
+                broken: Some(usize::try_from(ROUNDS - 1).unwrap_or(usize::MAX)),
+            },
+            Case {
+                name: "a replica carrying a round, which is not the coordinator's record",
+                world: {
+                    let mut world = World::new();
+                    world.insert(names.replicas[0].clone(), names.acknowledged(3, opens(3)));
+                    world
+                },
+                broken: None,
+            },
+        ];
+        for case in cases {
+            let broken: Vec<usize> = HELD
+                .iter()
+                .enumerate()
+                .filter(|(_, held)| !held(&case.world))
+                .map(|(index, _)| index)
+                .collect();
+            assert_eq!(
+                broken,
+                case.broken.into_iter().collect::<Vec<_>>(),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
     fn a_round_that_loses_a_majority_of_its_replicas_loses_quorum() {
         // Three of five cut off leaves two answering, which is one short of a majority.
         let cut = REPLICAS - QUORUM + 1;
@@ -525,8 +637,9 @@ mod tests {
 
     #[test]
     fn the_step_a_failure_names_is_a_step_the_trace_has() {
-        // The verdict and the steps are read off one list, so this holds by construction. It is
-        // pinned because the construction is what a later reader would be tempted to take apart.
+        // The verdict is read off the trace and store the run returns, so this holds by
+        // construction. It is pinned because the construction is what a later reader would be
+        // tempted to take apart.
         let (trace, store, outcome) = runs(
             SEED,
             &cutting(REPLICAS, Window::forever_from(VirtualTime::ZERO)),

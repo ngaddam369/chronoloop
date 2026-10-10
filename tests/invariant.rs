@@ -5,15 +5,16 @@
 //! off, a store the run filled itself — and asks whether a judgement that knows nothing but the
 //! recorded world lands where the system's own verdict does.
 //!
-//! That agreement is the point of every case here, and it is only worth anything because the two
-//! sides take **different routes**. The coordinator's verdict is read off notes it kept for itself
-//! while it ran. The controller's is its own invariants, checked by this same checker, but over
-//! predicates written in its module; the ones below are written here, from what the module docs say
-//! the world holds, and share no code with them. A checker naming the wrong step, or the wrong state,
-//! or reading a world the store did not hold, disagrees with the coordinator's verdict, which never
-//! saw it — and for the controller, a predicate reading the world wrong disagrees with the other
-//! one. What the controller's side cannot catch is a fault in the checker itself, since both of its
-//! routes run through it; the coordinator's cases are the ones here that hold the checker.
+//! That agreement is the point of every case here, and it is worth what the two sides' routes
+//! differ by. Both systems' verdicts are their own invariants, checked by this same checker, but
+//! over predicates written in their modules; the ones below are written here, from what the module
+//! docs say the world holds, and share no code with them. A predicate reading the world wrong on
+//! either side disagrees with the other one. What these cases **cannot** catch is a fault in the
+//! checker itself, since both routes run through it — the coordinator's verdict used to be read off
+//! notes it kept for itself, and that was the route that held the checker here, until its verdict
+//! became its invariants too. The checker is held elsewhere now: by its own unit tests on traces
+//! built by hand, and by the coordinator's pinned outcomes in `tests/outcome.rs`, `tests/cli.rs`,
+//! `tests/shrink.rs` and `tests/repro.rs`, every one of which a checker naming the wrong step moves.
 //!
 //! What none of it pins is the content of any one run: each expectation is the run's own verdict,
 //! so a change upstream that moved every step would move both sides alike. Pinned histories live in
