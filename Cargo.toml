@@ -54,3 +54,10 @@ pedantic = { level = "deny", priority = -1 }
 module_name_repetitions = "allow" # clock::VirtualClock reads better than clock::Virtual
 missing_errors_doc = "allow"      # re-enable once the error taxonomy settles
 must_use_candidate = "allow"      # would demand #[must_use] on nearly every constructor
+
+# The portable hasher is the whole cost of a debug run: every step's state is hashed, and unoptimised
+# it took four fifths of a replicated-log run. Optimising this one crate in the dev profile leaves
+# chronoloop's own code a true debug build, which is what the debug pass of the gated suite compares
+# against release, and a hash cannot depend on how its function was compiled.
+[profile.dev.package.blake3]
+opt-level = 3
