@@ -10,9 +10,12 @@ build:
 fmt:
 	cargo fmt --all
 
-## lint: run clippy over every target, treating warnings as errors
+## lint: run clippy over every target, and build the docs, both treating warnings as errors
+## Clippy does not run rustdoc, so a doc link to a private item or to nothing at all goes unnoticed
+## by it — and docs.rs renders such a link as dead text.
 lint:
 	cargo clippy --all-targets -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 ## test: run all tests, including doctests (never the benches — those are `make bench`)
 test:
