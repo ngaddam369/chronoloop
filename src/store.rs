@@ -60,10 +60,11 @@ enum Stored {
 /// What the store holds under one name: the node's own contents, its children named rather than
 /// held.
 ///
-/// This is [`Stored`] as a reader sees it, and it is the store's claim made public. [`StateStore::get`]
-/// rebuilds everything under a node, which is the wrong instrument for a walk that means to stop as
-/// soon as two children agree — that walk wants one level at a time, and a child's name is the hash
-/// it answers to, so descending is a second lookup rather than a second copy.
+/// This is the store's private `Stored` as a reader sees it, and it is the store's claim made
+/// public. [`StateStore::get`] rebuilds everything under a node, which is the wrong instrument for
+/// a walk that means to stop as soon as two children agree — that walk wants one level at a time,
+/// and a child's name is the hash it answers to, so descending is a second lookup rather than a
+/// second copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Held<'a> {
     /// A value, as the bytes that stand for it.

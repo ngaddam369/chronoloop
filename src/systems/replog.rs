@@ -62,8 +62,8 @@
 //! wherever the run writes it down — `client-0` to `client-2`, `node-3` to `node-7` — so a fault on
 //! `node 7 -> node 3` is about the replicas the trace calls `node-7` and `node-3`.
 //!
-//! The clients send [`ROUNDS`] rounds of commands, one command each a round, numbered across all
-//! three: client `c`'s command in round `k` is `3(k - 1) + c + 1`. Every client's command in a round
+//! The clients send five rounds (`ROUNDS`) of commands, one command each a round, numbered across
+//! all three: client `c`'s command in round `k` is `3(k - 1) + c + 1`. Every client's command in a round
 //! is sent no earlier than the round's own place on a fixed period, and later only if that client's
 //! command before it is not done yet. A client is sequential on its own and the three overlap with
 //! each other, so each round puts three commands in flight together and the log is free to order

@@ -32,7 +32,7 @@
 //! comparing two counts hold is the merge, not the count. The only thing that notices a sweep
 //! running its seeds one after another is the barrier case below, and it notices by hanging.
 //!
-//! [`tests/audit.rs`]'s scan forbids a thread anywhere in `src/` and `tests/`, and names this file
+//! `tests/audit.rs`'s scan forbids a thread anywhere in `src/` and `tests/`, and names this file
 //! as the single exception, for one rule, in a table that says why.
 
 use core::num::{NonZeroU64, NonZeroUsize};

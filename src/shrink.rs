@@ -77,7 +77,11 @@ impl Reduction {
     }
 }
 
-/// Reduces `faults` to the fewest and smallest that still fail the way they did.
+/// Reduces `faults` to a schedule that still fails the way they did, small but not proven smallest.
+///
+/// What comes back is a schedule from which no single fault can be dropped, with each window
+/// narrowed and each odds lowered by bisection — see the module docs for why a bisection finds a
+/// small value rather than the smallest.
 ///
 /// `run` is the run under reduction with its seed already closed over: it takes a candidate schedule
 /// and says how that run went. Returns [`None`] when the run under `faults` held up, which is a
@@ -299,7 +303,7 @@ where
         Ok(())
     }
 
-    /// Lowers every fault's odds to the fewest occurrences the failure needs.
+    /// Lowers every fault's odds by bisection towards the fewest occurrences the failure needs.
     ///
     /// Only the numerator comes down. The denominator is how many trials the odds are counted in, so
     /// moving it would change the odds in either direction rather than reduce them.

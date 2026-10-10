@@ -18,7 +18,7 @@
 //! **destroys the database's data**, and the world records that as a fact about the database rather
 //! than as something the next pass can undo. The other moves are safe whenever they land: a replica
 //! is created, a standby that has caught up is promoted — and the primary it replaces steps down to
-//! a standby that is, by then, in sync — and a replica nobody wants is taken away.
+//! a standby, in whatever phase it was in — and a replica nobody wants is taken away.
 //!
 //! # Level-triggered, and what that buys
 //!
@@ -910,11 +910,11 @@ pub fn run(seed: u64, faults: &FaultSchedule) -> Result<(Trace, StateStore, Outc
 ///
 /// This is what lets a sweep look for a failure **blind**. A schedule written by hand is written by
 /// someone who knows where the failure is; this one knows only what any run of this system has —
-/// two nodes and the link between them, and when the controller's passes are — and draws
-/// [`TROUBLE`] faults onto that: each on one direction of the link, each an outage or a loss at some
-/// odds, each starting anywhere from the beginning and lasting between a tenth of a second and ten.
-/// Every one is over by the time the last [`CLEAR_PASSES`] passes open, because a controller owes
-/// convergence once trouble stops and not while it is still going on. Nothing in it is drawn from,
+/// two nodes and the link between them, and when the controller's passes are — and draws six
+/// faults (`TROUBLE`) onto that: each on one direction of the link, each an outage or a loss at
+/// some odds, each starting anywhere from the beginning and lasting between a tenth of a second and
+/// ten. Every one is over by the time the last five passes (`CLEAR_PASSES`) open, because a
+/// controller owes convergence once trouble stops and not while it is still going on. Nothing in it is drawn from,
 /// or tuned against, the timeline of what is wanted.
 ///
 /// The draws come from a generator of their own: the **third** value the run's root generator

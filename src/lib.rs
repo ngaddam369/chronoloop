@@ -15,8 +15,8 @@
 //!
 //! - **Time travel** — every step's world state is content-addressed, so a run can be inspected at
 //!   step 37, diffed against step 36, and forked into a new timeline from there.
-//! - **Shrinking** — given a seed that fails, the engine reduces the injected-fault schedule to the
-//!   shortest sequence that still reproduces the failure.
+//! - **Shrinking** — given a seed that fails, the engine reduces the injected-fault schedule to a
+//!   small one that still reproduces the failure: no single fault left in it can be dropped.
 //!
 //! # Prior art
 //!
@@ -37,7 +37,8 @@
 //!
 //! # Status
 //!
-//! What works today is the deterministic core and one system running on it. A run is driven by a
+//! What works today is the deterministic core and the systems that exercise it, met below in the
+//! order the engine needed them. A run is driven by a
 //! [`VirtualClock`] over an [`EventQueue`], polled by a single-threaded [`Executor`], with every
 //! random choice drawn from a [`SeededRng`]; [`pingpong`] is a two-task exchange over that clock,
 //! and its [`Recording`] can be written to a file and replayed against a later run of the engine.
@@ -87,9 +88,9 @@
 //!
 //! And a verdict is what the reduction tests against. [`shrink`] takes a failing run's schedule and
 //! makes it smaller: it drops entries by delta debugging over the list, narrows each window by
-//! bisection towards the span the failure needs, and lowers each odds to the fewest occurrences it
-//! needs, running the system again after every candidate and keeping only those whose run still fails
-//! for the same reason. What comes back is a [`Reduction`] — the faults the failure could not do
+//! bisection towards the span the failure needs, and lowers each odds by bisection towards the
+//! fewest occurrences it needs, running the system again after every candidate and keeping only
+//! those whose run still fails for the same reason. What comes back is a [`Reduction`] — the faults the failure could not do
 //! without, and the failure the run under them produces — which is what turns a schedule a sweep
 //! threw at a run into a repro a person can read.
 //!
@@ -147,11 +148,20 @@
 //! reconciler is judged that way itself: its verdict is two invariants over the world it recorded,
 //! that no wanted database loses its data and that the loop does not end short of what was asked.
 //!
+//! The reconciler is a control loop, and [`replog`] is there to show the engine is not shaped around
+//! one: a replicated log, Raft-shaped, with five replicas electing a leader and three clients
+//! sending it commands. A replica asks whether it could stand before it does — a pre-vote, which
+//! moves no term — and refuses a candidate whose log is behind its own. Its verdict is four
+//! invariants over the world it recorded: never two leaders in one term, never a committed entry
+//! changed, the applied order **linearizable** as the clients saw it, and every command committed
+//! by the end of the run.
+//!
 //! [`fork`]: fork::fork
 //! [`ring`]: systems::ring
 //! [`drawn_faults`]: systems::reconciler::drawn_faults
 //! [`quorum`]: systems::quorum
 //! [`reconciler`]: systems::reconciler
+//! [`replog`]: systems::replog
 //!
 //! [`diff`]: diff::diff
 //! [`list`]: diff::list

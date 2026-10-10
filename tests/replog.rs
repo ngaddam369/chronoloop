@@ -97,7 +97,10 @@ const SWEEP: u64 = 500;
 /// Node 5's timeout runs out first, at 1.96s. It asks whether it could stand, a majority says it
 /// could, and it stands at 2.07s and every other replica votes for it. Its no-op is entry 1, and
 /// each command after it is taken, copied, committed by the leader once three replicas hold it, and
-/// answered — the followers hearing of the commit on the next heartbeat, half a second later. The
+/// answered. A follower hears of a commit with the next copy the leader sends it, which is usually a
+/// wire crossing later, since an acknowledgement that leaves a follower behind is answered with a
+/// fresh copy at once; only the last commit, with nothing after it to copy, waits for the heartbeat
+/// half a second on (node 5 commits through 16 at 10.19s, the others at 10.67s to 10.71s). The
 /// command entries are 2 to 16, and no one stands against node 5 again. Each round's three commands
 /// are taken in whatever order they reach the leader, which is not the order they are numbered in:
 /// command 2 is entry 2 and command 1 entry 3.

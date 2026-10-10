@@ -24,8 +24,9 @@ On top of that determinism:
 
 - **Time travel** — every step's world state is content-addressed, so you can jump to step 37, diff it
   against step 36, and fork a new timeline from there.
-- **Shrinking** — hand it a seed that fails and it reduces the injected-fault schedule to the shortest
-  sequence that still reproduces the failure, emitting a repro artifact of a few hundred bytes.
+- **Shrinking** — hand it a seed that fails and it reduces the injected-fault schedule to a small
+  one that still reproduces the failure, with no single fault left that it can do without, and emits a
+  repro artifact of a few hundred bytes.
 
 ## Prior art
 

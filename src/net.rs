@@ -448,9 +448,11 @@ impl<R: Rng> Wire<R> {
             .unwrap_or(&self.default_link)
             .clone();
         // A fault says what the odds are while it lasts; the link says what they are otherwise.
-        // Either way the draw happens, so injecting one cannot change how much of the seed a send
-        // consumes — a run under faults would otherwise diverge from one without for reasons that
-        // have nothing to do with the faults.
+        // Either way the odds are drawn against the same way, so a fault whose odds are the link's
+        // own spends exactly what the link would have — a run carrying a harmless fault would
+        // otherwise diverge from one without for reasons that have nothing to do with the fault.
+        // What a send spends still depends on what the draws decide: a lost message draws no delay,
+        // and odds that are certain, n in n, are decided without drawing at all.
         let loss = self.faults.loss(from, to, now).unwrap_or(link.loss);
         if loss.draw(&mut self.rng) {
             return Sent::Nothing;
