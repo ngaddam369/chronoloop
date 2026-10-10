@@ -9,6 +9,8 @@ use rand::Rng as _;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
+use crate::clock::VirtualTime;
+
 /// What a system may ask the simulation for when it needs a random choice.
 ///
 /// A system under test names this capability rather than reaching for a generator of its own, so
@@ -116,15 +118,10 @@ impl Rng for SeededRng {
     ///
     /// Panics if the range is back to front.
     fn duration_in(&mut self, bounds: RangeInclusive<Duration>) -> Duration {
-        let low = nanos_of(*bounds.start());
-        let high = nanos_of(*bounds.end());
+        let low = VirtualTime::ZERO.saturating_add(*bounds.start()).as_nanos();
+        let high = VirtualTime::ZERO.saturating_add(*bounds.end()).as_nanos();
         Duration::from_nanos(self.range(low..=high))
     }
-}
-
-/// The duration in nanoseconds, capped at the end of virtual time.
-fn nanos_of(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl From<u64> for SeededRng {

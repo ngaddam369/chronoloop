@@ -228,7 +228,9 @@ const DONE: &str = "-done";
 
 /// Returns the instant the commands of round `round` may be sent from.
 fn opens(round: u64) -> VirtualTime {
-    VirtualTime::from_nanos(round.saturating_mul(as_nanos(PERIOD)))
+    VirtualTime::from_nanos(
+        round.saturating_mul(VirtualTime::ZERO.saturating_add(PERIOD).as_nanos()),
+    )
 }
 
 /// Returns the number of the command the client at `client` sends in round `round`, counting
@@ -244,23 +246,7 @@ fn numbered(round: u64, client: usize) -> u64 {
 
 /// Returns the instant every loop stops at.
 fn stop() -> VirtualTime {
-    VirtualTime::from_nanos(as_nanos(STOP))
-}
-
-/// Returns `duration` as a whole number of nanoseconds, capped at the end of virtual time.
-fn as_nanos(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-/// Returns how long there is left until `deadline`, which is nothing once it has passed.
-fn until(now: VirtualTime, deadline: VirtualTime) -> Duration {
-    Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
-}
-
-/// Returns the instant `duration` after `at`, capped at the end of virtual time.
-fn after(at: VirtualTime, duration: Duration) -> VirtualTime {
-    at.checked_add(duration)
-        .unwrap_or(VirtualTime::from_nanos(u64::MAX))
+    VirtualTime::ZERO.saturating_add(STOP)
 }
 
 /// Returns what the replica at `index` among the replicas is called: its node number, which comes
@@ -1479,11 +1465,11 @@ async fn replicate<C, R, N>(
         format!("{} started as a follower in term 0", node(replica.me)),
         Change::Replica(replica.me, replica.recorded.clone()),
     );
-    let mut timer = after(clock.now(), rng.duration_in(ELECTION));
+    let mut timer = clock.now().saturating_add(rng.duration_in(ELECTION));
     while clock.now() < end {
         let wake = timer.min(end);
         let out = match clock
-            .timeout(until(clock.now(), wake), endpoint.recv())
+            .timeout(wake.saturating_duration_since(clock.now()), endpoint.recv())
             .await
         {
             Ok(delivery) => {
@@ -1507,8 +1493,8 @@ async fn replicate<C, R, N>(
         }
         match out.rearm {
             Rearm::Keep => {}
-            Rearm::Heartbeat => timer = after(now, HEARTBEAT),
-            Rearm::Election => timer = after(now, rng.duration_in(ELECTION)),
+            Rearm::Heartbeat => timer = now.saturating_add(HEARTBEAT),
+            Rearm::Election => timer = now.saturating_add(rng.duration_in(ELECTION)),
         }
     }
 }
@@ -1551,7 +1537,7 @@ async fn submit<C, N>(
                 clock,
                 endpoint,
                 command,
-                after(clock.now(), PATIENCE).min(end),
+                clock.now().saturating_add(PATIENCE).min(end),
             )
             .await
             {
@@ -1585,7 +1571,10 @@ where
 {
     loop {
         let delivery = clock
-            .timeout(until(clock.now(), deadline), endpoint.recv())
+            .timeout(
+                deadline.saturating_duration_since(clock.now()),
+                endpoint.recv(),
+            )
             .await
             .ok()?;
         if let Message::Submitted {
@@ -3261,10 +3250,9 @@ mod tests {
                 .into_iter()
                 .filter(|(at, _)| {
                     // Anything already on its way in at five seconds may still land.
-                    *at > after(
-                        VirtualTime::from_nanos(5_000_000_000),
-                        Duration::from_millis(100),
-                    ) && *at < VirtualTime::from_nanos(15_000_000_000)
+                    *at > VirtualTime::from_nanos(5_000_000_000)
+                        .saturating_add(Duration::from_millis(100))
+                        && *at < VirtualTime::from_nanos(15_000_000_000)
                 })
                 .collect();
             assert!(

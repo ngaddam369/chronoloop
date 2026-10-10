@@ -471,8 +471,7 @@ impl<R: Rng> Wire<R> {
 /// virtual clock can represent.
 fn landing(now: VirtualTime, link: &Link, rng: &mut impl Rng) -> VirtualTime {
     let delay = rng.duration_in(link.latency.clone());
-    now.checked_add(delay)
-        .unwrap_or(VirtualTime::from_nanos(u64::MAX))
+    now.saturating_add(delay)
 }
 
 /// A network of nodes and the links between them, every decision drawn from one generator.

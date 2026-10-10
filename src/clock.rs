@@ -23,6 +23,10 @@ impl VirtualTime {
     /// The start of the simulation.
     pub const ZERO: Self = Self(0);
 
+    /// The end of virtual time: the last instant it can represent, where anything reaching past it
+    /// is capped.
+    pub const MAX: Self = Self(u64::MAX);
+
     /// Creates an instant `nanos` nanoseconds after the start of the simulation.
     pub const fn from_nanos(nanos: u64) -> Self {
         Self(nanos)
@@ -37,6 +41,42 @@ impl VirtualTime {
     pub fn checked_add(self, duration: Duration) -> Option<Self> {
         let nanos = u64::try_from(duration.as_nanos()).ok()?;
         self.0.checked_add(nanos).map(Self)
+    }
+
+    /// Returns the instant `duration` after `self`, capped at [`VirtualTime::MAX`].
+    ///
+    /// A wait reaching past the end of virtual time ends there rather than wrapping round to its
+    /// start, which is what every deadline a system arms wants:
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use chronoloop::clock::VirtualTime;
+    ///
+    /// let now = VirtualTime::from_nanos(5);
+    /// assert_eq!(now.saturating_add(Duration::from_nanos(7)), VirtualTime::from_nanos(12));
+    /// assert_eq!(now.saturating_add(Duration::MAX), VirtualTime::MAX);
+    /// ```
+    #[must_use]
+    pub fn saturating_add(self, duration: Duration) -> Self {
+        self.checked_add(duration).unwrap_or(Self::MAX)
+    }
+
+    /// Returns how long after `earlier` this instant is, which is nothing if `earlier` is the later
+    /// of the two — so a deadline asked how long is left once it has passed answers nothing.
+    ///
+    /// ```
+    /// use core::time::Duration;
+    /// use chronoloop::clock::VirtualTime;
+    ///
+    /// let deadline = VirtualTime::from_nanos(10);
+    /// let left = deadline.saturating_duration_since(VirtualTime::from_nanos(3));
+    /// assert_eq!(left, Duration::from_nanos(7));
+    /// let passed = deadline.saturating_duration_since(VirtualTime::from_nanos(12));
+    /// assert_eq!(passed, Duration::ZERO);
+    /// ```
+    #[must_use]
+    pub fn saturating_duration_since(self, earlier: Self) -> Duration {
+        Duration::from_nanos(self.0.saturating_sub(earlier.0))
     }
 }
 
@@ -233,11 +273,7 @@ pub trait Clock {
     /// # Ok::<(), ExecutorError>(())
     /// ```
     fn sleep(&self, duration: Duration) -> Self::Sleep {
-        let deadline = self
-            .now()
-            .checked_add(duration)
-            .unwrap_or(VirtualTime::from_nanos(u64::MAX));
-        self.sleep_until(deadline)
+        self.sleep_until(self.now().saturating_add(duration))
     }
 
     /// Returns a future that runs `future`, giving up on it once `duration` has gone by.
@@ -452,6 +488,102 @@ mod tests {
                 VirtualTime::from_nanos(case.start)
                     .checked_add(case.duration)
                     .map(VirtualTime::as_nanos),
+                case.want,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn saturating_add_stops_at_the_end_of_virtual_time() {
+        struct Case {
+            name: &'static str,
+            start: u64,
+            duration: Duration,
+            want: u64,
+        }
+        let cases = [
+            Case {
+                name: "an ordinary step forward",
+                start: 5,
+                duration: Duration::from_nanos(7),
+                want: 12,
+            },
+            Case {
+                name: "exactly reaches the end",
+                start: u64::MAX - 1,
+                duration: Duration::from_nanos(1),
+                want: u64::MAX,
+            },
+            Case {
+                name: "one past the end",
+                start: u64::MAX,
+                duration: Duration::from_nanos(1),
+                want: u64::MAX,
+            },
+            Case {
+                name: "a duration wider than u64 nanoseconds, from the start",
+                start: 0,
+                duration: Duration::from_secs(u64::MAX),
+                want: u64::MAX,
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                VirtualTime::from_nanos(case.start)
+                    .saturating_add(case.duration)
+                    .as_nanos(),
+                case.want,
+                "{}",
+                case.name
+            );
+        }
+        assert_eq!(
+            VirtualTime::MAX.as_nanos(),
+            u64::MAX,
+            "the end is the last nanosecond"
+        );
+    }
+
+    #[test]
+    fn saturating_duration_since_is_nothing_once_the_earlier_instant_is_later() {
+        struct Case {
+            name: &'static str,
+            later: u64,
+            earlier: u64,
+            want: Duration,
+        }
+        let cases = [
+            Case {
+                name: "time left before a deadline",
+                later: 10,
+                earlier: 3,
+                want: Duration::from_nanos(7),
+            },
+            Case {
+                name: "the deadline itself",
+                later: 10,
+                earlier: 10,
+                want: Duration::ZERO,
+            },
+            Case {
+                name: "a deadline already passed",
+                later: 3,
+                earlier: 10,
+                want: Duration::ZERO,
+            },
+            Case {
+                name: "the whole of virtual time",
+                later: u64::MAX,
+                earlier: 0,
+                want: Duration::from_nanos(u64::MAX),
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                VirtualTime::from_nanos(case.later)
+                    .saturating_duration_since(VirtualTime::from_nanos(case.earlier)),
                 case.want,
                 "{}",
                 case.name

@@ -78,3 +78,50 @@ fn a_system_written_against_the_clock_capability_runs_on_the_engine() {
     executor.run().expect("the run finishes");
     assert_eq!(*attempts.borrow(), [0, SECOND, 3 * SECOND, 7 * SECOND]);
 }
+
+#[test]
+fn a_deadline_kept_in_virtual_time_is_met_exactly_however_the_wait_is_split() {
+    // The arithmetic a control loop does on every pass: fix a deadline once, do some work, and wait
+    // out whatever is left of it. Reached through the executor's clock rather than by constructing
+    // instants, so the methods are held to what a running system sees.
+    let mut executor = Executor::new();
+    let seen: Rc<RefCell<Vec<(VirtualTime, Duration)>>> = Rc::default();
+    let handle = executor.handle();
+    let recorded = Rc::clone(&seen);
+    executor.spawn(async move {
+        let deadline = handle.now().saturating_add(Duration::from_secs(5));
+        handle.sleep(Duration::from_secs(2)).await;
+        let left = deadline.saturating_duration_since(handle.now());
+        handle.sleep(left).await;
+        recorded.borrow_mut().push((handle.now(), left));
+        // Once it has passed, nothing is left, rather than a wait that wraps around.
+        handle.sleep(Duration::from_secs(1)).await;
+        recorded.borrow_mut().push((
+            handle.now(),
+            deadline.saturating_duration_since(handle.now()),
+        ));
+    });
+
+    executor.run().expect("the run finishes");
+    assert_eq!(
+        *seen.borrow(),
+        [
+            (
+                VirtualTime::from_nanos(5_000_000_000),
+                Duration::from_secs(3)
+            ),
+            (VirtualTime::from_nanos(6_000_000_000), Duration::ZERO),
+        ]
+    );
+}
+
+#[test]
+fn a_sleep_past_the_end_of_virtual_time_ends_there() {
+    let mut executor = Executor::new();
+    let handle = executor.handle();
+    executor.spawn(async move {
+        handle.sleep(Duration::MAX).await;
+    });
+    executor.run().expect("the run finishes");
+    assert_eq!(executor.handle().now(), VirtualTime::MAX);
+}

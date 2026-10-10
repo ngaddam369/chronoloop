@@ -706,23 +706,9 @@ enum Message {
 
 /// Returns the instant pass `pass` opens at.
 fn opens(pass: u64) -> VirtualTime {
-    VirtualTime::from_nanos(pass.saturating_mul(as_nanos(PERIOD)))
-}
-
-/// Returns `duration` as a whole number of nanoseconds, capped at the end of virtual time.
-fn as_nanos(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-/// Returns how long there is left until `deadline`, which is nothing once it has passed.
-fn until(now: VirtualTime, deadline: VirtualTime) -> Duration {
-    Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
-}
-
-/// Returns the instant `duration` after `at`, capped at the end of virtual time.
-fn after(at: VirtualTime, duration: Duration) -> VirtualTime {
-    at.checked_add(duration)
-        .unwrap_or(VirtualTime::from_nanos(u64::MAX))
+    VirtualTime::from_nanos(
+        pass.saturating_mul(VirtualTime::ZERO.saturating_add(PERIOD).as_nanos()),
+    )
 }
 
 /// One change to what is wanted, with its names already made.
@@ -747,7 +733,7 @@ fn timeline() -> Result<Vec<Change>, RunError> {
                 .map(|&standby| region(standby))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Change {
-                at: after(opens(0), Duration::from_secs(seconds)),
+                at: opens(0).saturating_add(Duration::from_secs(seconds)),
                 database: Name::new(database)?,
                 placement: Placement::new(region(primary)?, standbys)?,
             })
@@ -961,14 +947,14 @@ pub fn drawn_faults(seed: u64) -> FaultSchedule {
             } else {
                 None
             };
-            let start = rng.range(0..=healed - 1);
+            let start = VirtualTime::from_nanos(rng.range(0..=healed - 1));
             let end = start
-                .saturating_add(as_nanos(rng.duration_in(TROUBLE_LASTS)))
-                .min(healed);
-            let during = Window::new(VirtualTime::from_nanos(start), VirtualTime::from_nanos(end))
+                .saturating_add(rng.duration_in(TROUBLE_LASTS))
+                .min(VirtualTime::from_nanos(healed));
+            let during = Window::new(start, end)
                 // `end` is at least `start`: it is `start` plus a length, capped at an instant
                 // `start` was drawn below.
-                .unwrap_or(Window::forever_from(VirtualTime::from_nanos(start)));
+                .unwrap_or(Window::forever_from(start));
             match loss {
                 None => Fault::Partition { from, to, during },
                 Some(odds) => Fault::Loss {
@@ -1036,12 +1022,12 @@ where
         // A pass opens on the period rather than whenever the last one finished, so which pass a
         // window of simulated time falls in is not something the run's draws can move.
         let mut at = opens(pass);
-        while after(at, PATIENCE) <= opens(pass + 1) {
+        while at.saturating_add(PATIENCE) <= opens(pass + 1) {
             clock.sleep_until(at).await;
-            if look(clock, endpoint, server, after(at, PATIENCE)).await == 0 {
+            if look(clock, endpoint, server, at.saturating_add(PATIENCE)).await == 0 {
                 break;
             }
-            at = after(clock.now(), REQUEUE);
+            at = clock.now().saturating_add(REQUEUE);
         }
     }
 }
@@ -1060,7 +1046,10 @@ where
     // acting on one would do no harm anyway, which is the point of deciding on what is rather than on
     // what changed.
     let Ok(delivery) = clock
-        .timeout(until(clock.now(), deadline), endpoint.recv())
+        .timeout(
+            deadline.saturating_duration_since(clock.now()),
+            endpoint.recv(),
+        )
         .await
     else {
         return 0;
@@ -1102,7 +1091,7 @@ impl<R: Rng> Server<'_, R> {
         region: &Region,
         bounds: RangeInclusive<Duration>,
     ) {
-        let at = after(now, self.rng.duration_in(bounds));
+        let at = now.saturating_add(self.rng.duration_in(bounds));
         self.due
             .insert((at, self.armed), (database.clone(), region.clone()));
         self.armed += 1;
@@ -1206,7 +1195,7 @@ async fn serve<C, N, R>(
             .into_iter()
             .chain(server.next_due())
             .min();
-        let wait = next.map_or(QUIET, |at| until(clock.now(), at));
+        let wait = next.map_or(QUIET, |at| at.saturating_duration_since(clock.now()));
         let Ok(delivery) = clock.timeout(wait, endpoint.recv()).await else {
             let now = clock.now();
             if let Some(change) = changes.next_if(|change| change.at <= now) {

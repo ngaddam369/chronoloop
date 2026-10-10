@@ -97,17 +97,9 @@ const AT: &str = "at";
 
 /// Returns the instant round `round` opens at.
 fn opens(round: u64) -> VirtualTime {
-    VirtualTime::from_nanos(round.saturating_mul(as_nanos(PERIOD)))
-}
-
-/// Returns `duration` as a whole number of nanoseconds, capped at the end of virtual time.
-fn as_nanos(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-/// Returns how long there is left until `deadline`, which is nothing once it has passed.
-fn until(now: VirtualTime, deadline: VirtualTime) -> Duration {
-    Duration::from_nanos(deadline.as_nanos().saturating_sub(now.as_nanos()))
+    VirtualTime::from_nanos(
+        round.saturating_mul(VirtualTime::ZERO.saturating_add(PERIOD).as_nanos()),
+    )
 }
 
 /// Something the coordinator wrote down, and the state the run was in once it had.
@@ -258,13 +250,14 @@ async fn ask<C, N>(
             endpoint.send(*replica, round);
         }
 
-        let deadline = opens(round)
-            .checked_add(PATIENCE)
-            .unwrap_or(VirtualTime::from_nanos(u64::MAX));
+        let deadline = opens(round).saturating_add(PATIENCE);
         let mut acks = 0;
         while acks < REPLICAS {
             let Ok(ack) = clock
-                .timeout(until(clock.now(), deadline), endpoint.recv())
+                .timeout(
+                    deadline.saturating_duration_since(clock.now()),
+                    endpoint.recv(),
+                )
                 .await
             else {
                 break;

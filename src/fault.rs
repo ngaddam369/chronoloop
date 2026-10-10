@@ -82,7 +82,7 @@ impl Window {
     pub fn forever_from(start: VirtualTime) -> Self {
         Self {
             start,
-            end: VirtualTime::from_nanos(u64::MAX),
+            end: VirtualTime::MAX,
         }
     }
 
@@ -118,14 +118,14 @@ impl Window {
     pub fn holds(&self, at: VirtualTime) -> bool {
         // The end of virtual time is the only instant a window that never closes has to hold, and
         // it is the one instant the half-open rule would leave out.
-        at >= self.start && (at < self.end || self.end == VirtualTime::from_nanos(u64::MAX))
+        at >= self.start && (at < self.end || self.end == VirtualTime::MAX)
     }
 }
 
 impl fmt::Display for Window {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "from {} until ", self.start)?;
-        if self.end == VirtualTime::from_nanos(u64::MAX) {
+        if self.end == VirtualTime::MAX {
             write!(f, "{FOREVER}")
         } else {
             write!(f, "{}", self.end)
