@@ -291,6 +291,7 @@ fn refuses(cases: Vec<Refused>) {
 fn an_invocation_that_cannot_be_carried_out_fails_and_says_why() {
     let missing = PathBuf::from(SCRATCH).join("no-such.history");
     let unreadable = scratch_file("not-a-history.history", "some other tool's output\n");
+    let signed = scratch_file("signed-seed.history", "chronoloop history seed +7\n");
     let reached_twenty = recorded_trace("reached-twenty.trace");
     let already_forked = {
         let forked = chronoloop(&["fork", arg(&reached_twenty), "--at", "7", "--seed", "99"]);
@@ -306,6 +307,11 @@ fn an_invocation_that_cannot_be_carried_out_fails_and_says_why() {
         Refused {
             name: "a file that is not a history",
             args: vec!["replay".to_owned(), arg(&unreadable).to_owned()],
+            mentions: "chronoloop history seed",
+        },
+        Refused {
+            name: "a history whose seed carries a sign, which no history is written with",
+            args: vec!["replay".to_owned(), arg(&signed).to_owned()],
             mentions: "chronoloop history seed",
         },
         Refused {
@@ -362,6 +368,10 @@ fn a_failing_run_that_cannot_be_asked_about_fails_and_says_why() {
     let missing = PathBuf::from(SCRATCH).join("no-such.faults");
     let unreadable = scratch_file("not-a-schedule.faults", "some other tool's output\n");
     let survivable = scratch_file("nothing-to-reduce.faults", LOSSY);
+    let signed = scratch_file(
+        "signed-odds.faults",
+        "chronoloop faults\nloss +1 in 2 on node 0 -> node 1 from 0.000000000s until forever\n",
+    );
     let checking = |faults: &Path| {
         vec![
             "check".to_owned(),
@@ -381,6 +391,11 @@ fn a_failing_run_that_cannot_be_asked_about_fails_and_says_why() {
             name: "a file that is not a schedule of faults",
             args: checking(&unreadable),
             mentions: "chronoloop faults",
+        },
+        Refused {
+            name: "odds carrying a sign, which no schedule is written with",
+            args: checking(&signed),
+            mentions: "line 2: expected a fault",
         },
         Refused {
             name: "a file that is not a repro",

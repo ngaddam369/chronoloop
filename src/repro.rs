@@ -54,6 +54,7 @@
 use core::fmt;
 use core::str::FromStr;
 
+use crate::digits::digits;
 use crate::fault::{self, FaultSchedule, ParseFaultError, ParseScheduleError};
 use crate::outcome::{Outcome, ParseOutcomeError};
 use crate::systems::System;
@@ -66,18 +67,6 @@ const SEED: &str = " seed ";
 
 /// The line a repro's faults begin on, counting its header as line 1.
 const SCHEDULE_AT: usize = 3;
-
-/// Reads a seed the one way a written repro writes one.
-///
-/// Digits and nothing else, so a sign is refused rather than quietly taken for what it precedes.
-/// [`crate::trace`] reads its seed under the same rule; [`crate::history`] does not, and a new
-/// reader should not take up an old reader's defect.
-fn count(text: &str) -> Option<u64> {
-    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    text.parse().ok()
-}
 
 /// Takes the first line off `text`, and hands back what follows it.
 ///
@@ -294,7 +283,7 @@ impl FromStr for Repro {
         let (system, seed) = header
             .strip_prefix(HEADER)
             .and_then(|named| named.split_once(SEED))
-            .and_then(|(system, seed)| Some((system.parse().ok()?, count(seed)?)))
+            .and_then(|(system, seed)| Some((system.parse().ok()?, digits(seed)?)))
             .ok_or(ParseReproError::BadHeader)?;
         let (failure, faults) = line(rest).ok_or(ParseReproError::BadFailure {
             source: ParseOutcomeError::Malformed,

@@ -11,6 +11,7 @@ use core::str::FromStr;
 use std::rc::Rc;
 
 use crate::clock::{Clock, ParseVirtualTimeError, VirtualTime};
+use crate::digits::digits;
 
 /// The first line of a written recording, up to the seed itself.
 const HEADER: &str = "chronoloop history seed ";
@@ -285,7 +286,7 @@ impl FromStr for Recording {
         let header = lines.next().ok_or(ParseRecordingError::MissingHeader)?;
         let seed = header
             .strip_prefix(HEADER)
-            .and_then(|seed| seed.parse().ok())
+            .and_then(digits)
             .ok_or(ParseRecordingError::BadHeader)?;
         let entries = lines
             .enumerate()
@@ -568,6 +569,11 @@ mod tests {
             Case {
                 name: "a seed that is not a number",
                 text: "chronoloop history seed lucky\n",
+                want: ParseRecordingError::BadHeader,
+            },
+            Case {
+                name: "a seed carrying a sign, which no recording writes",
+                text: "chronoloop history seed +7\n",
                 want: ParseRecordingError::BadHeader,
             },
             Case {

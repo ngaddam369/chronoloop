@@ -43,6 +43,8 @@
 use core::fmt;
 use core::str::FromStr;
 
+use crate::digits::digits;
+
 /// How a run that held up is written.
 const PASSED: &str = "passed";
 
@@ -51,18 +53,6 @@ const FAILED_AT: &str = "failed at step ";
 
 /// What stands between a failure's step and its reason.
 const BECAUSE: &str = ": ";
-
-/// Reads a step the one way a written outcome writes one.
-///
-/// Digits and nothing else, so a sign is refused rather than quietly taken for what it precedes:
-/// the text an outcome is read from has to be text an outcome would have written. [`crate::trace`]
-/// reads its step numbers under the same rule.
-fn step(text: &str) -> Option<usize> {
-    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    text.parse().ok()
-}
 
 /// Returned when a reason could not be used as one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,7 +259,7 @@ impl FromStr for Outcome {
         let (at, reason) = failure
             .split_once(BECAUSE)
             .ok_or(ParseOutcomeError::Malformed)?;
-        let at = step(at).ok_or(ParseOutcomeError::Malformed)?;
+        let at = digits::<usize>(at).ok_or(ParseOutcomeError::Malformed)?;
         let reason = Reason::new(reason).map_err(|_| ParseOutcomeError::Malformed)?;
         Ok(Self::Fail { reason, step: at })
     }

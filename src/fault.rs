@@ -17,6 +17,7 @@ use core::fmt;
 use core::str::FromStr;
 
 use crate::clock::{ParseVirtualTimeError, VirtualTime};
+use crate::digits::digits;
 use crate::net::{NodeId, Odds, OddsError};
 
 /// The first line of a written schedule.
@@ -262,13 +263,9 @@ fn node(text: &str) -> Result<NodeId, ParseFaultError> {
     let index = text
         .strip_prefix("node ")
         .ok_or(ParseFaultError::Malformed)?;
-    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(ParseFaultError::Malformed);
-    }
-    index
-        .parse()
+    digits(index)
         .map(NodeId::from_index)
-        .map_err(|_| ParseFaultError::Malformed)
+        .ok_or(ParseFaultError::Malformed)
 }
 
 /// Reads the `from <instant> until <instant>` a fault's window is written as.
@@ -289,10 +286,8 @@ fn window(text: &str) -> Result<Window, ParseFaultError> {
 /// Reads the `<n> in <n>` odds are written as.
 fn odds(text: &str) -> Result<Odds, ParseFaultError> {
     let (numerator, denominator) = text.split_once(" in ").ok_or(ParseFaultError::Malformed)?;
-    let numerator = numerator.parse().map_err(|_| ParseFaultError::Malformed)?;
-    let denominator = denominator
-        .parse()
-        .map_err(|_| ParseFaultError::Malformed)?;
+    let numerator = digits(numerator).ok_or(ParseFaultError::Malformed)?;
+    let denominator = digits(denominator).ok_or(ParseFaultError::Malformed)?;
     Ok(Odds::new(numerator, denominator)?)
 }
 
@@ -660,6 +655,42 @@ mod tests {
                 case.text.parse::<FaultSchedule>(),
                 Err(case.want),
                 "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn reading_a_schedule_refuses_a_sign_on_every_number_it_reads() {
+        // `str::parse` takes `+1` for `1`, and a schedule never writes one, so each number a fault
+        // line carries is read as digits and nothing else. A window's instants are held to the same
+        // rule by `VirtualTime`'s own reader.
+        struct Case {
+            name: &'static str,
+            line: &'static str,
+        }
+        let cases = [
+            Case {
+                name: "a node",
+                line: "partition on node +0 -> node 1 from 0.000000000s until forever",
+            },
+            Case {
+                name: "an odds' count",
+                line: "loss +1 in 2 on node 0 -> node 1 from 0.000000000s until forever",
+            },
+            Case {
+                name: "an odds' trials",
+                line: "loss 1 in +2 on node 0 -> node 1 from 0.000000000s until forever",
+            },
+        ];
+        for case in cases {
+            assert_eq!(
+                format!("chronoloop faults\n{}\n", case.line).parse::<FaultSchedule>(),
+                Err(ParseScheduleError::BadFault {
+                    line: 2,
+                    source: ParseFaultError::Malformed,
+                }),
+                "a sign on {}",
                 case.name
             );
         }

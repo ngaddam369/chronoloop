@@ -191,6 +191,7 @@
 
 pub mod clock;
 pub mod diff;
+mod digits;
 pub mod event;
 pub mod executor;
 pub mod fault;

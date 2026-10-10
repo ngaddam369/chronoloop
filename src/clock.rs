@@ -7,6 +7,8 @@ use core::str::FromStr;
 use core::task::{Context, Poll};
 use core::time::Duration;
 
+use crate::digits::is_digits;
+
 /// Nanoseconds in a second, the scale [`VirtualTime`] is both written and read at.
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
@@ -122,7 +124,7 @@ impl FromStr for VirtualTime {
 
 /// Reads a run of ASCII digits, rejecting a sign or any other character outright.
 fn decimal(text: &str) -> Result<u64, ParseVirtualTimeError> {
-    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+    if !is_digits(text) {
         return Err(ParseVirtualTimeError::Malformed);
     }
     text.parse().map_err(|_| ParseVirtualTimeError::Overflow)

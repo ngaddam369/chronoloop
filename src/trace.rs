@@ -56,6 +56,7 @@ use core::fmt;
 use core::str::FromStr;
 
 use crate::clock::{ParseVirtualTimeError, VirtualTime};
+use crate::digits::digits;
 use crate::fork::Fork;
 use crate::history::Entry;
 use crate::world::{ParseStateHashError, StateHash};
@@ -176,17 +177,6 @@ impl FromStr for Step {
         let event = Entry::new(at, message).map_err(|_| ParseStepError::Malformed)?;
         Ok(Self::new(event, state))
     }
-}
-
-/// Reads a count the one way a written trace writes one.
-///
-/// Digits and nothing else, so a sign is refused rather than quietly taken for what it precedes: the
-/// text a trace is read from has to be text a trace would have written.
-fn count<T: FromStr>(text: &str) -> Option<T> {
-    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    text.parse().ok()
 }
 
 /// What a run passed through, together with the seed that produced it.
@@ -363,7 +353,7 @@ impl FromStr for Trace {
         let header = lines.next().ok_or(ParseTraceError::MissingHeader)?;
         let seed = header
             .strip_prefix(HEADER)
-            .and_then(count)
+            .and_then(digits)
             .ok_or(ParseTraceError::BadHeader)?;
 
         // A fork is written on its own line straight after the header, and only a run that forked
@@ -385,7 +375,7 @@ impl FromStr for Trace {
                 .strip_prefix(STEP)
                 .and_then(|numbered| numbered.split_once(' '))
                 .ok_or(ParseTraceError::Unnumbered { line })?;
-            let number: usize = count(number).ok_or(ParseTraceError::Unnumbered { line })?;
+            let number: usize = digits(number).ok_or(ParseTraceError::Unnumbered { line })?;
             // The numbering is settled before the record is read, so a step in the wrong place is
             // reported as that rather than as whatever its contents turn out to be.
             if number != offset {
@@ -408,7 +398,7 @@ impl FromStr for Trace {
 /// Reads the line a forked trace names its fork on, or nothing if that is not what it is.
 fn read_fork(text: &str) -> Option<Fork> {
     let (at, seed) = text.strip_prefix(FORKED_AT)?.split_once(TO_SEED)?;
-    Some(Fork::new(at.parse().ok()?, count(seed)?))
+    Some(Fork::new(at.parse().ok()?, digits(seed)?))
 }
 
 #[cfg(test)]
