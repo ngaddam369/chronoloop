@@ -120,14 +120,15 @@ enum Command {
         /// The step to compare to.
         after: usize,
     },
-    /// Run a recorded trace again, drawing from another seed after one of its steps.
+    /// Run a recorded trace again, drawing from another seed after the instant of one of its steps.
     Fork {
         /// A trace written earlier by `trace`.
         path: PathBuf,
-        /// The step the run stops being the run the trace records, counting from zero.
+        /// The last step that stays the trace's own, counting from zero: the run draws from the new
+        /// seed only after this step's instant, so a later step at the same instant stays too.
         #[arg(long)]
         at: usize,
-        /// The seed everything after that step is drawn from.
+        /// The seed every draw after that step's instant comes from.
         #[arg(long)]
         seed: u64,
     },
@@ -717,7 +718,7 @@ impl Loaded {
         Ok(report)
     }
 
-    /// Runs the trace again, drawing from `seed` after its step numbered `step`.
+    /// Runs the trace again, drawing from `seed` after the instant of its step numbered `step`.
     fn forked(&self, step: usize, seed: u64) -> Result<String, CliError> {
         // A run draws from its own seed until one instant and from one other after it. A second
         // fork would claim the first fork's steps as a prefix it does not have, so it is refused

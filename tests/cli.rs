@@ -537,6 +537,39 @@ fn forking_writes_a_trace_that_says_what_produces_it_again() {
 }
 
 #[test]
+fn the_step_a_fork_is_taken_at_is_the_last_one_the_trace_keeps() {
+    // What `--help` says of `--at`: the step named is kept, byte for byte as the file holds it, and
+    // the new seed takes over only after that step's instant. Read off the file rather than off the
+    // library, so the binary's own handling of the number is what is held.
+    //
+    // Step 8, because it can tell the two readings apart. Most steps record what draws made well
+    // before them decided, so a fork one step early leaves them alone and a case built on one
+    // passes whichever reading the binary takes — step 7, which the case above forks at, is one.
+    // Found by running the binary with `--at` mapped one step early: of this seed's twenty steps,
+    // only 1, 4, 8, 16 and 17 then come back changed. Picked against the code as it stands; a
+    // change that moves the draws can move it, so re-pick by running that mutation again.
+    let path = recorded_trace("forked-at-eight.trace");
+    let forked = chronoloop(&["fork", arg(&path), "--at", "8", "--seed", "99"]);
+    assert!(forked.status.success(), "{}", stderr(&forked));
+
+    let original = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+    let original: Vec<&str> = original.lines().collect();
+    let written = stdout(&forked);
+    let written: Vec<&str> = written.lines().collect();
+    assert_eq!(
+        &written[2..=10],
+        &original[1..=9],
+        "steps 0 to 8 are the trace's own, under the header and the fork line"
+    );
+    assert_ne!(
+        written[2..],
+        original[1..],
+        "and the steps after it are not"
+    );
+}
+
+#[test]
 fn a_fork_back_to_a_traces_own_seed_writes_the_trace_back_out() {
     // The cheapest check on the whole mechanism, made across two processes and a file on disk: a
     // fork that cannot reproduce its own run has nothing to say about any other. The recorded side
