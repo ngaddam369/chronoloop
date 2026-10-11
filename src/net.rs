@@ -96,8 +96,8 @@ impl std::error::Error for OddsError {}
 
 /// How likely something on a link is, as a whole-number ratio.
 ///
-/// The ratio is integers, so no floating-point rounding sits between a seed and a decision, and it
-/// is checked once here rather than every time a draw is made against it.
+/// It is checked once here, so a draw made against it never meets odds that cannot be honoured.
+/// How a draw is decided against a ratio is on [`Rng::chance`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Odds {
     numerator: u32,

@@ -14,8 +14,8 @@ use crate::clock::VirtualTime;
 /// What a system may ask the simulation for when it needs a random choice.
 ///
 /// A system under test names this capability rather than reaching for a generator of its own, so
-/// its choices can only ever come from the run's seed. Every draw is an integer one: no
-/// floating-point rounding sits between a seed and a decision.
+/// its choices can only ever come from the run's seed. A value, a range and a duration are drawn on
+/// integers alone; how a chance is decided is on [`Rng::chance`].
 pub trait Rng {
     /// Draws the next 64-bit value.
     fn next_u64(&mut self) -> u64;
@@ -24,6 +24,12 @@ pub trait Rng {
     fn range(&mut self, bounds: RangeInclusive<u64>) -> u64;
 
     /// Draws `true` with odds of `numerator` in `denominator`.
+    ///
+    /// [`SeededRng`] decides it by comparing one 64-bit draw with a threshold worked out from the
+    /// odds by a single floating-point division, scaled to 2^64 and cut to a whole number. The
+    /// division is correctly rounded, so the threshold is the same on every platform with IEEE 754
+    /// arithmetic and a seed decides the same way on all of them. It is the exact ratio only up to
+    /// that rounding and that cut: odds of `p` are held to within `p`·2^-53 + 2^-64 of `p`.
     fn chance(&mut self, numerator: u32, denominator: u32) -> bool;
 
     /// Draws a duration within `bounds`, both ends included.
