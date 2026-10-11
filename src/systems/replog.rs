@@ -123,6 +123,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use crate::clock::{Clock, VirtualTime};
+use crate::digits::digits;
 use crate::executor::Executor;
 use crate::fault::FaultSchedule;
 use crate::history::Entry;
@@ -289,10 +290,7 @@ impl Op {
         if text == "no-op" {
             return Some(Self::Noop);
         }
-        text.strip_prefix("command ")?
-            .parse()
-            .ok()
-            .map(Self::Command)
+        digits(text.strip_prefix("command ")?).map(Self::Command)
     }
 }
 
@@ -1162,7 +1160,7 @@ fn asked(world: &World) -> BTreeMap<u64, (VirtualTime, Option<VirtualTime>)> {
             else {
                 continue;
             };
-            let (Ok(command), Value::Instant(sent)) = (number.parse(), value) else {
+            let (Some(command), Value::Instant(sent)) = (digits(number), value) else {
                 continue;
             };
             let done = match field(asking, &format!("{COMMAND}{number}{DONE}")) {
@@ -1246,7 +1244,7 @@ fn applied_commands(replica: &Resource) -> Option<Vec<u64>> {
         let Some(at) = name.as_str().strip_prefix(APPLIED) else {
             continue;
         };
-        let (Ok(at), Value::Text(text)) = (at.parse::<u64>(), value) else {
+        let (Some(at), Value::Text(text)) = (digits::<u64>(at), value) else {
             return None;
         };
         applied.insert(at, Op::read(text)?);
@@ -3104,6 +3102,100 @@ mod tests {
         ]
     }
 
+    /// `world` with the field `from` of the resource `owner` written as `to` instead, holding
+    /// `value`.
+    fn rewritten(world: &World, owner: &str, from: &str, to: &str, value: Value) -> World {
+        let mut world = world.clone();
+        let mut resource = world
+            .remove(&name(owner))
+            .unwrap_or_else(|| panic!("{owner} is written down"));
+        resource
+            .remove(&name(from))
+            .unwrap_or_else(|| panic!("{owner} has a field {from}"));
+        resource.insert(name(to), value);
+        world.insert(name(owner), resource);
+        world
+    }
+
+    /// The cases of `each_invariant_breaks_on_the_world_it_is_about_and_holds_on_the_others` about
+    /// a number written the way nothing in this module writes one.
+    ///
+    /// Each starts from a world every promise holds of and puts a sign in front of one number in
+    /// it. A number with a sign is not one the run could have recorded, so it is not taken for the
+    /// number it precedes: read as one, each of these worlds would hold every promise the
+    /// untouched world does.
+    fn foreign_cases() -> Vec<WorldCase> {
+        let sound = written(
+            vec![recorded(vec![command(1, 1)], vec![Op::Command(1)], &[])],
+            &[(0, 1, 1, Some(2))],
+        );
+        let command = |text: &str| Value::Text(text.to_owned());
+        let at = |nanos| Value::Instant(VirtualTime::from_nanos(nanos));
+        let signed_index = rewritten(
+            &rewritten(
+                &sound,
+                "node-3",
+                "applied-0001",
+                "applied-+001",
+                command("command 1"),
+            ),
+            "node-3",
+            "entry-0001-op",
+            "entry-+001-op",
+            command("command 1"),
+        );
+        let signed_op = rewritten(
+            &rewritten(
+                &sound,
+                "node-3",
+                "applied-0001",
+                "applied-0001",
+                command("command +1"),
+            ),
+            "node-3",
+            "entry-0001-op",
+            "entry-0001-op",
+            command("command +1"),
+        );
+        let signed_command = rewritten(
+            &rewritten(
+                &sound,
+                "client-0",
+                "command-0001-sent",
+                "command-+001-sent",
+                at(1),
+            ),
+            "client-0",
+            "command-0001-done",
+            "command-+001-done",
+            at(2),
+        );
+        vec![
+            WorldCase {
+                name: "the world the signed ones are made from",
+                world: sound,
+                broken: &[],
+            },
+            WorldCase {
+                name: "an entry applied at an index written with a sign",
+                world: signed_index,
+                broken: &[Promise::Linearizable],
+            },
+            WorldCase {
+                // Falling short as well: what was applied is not the command the client sent.
+                name: "an entry applied that names its command with a sign",
+                world: signed_op,
+                broken: &[Promise::Linearizable, Promise::Finished],
+            },
+            WorldCase {
+                // Read as no command at all, so the one the replica applied is one no client sent.
+                name: "a command a client sent, numbered with a sign",
+                world: signed_command,
+                broken: &[Promise::Linearizable],
+            },
+        ]
+    }
+
     #[test]
     fn each_invariant_breaks_on_the_world_it_is_about_and_holds_on_the_others() {
         let promises = [
@@ -3112,7 +3204,11 @@ mod tests {
             Promise::Linearizable,
             Promise::Finished,
         ];
-        for case in world_cases().into_iter().chain(order_cases()) {
+        for case in world_cases()
+            .into_iter()
+            .chain(order_cases())
+            .chain(foreign_cases())
+        {
             for promise in promises {
                 assert_eq!(
                     promise.holds(&case.world),
