@@ -1023,3 +1023,24 @@ fn the_committed_lost_data_repro_no_longer_reproduces() {
          produced: passed\n"
     );
 }
+
+#[test]
+fn a_repro_saved_with_carriage_returns_is_the_same_repro() {
+    // The committed file as a checkout converting line endings, or an editor on another system,
+    // would leave it: every line ending `\r\n`. It is still the file the case above reads, so it
+    // gets the same answer rather than a complaint about a header that looks right.
+    assert!(
+        !LOST_DATA.contains('\r'),
+        "the committed file ends lines with `\\n`"
+    );
+    let path = scratch_file("lost-data-crlf.repro", &LOST_DATA.replace('\n', "\r\n"));
+    let reproduced = chronoloop(&["reproduce", arg(&path)]);
+    assert!(!reproduced.status.success(), "the bug is fixed");
+    assert_eq!(stdout(&reproduced), "");
+    assert_eq!(
+        stderr(&reproduced),
+        "chronoloop: seed 5 does not reproduce what the repro names\n  \
+         expected: failed at step 17: lost data\n  \
+         produced: passed\n"
+    );
+}

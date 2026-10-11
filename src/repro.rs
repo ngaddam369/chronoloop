@@ -71,12 +71,16 @@ const SCHEDULE_AT: usize = 3;
 /// Takes the first line off `text`, and hands back what follows it.
 ///
 /// [`None`] means the text has run out, which is what tells a line that is missing from a line that
-/// is empty.
+/// is empty. A line ends at `\n` or `\r\n`, as it does for [`str::lines`] and so for the schedule
+/// read from what follows: a carriage return anywhere else stays in the line.
 fn line(text: &str) -> Option<(&str, &str)> {
     if text.is_empty() {
         return None;
     }
-    Some(text.split_once('\n').unwrap_or((text, "")))
+    Some(match text.split_once('\n') {
+        Some((line, rest)) => (line.strip_suffix('\r').unwrap_or(line), rest),
+        None => (text, ""),
+    })
 }
 
 /// Returned when a repro could not be made.
@@ -363,6 +367,32 @@ mod tests {
             REPRO.parse(),
             Ok(recorded()),
             "and the pinned text is that text"
+        );
+    }
+
+    #[test]
+    fn a_repro_with_carriage_returns_reads_as_the_schedule_beneath_it_would() {
+        // The schedule a repro's tail is read by takes a line ending of `\r\n` as it takes `\n`, so
+        // the lines above it do too: a file saved with either ending is one repro, rather than one
+        // whose faults read and whose header does not.
+        assert_eq!(
+            REPRO.replace('\n', "\r\n").parse(),
+            Ok(recorded()),
+            "every line ended with a carriage return"
+        );
+        // And only a carriage return a line ends with, as `str::lines` has it: one anywhere else
+        // is text the form never writes.
+        assert_eq!(
+            REPRO.replacen(" seed", "\r seed", 1).parse::<Repro>(),
+            Err(ParseReproError::BadHeader),
+            "a carriage return inside the header"
+        );
+        assert!(
+            REPRO
+                .replacen(" lost quorum", "\r lost quorum", 1)
+                .parse::<Repro>()
+                .is_err(),
+            "a carriage return inside the failure"
         );
     }
 
