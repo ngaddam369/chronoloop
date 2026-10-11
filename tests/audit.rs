@@ -82,7 +82,7 @@ const NO_ADDRESSES: &str = "no address reaches state, a hash, or a history";
 ///
 /// A `static` rather than a `const`, because a `const` is inlined at each use and a reference taken
 /// to one points at a temporary; the reports below outlive the scan that produced them.
-static RULES: [Rule; 25] = [
+static RULES: [Rule; 31] = [
     Rule {
         needle: "Instant::now",
         jewel: VIRTUAL_TIME,
@@ -133,6 +133,12 @@ static RULES: [Rule; 25] = [
         jewel: ONE_SEED,
         why: "the call underneath all of these, and the reason the generator crates are built with \
               their default features off",
+    },
+    Rule {
+        needle: "RandomState",
+        jewel: ONE_SEED,
+        why: "the hasher-builder an unordered map is seeded by, drawing its keys from the operating \
+              system without the map ever being named",
     },
     Rule {
         needle: "HashMap",
@@ -215,9 +221,40 @@ static RULES: [Rule; 25] = [
               reach for; it covers a shared raw borrow and an exclusive one alike",
     },
     Rule {
-        needle: "{:p}",
+        needle: "ptr::from_ref",
         jewel: NO_ADDRESSES,
-        why: "prints an address, which puts one straight into a recorded history",
+        why: "the cast above written as a call, which is the spelling `clippy::ref_as_ptr` asks for \
+              in its place",
+    },
+    Rule {
+        needle: "ptr::from_mut",
+        jewel: NO_ADDRESSES,
+        why: "the same call, through a pointer that could also write",
+    },
+    Rule {
+        needle: "into_raw",
+        jewel: NO_ADDRESSES,
+        why: "gives up an owner for the address of what it owned, which a box, a counted pointer and \
+              a C string all offer",
+    },
+    Rule {
+        needle: "into_raw_parts",
+        jewel: NO_ADDRESSES,
+        why: "the same address with a length and a capacity beside it; a longer name that the needle \
+              above deliberately does not claim, so it has to be named here",
+    },
+    Rule {
+        needle: ":p}",
+        jewel: NO_ADDRESSES,
+        why: "prints an address, which puts one straight into a recorded history — whether the \
+              argument is unnamed, numbered, or named inline as `clippy::uninlined_format_args` \
+              insists. A width or a fill between the colon and the `p` is not caught: the scan \
+              matches spellings, not a format string's grammar",
+    },
+    Rule {
+        needle: "#p}",
+        jewel: NO_ADDRESSES,
+        why: "the same address in its alternate form, whose `#` stands between the colon and the `p`",
     },
 ];
 
@@ -237,7 +274,7 @@ struct Violation {
 /// spelling — it is the same trap as an assertion whose two sides come from one run. Each of these
 /// is a line someone could plausibly write, and each breaks exactly one rule, which is also how a
 /// needle broad enough to swallow its neighbours gets caught.
-static VIOLATIONS: [Violation; 25] = [
+static VIOLATIONS: [Violation; 31] = [
     Violation {
         name: "the machine's monotonic clock",
         source: "    let started = std::time::Instant::now();",
@@ -282,6 +319,11 @@ static VIOLATIONS: [Violation; 25] = [
         name: "the call underneath them",
         source: "    getrandom::fill(&mut seed).expect(\"the system has entropy\");",
         needle: "getrandom",
+    },
+    Violation {
+        name: "a map's per-process keys, without the map",
+        source: "    let keys = std::hash::RandomState::new();",
+        needle: "RandomState",
     },
     Violation {
         name: "an unordered map in simulated state",
@@ -359,9 +401,34 @@ static VIOLATIONS: [Violation; 25] = [
         needle: "&raw ",
     },
     Violation {
+        name: "an address taken by the call a lint asks for in place of a cast",
+        source: "    let identity = std::ptr::from_ref(&shared).addr();",
+        needle: "ptr::from_ref",
+    },
+    Violation {
+        name: "the call in place of a cast, through a pointer that can write",
+        source: "    let raw = std::ptr::from_mut(&mut queue);",
+        needle: "ptr::from_mut",
+    },
+    Violation {
+        name: "an owner given up for an address",
+        source: "    let identity = Rc::into_raw(shared) as usize;",
+        needle: "into_raw",
+    },
+    Violation {
+        name: "a buffer given up for its address and its sizes",
+        source: "    let (start, len, capacity) = buffer.into_raw_parts();",
+        needle: "into_raw_parts",
+    },
+    Violation {
         name: "an address printed into a history",
         source: "    history.record(clock, format!(\"polling task at {:p}\", &task));",
-        needle: "{:p}",
+        needle: ":p}",
+    },
+    Violation {
+        name: "an address printed into a history in its alternate form",
+        source: "    history.record(clock, format!(\"queue at {:#p}\", &queue));",
+        needle: "#p}",
     },
 ];
 
@@ -379,7 +446,7 @@ struct Boundary {
 /// The pairs that make the distinction worth drawing: a forbidden spelling, and a longer name it
 /// sits inside — at the front of one, where the longer name is something else, and at the end of
 /// one, where the longer name is the forbidden thing wearing a prefix.
-static BOUNDARIES: [Boundary; 8] = [
+static BOUNDARIES: [Boundary; 12] = [
     Boundary {
         name: "the generator a run may not have",
         source: "    let delay: u64 = rand::rng().random_range(1..=100);",
@@ -414,6 +481,26 @@ static BOUNDARIES: [Boundary; 8] = [
         name: "a raw borrow through a pointer that can write",
         source: "    let raw = std::ptr::addr_of_mut!(queue);",
         caught: &["addr_of_mut!"],
+    },
+    Boundary {
+        name: "an address printed under the name a lint inlines it as",
+        source: "    history.record(clock, format!(\"polling task at {task:p}\"));",
+        caught: &[":p}"],
+    },
+    Boundary {
+        name: "an address printed by the position of its argument",
+        source: "    history.record(clock, format!(\"polling {1} at {0:p}\", &task, name));",
+        caught: &[":p}"],
+    },
+    Boundary {
+        name: "a field inlined by a name ending in the same letter, which is no address",
+        source: "    history.record(clock, format!(\"{step} after {gap:?}\"));",
+        caught: &[],
+    },
+    Boundary {
+        name: "a buffer's raw parts, a longer name than the owner's, needing a needle of its own",
+        source: "    let (start, len, capacity) = buffer.into_raw_parts();",
+        caught: &["into_raw_parts"],
     },
     Boundary {
         name: "a braced import, which ends in punctuation and so begins no name",
@@ -455,7 +542,7 @@ fn continues_a_name(c: char) -> bool {
 /// seed can build. A `contains` cannot tell them apart, so it reports the second under the first's
 /// jewel — a violation announced against code that broke nothing. A needle ending in a name
 /// character therefore counts only where the next character does not continue that name. One
-/// ending in punctuation — `thread::{`, `as *mut`, `addr_of!`, `{:p}` — has no name to continue and
+/// ending in punctuation — `thread::{`, `as *mut`, `addr_of!`, `:p}` — has no name to continue and
 /// counts wherever it falls, which is what keeps `use std::thread::{sleep, spawn};` caught.
 ///
 /// Only that end is guarded, and the asymmetry is the point rather than half a job. A needle that
