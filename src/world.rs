@@ -31,6 +31,18 @@
 //!                  (name length as u64, little endian) ++ name ++ the child's 32-byte hash
 //! ```
 //!
+//! A node's hash is the unkeyed BLAKE3 hash of that encoding, and a [`StateHash`] is those 32 bytes.
+//!
+//! A [`World`] is a branch of its resources, each [`Resource`] a branch of its fields, and each
+//! field a leaf holding its [`Value`]'s bytes — a tag naming the kind, then what the kind holds:
+//!
+//! ```text
+//! flag    0x00 ++ 0x00 for off, 0x01 for on
+//! count   0x01 ++ (count as u64, little endian)
+//! text    0x02 ++ the text's UTF-8 bytes, running to the end of the leaf
+//! instant 0x03 ++ (nanoseconds since the start of the run as u64, little endian)
+//! ```
+//!
 //! Every piece of it earns its place. The leading byte keeps a leaf of no bytes from hashing like a
 //! branch of no children. Children are held in a [`BTreeMap`], so their order is their names' order
 //! rather than the order something inserted them: determinism rule three, satisfied by the type
