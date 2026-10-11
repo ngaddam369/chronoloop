@@ -812,6 +812,14 @@ mod tests {
                 },
             },
             Refusal {
+                name: "a state's name with a sign in it",
+                text: format!("{HEAD}\nstep 0 0.000000000s +{} began\n", &hash[1..]),
+                want: ParseTraceError::BadStep {
+                    line: 2,
+                    source: ParseStepError::Hash(ParseStateHashError::BadDigit),
+                },
+            },
+            Refusal {
                 name: "a step with no message at all",
                 text: format!("{HEAD}\nstep 0 0.000000000s {hash}\n"),
                 want: ParseTraceError::BadStep {

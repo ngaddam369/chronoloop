@@ -152,16 +152,27 @@ impl FromStr for StateHash {
         // The length is settled above, so every byte of the text falls in a pair and the remainder
         // is empty.
         let (pairs, _) = text.as_bytes().as_chunks::<2>();
-        for (byte, digits) in bytes.iter_mut().zip(pairs) {
-            // Uppercase is refused rather than accepted, so a state has one written form and a
-            // file holding two spellings of one hash cannot arise.
-            if digits.iter().any(u8::is_ascii_uppercase) {
+        for (byte, &[high, low]) in bytes.iter_mut().zip(pairs) {
+            let (Some(high), Some(low)) = (digit(high), digit(low)) else {
                 return Err(ParseStateHashError::BadDigit);
-            }
-            let pair = core::str::from_utf8(digits).map_err(|_| ParseStateHashError::BadDigit)?;
-            *byte = u8::from_str_radix(pair, 16).map_err(|_| ParseStateHashError::BadDigit)?;
+            };
+            *byte = high << 4 | low;
         }
         Ok(Self(bytes))
+    }
+}
+
+/// The value of one digit of a written hash, or [`None`] for a byte [`StateHash`]'s `Display`
+/// never writes.
+///
+/// Decoded here rather than by a number reader, because a number reader is more forgiving than a
+/// written form may be: it takes uppercase, and it takes a sign, so `+a` would read as `0a`. Either
+/// would give a state two spellings and let a file hold both.
+fn digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
     }
 }
 
@@ -1074,6 +1085,18 @@ mod tests {
             Case {
                 name: "written the way a number is",
                 text: format!("0x{}", &written[2..]),
+                want: ParseStateHashError::BadDigit,
+            },
+            // A sign at the head of a pair is what a number reader takes, so a pair read as a
+            // number would read `+a` as `0a`: one state, two spellings.
+            Case {
+                name: "signed at the start",
+                text: format!("+{}", &written[1..]),
+                want: ParseStateHashError::BadDigit,
+            },
+            Case {
+                name: "signed at the head of a later pair",
+                text: format!("{}+{}", &written[..10], &written[11..]),
                 want: ParseStateHashError::BadDigit,
             },
             Case {

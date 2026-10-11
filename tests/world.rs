@@ -17,7 +17,7 @@ use chronoloop::clock::Clock;
 use chronoloop::executor::Executor;
 use chronoloop::net::{Network, VirtualNetwork};
 use chronoloop::rng::{Rng, SeededRng};
-use chronoloop::world::{Name, Resource, Snapshot, Value, World};
+use chronoloop::world::{Name, Resource, Snapshot, StateHash, Value, World};
 
 /// How long a node thinks before it says anything.
 const THINKING: core::ops::RangeInclusive<Duration> =
@@ -143,6 +143,25 @@ fn a_state_hash_outlives_the_process_that_produced_it() {
         "79d631b3589020a5fdaedf4721bc1e38a15d6261792415d292845db3ffdde396",
         "the state seed 7 is observed to leave behind"
     );
+}
+
+#[test]
+fn a_state_hash_has_one_written_form() {
+    // A run's state, written out, reads back as itself, and a sign in place of the digit at the
+    // head of any byte is refused rather than read as a zero. A pair read as a number would take
+    // `+a` for `0a` and give the one state two spellings a file could hold side by side.
+    for seed in 0..8 {
+        let hash = observed(seed).state_hash();
+        let written = hash.to_string();
+        assert_eq!(written.parse::<StateHash>(), Ok(hash), "seed {seed}");
+        for at in (0..written.len()).step_by(2) {
+            let signed = format!("{}+{}", &written[..at], &written[at + 1..]);
+            assert!(
+                signed.parse::<StateHash>().is_err(),
+                "seed {seed}: a sign at {at} in {signed}"
+            );
+        }
+    }
 }
 
 #[test]
