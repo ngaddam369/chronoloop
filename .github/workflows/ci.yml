@@ -40,6 +40,11 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: clippy
         run: cargo clippy --locked --all-targets -- -D warnings
+      # Clippy never runs rustdoc, so a broken intra-doc link passes it.
+      - name: rustdoc
+        run: cargo doc --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   build:
     name: build
