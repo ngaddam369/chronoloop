@@ -6,10 +6,11 @@
 //! production and never again in a test environment.
 //!
 //! chronoloop runs a control loop in **virtual time** on a single-threaded deterministic executor.
-//! Time, randomness, network, and I/O are traits, so the same loop logic runs against a simulated
-//! world where every delay, drop, and partition is drawn from one seed and nothing else. A run is
-//! therefore a pure function of its seed: the same seed replays the same history, byte for byte,
-//! forever.
+//! Time, randomness, and the network are capabilities a system names as traits, so its loop runs
+//! against a simulated world: every delay, and every message lost or duplicated, is drawn from one
+//! seed, and every outage comes from a fault schedule the run is handed as a value. A run is
+//! therefore a pure function of its seed and its schedule: the same two replay the same history,
+//! byte for byte, forever.
 //!
 //! On top of that determinism sit the two capabilities the engine exists for:
 //!
