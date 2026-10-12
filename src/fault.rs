@@ -57,7 +57,8 @@ impl std::error::Error for WindowError {}
 /// The span of simulated time a fault is in force for.
 ///
 /// Half open: it holds the instant it opens at and not the one it closes at, so two windows laid end
-/// to end neither overlap nor leave a gap between them.
+/// to end neither overlap nor leave a gap between them. The one exception is the end of virtual
+/// time: a window closing there never closes, so it holds that instant too.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Window {
     start: VirtualTime,
@@ -71,6 +72,8 @@ impl Window {
     ///
     /// Returns [`WindowError`] if `end` is earlier than `start`. A window that opens and closes at
     /// the same instant holds nothing, which is meaningful; one that closes first is a mistake.
+    /// Except at the end of virtual time: closing there and never closing are one value, so a window
+    /// opening and closing at [`VirtualTime::MAX`] is the window open from it forever, and holds it.
     pub fn new(start: VirtualTime, end: VirtualTime) -> Result<Self, WindowError> {
         if end < start {
             return Err(WindowError::Backwards { start, end });
@@ -114,7 +117,8 @@ impl Window {
         }
     }
 
-    /// Returns `true` if `at` falls inside the window.
+    /// Returns `true` if `at` falls inside the window, which a window closing at the end of virtual
+    /// time takes to include that instant.
     pub fn holds(&self, at: VirtualTime) -> bool {
         // The end of virtual time is the only instant a window that never closes has to hold, and
         // it is the one instant the half-open rule would leave out.
@@ -748,6 +752,50 @@ mod tests {
         let forever = Window::forever_from(VirtualTime::ZERO);
         assert!(forever.holds(VirtualTime::ZERO));
         assert!(forever.holds(t(u64::MAX)));
+    }
+
+    #[test]
+    fn a_window_opening_and_closing_at_one_instant_holds_nothing_except_at_the_end_of_time() {
+        struct Case {
+            name: &'static str,
+            during: Window,
+            at: VirtualTime,
+            want: bool,
+        }
+        let end = VirtualTime::MAX;
+        let cases = [
+            Case {
+                name: "a window of no span holds the instant it is at",
+                during: window(5, 5),
+                at: t(5),
+                want: false,
+            },
+            // Closing at the end of virtual time and never closing are one value, so the window of
+            // no span at that instant is the window from it forever, and holds it.
+            Case {
+                name: "a window of no span at the end of time holds that instant",
+                during: Window::new(end, end)
+                    .unwrap_or_else(|e| panic!("a window may open and close at one instant: {e}")),
+                at: end,
+                want: true,
+            },
+            Case {
+                name: "forever from the end of time holds that instant",
+                during: Window::forever_from(end),
+                at: end,
+                want: true,
+            },
+            Case {
+                name: "forever from the end of time holds nothing before it",
+                during: Window::forever_from(end),
+                at: t(u64::MAX - 1),
+                want: false,
+            },
+        ];
+
+        for case in cases {
+            assert_eq!(case.during.holds(case.at), case.want, "{}", case.name);
+        }
     }
 
     #[test]
