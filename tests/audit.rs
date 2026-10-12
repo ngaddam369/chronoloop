@@ -13,6 +13,15 @@
 //! a proof of the five rules it does cover — it catches a forbidden thing by name, so a new way of
 //! spelling an old mistake goes unnoticed until someone adds it below.
 //!
+//! The rule against addresses is where that bites hardest, because the commonest way to make one
+//! has no name at all. A reference coerces to a raw pointer by an annotation alone —
+//! `let at: *const u8 = &byte;` — and a raw pointer, a `NonNull` or a function pointer prints its
+//! address under the ordinary `{:?}`, which is the same two characters as every other value's debug
+//! form. The casts, the macros, the conversions and the `p` format are caught; an address reached
+//! that way is not, and there the rule rests on review. The same is true of a name brought in by a
+//! `use` and called bare: `process::id` is caught, a bare `id()` after `use std::process::id` is
+//! not.
+//!
 //! Two pieces of scope are deliberate. **`benches/` is not read**: a benchmark measures the engine
 //! from outside instead of taking part in a simulation, so the wall clock it reads is the right
 //! instrument and the one honest exception. And **this file reads everything but itself** — every
@@ -82,7 +91,7 @@ const NO_ADDRESSES: &str = "no address reaches state, a hash, or a history";
 ///
 /// A `static` rather than a `const`, because a `const` is inlined at each use and a reference taken
 /// to one points at a temporary; the reports below outlive the scan that produced them.
-static RULES: [Rule; 31] = [
+static RULES: [Rule; 32] = [
     Rule {
         needle: "Instant::now",
         jewel: VIRTUAL_TIME,
@@ -133,6 +142,12 @@ static RULES: [Rule; 31] = [
         jewel: ONE_SEED,
         why: "the call underneath all of these, and the reason the generator crates are built with \
               their default features off",
+    },
+    Rule {
+        needle: "process::id",
+        jewel: ONE_SEED,
+        why: "a number the operating system hands each process, so anything it reaches differs \
+              between two runs of the same seed as surely as a draw from its entropy would",
     },
     Rule {
         needle: "RandomState",
@@ -274,7 +289,7 @@ struct Violation {
 /// spelling — it is the same trap as an assertion whose two sides come from one run. Each of these
 /// is a line someone could plausibly write, and each breaks exactly one rule, which is also how a
 /// needle broad enough to swallow its neighbours gets caught.
-static VIOLATIONS: [Violation; 31] = [
+static VIOLATIONS: [Violation; 32] = [
     Violation {
         name: "the machine's monotonic clock",
         source: "    let started = std::time::Instant::now();",
@@ -319,6 +334,11 @@ static VIOLATIONS: [Violation; 31] = [
         name: "the call underneath them",
         source: "    getrandom::fill(&mut seed).expect(\"the system has entropy\");",
         needle: "getrandom",
+    },
+    Violation {
+        name: "the operating system's number for this process",
+        source: "    history.record(clock, format!(\"started by {}\", std::process::id()));",
+        needle: "process::id",
     },
     Violation {
         name: "a map's per-process keys, without the map",
