@@ -110,8 +110,10 @@ impl fmt::Display for UnreachedStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "the run never reached step {}; it took {} steps",
-            self.step, self.steps
+            "the run never reached step {}; it took {} {}",
+            self.step,
+            self.steps,
+            if self.steps == 1 { "step" } else { "steps" }
         )
     }
 }
@@ -376,6 +378,12 @@ mod tests {
                 instants: &[0, 1_500, 90_000],
                 step: 4_000,
                 want: "the run never reached step 4000; it took 3 steps",
+            },
+            Case {
+                name: "past the end of a run that took one",
+                instants: &[0],
+                step: 1,
+                want: "the run never reached step 1; it took 1 step",
             },
             Case {
                 name: "any step of a run that took none",

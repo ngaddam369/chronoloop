@@ -715,6 +715,22 @@ fn checking_a_run_that_broke_says_how_it_broke_and_fails() {
 }
 
 #[test]
+fn a_check_under_one_fault_says_one_fault() {
+    // The line the command reference quotes, from the built binary rather than the function behind
+    // it, at the one count that reads wrongly with the noun left plural.
+    let path = scratch_file(
+        "one.faults",
+        "chronoloop faults\n\
+         partition on node 4 -> node 5 from 0.000000000s until forever\n",
+    );
+
+    let checked = chronoloop(&["check", "--seed", HOLDS_UP, "--faults", arg(&path)]);
+
+    assert!(checked.status.success(), "{}", stderr(&checked));
+    assert_eq!(stdout(&checked), "seed 1: held up under 1 fault\n");
+}
+
+#[test]
 fn checking_a_run_that_held_up_says_so_and_succeeds() {
     // The other side of the threshold, and the half that feels the seed: these are faults one seed
     // breaks under and this one does not.

@@ -200,6 +200,8 @@ enum Command {
 struct Written {
     /// The line the first record falls on, counting the header as line 1.
     first_line: usize,
+    /// What the file calls one of the things it holds.
+    record: &'static str,
     /// What the file calls the things it holds, in the plural.
     records: &'static str,
     /// What the file itself is called.
@@ -210,6 +212,7 @@ impl Written {
     /// A recorded history: a header, and an entry per line under it.
     const RECORDING: Self = Self {
         first_line: 2,
+        record: "entry",
         records: "entries",
         file: "recording",
     };
@@ -218,6 +221,7 @@ impl Written {
     fn trace(trace: &Trace) -> Self {
         Self {
             first_line: if trace.fork().is_some() { 3 } else { 2 },
+            record: "step",
             records: "steps",
             file: "trace",
         }
@@ -270,8 +274,9 @@ impl<T: fmt::Display> fmt::Display for Divergence<T> {
             }
             Parting::Length { recorded, replayed } => write!(
                 f,
-                "the replay recorded {replayed} {} where the {} holds {recorded}",
-                self.written.records, self.written.file
+                "the replay recorded {} where the {} holds {recorded}",
+                counted(*replayed, self.written.record, self.written.records),
+                self.written.file
             ),
         }
     }
@@ -372,9 +377,9 @@ impl fmt::Display for CliError {
             Self::SomeSeedsBroke(survey) => {
                 write!(
                     f,
-                    "{} of {} seeds broke",
+                    "{} of {} broke",
                     survey.broke().len(),
-                    survey.swept()
+                    counted(survey.swept(), "seed", "seeds")
                 )?;
                 for broke in survey.broke() {
                     write!(f, "\n  {broke}")?;
@@ -528,9 +533,9 @@ fn replay(path: &Path) -> Result<String, CliError> {
         return Err(CliError::Diverged(Box::new(divergence)));
     }
     Ok(format!(
-        "seed {}: {} entries replayed identically\n",
+        "seed {}: {} replayed identically\n",
         recorded.seed(),
-        recorded.entries().len()
+        counted(recorded.entries().len(), "entry", "entries")
     ))
 }
 
@@ -546,8 +551,8 @@ fn checked(seed: u64, faults: &FaultSchedule) -> Result<String, CliError> {
     let outcome = System::Quorum.run(seed, faults)?;
     match Broke::new(seed, outcome) {
         None => Ok(format!(
-            "seed {seed}: held up under {} faults\n",
-            faults.len()
+            "seed {seed}: held up under {}\n",
+            counted(faults.len(), "fault", "faults")
         )),
         Some(broke) => Err(CliError::Broke(broke)),
     }
@@ -568,7 +573,11 @@ fn swept(
 ) -> Result<String, CliError> {
     let survey = sweep(seeds, jobs, |seed| System::Quorum.run(seed, faults))?;
     held_up(survey, |count| {
-        format!("swept {count} seeds under {} faults", faults.len())
+        format!(
+            "swept {} under {}",
+            counted(count, "seed", "seeds"),
+            counted(faults.len(), "fault", "faults")
+        )
     })
 }
 
@@ -588,7 +597,10 @@ fn hunted(seeds: NonZeroU64, jobs: NonZeroUsize) -> Result<String, CliError> {
         System::Reconciler.run(seed, &reconciler::drawn_faults(seed))
     })?;
     held_up(survey, |count| {
-        format!("hunted {count} seeds under faults drawn from each")
+        format!(
+            "hunted {} under faults drawn from each",
+            counted(count, "seed", "seeds")
+        )
     })
 }
 
@@ -768,6 +780,18 @@ fn execute(command: &Command) -> Result<String, CliError> {
         Command::Hunt { seeds, jobs } => hunted(*seeds, *jobs),
         Command::Corner { seed } => cornered(*seed),
     }
+}
+
+/// Writes `count` followed by `one` or `many`, whichever the count calls for.
+///
+/// Every line here with a count in it is one somebody may quote, and "1 faults" reads as a typo in
+/// the one place a reader is checking the tool's words against their own run.
+fn counted<N>(count: N, one: &str, many: &str) -> String
+where
+    N: fmt::Display + PartialEq + From<u8> + Copy,
+{
+    let noun = if count == N::from(1) { one } else { many };
+    format!("{count} {noun}")
 }
 
 /// Writes `output` to `out`, flushing it before returning.
@@ -1363,6 +1387,12 @@ mod tests {
                 want: Some("the replay recorded 4 entries where the recording holds 3"),
             },
             Case {
+                name: "a replay of one entry against a recording of three",
+                recorded: recorded(),
+                replayed: vec![entry(1, "ping sent")],
+                want: Some("the replay recorded 1 entry where the recording holds 3"),
+            },
+            Case {
                 name: "an entry differs before the lengths do",
                 recorded: recorded(),
                 replayed: vec![entry(1, "ping sent"), entry(9, "ping received")],
@@ -1638,6 +1668,48 @@ mod tests {
     fn shrunk() -> String {
         reduced(System::Quorum, QUORUM_SEED, &faults(FAULTS))
             .unwrap_or_else(|e| panic!("seed {QUORUM_SEED} breaks under those faults: {e}"))
+    }
+
+    /// One fault no seed breaks under: a link the coordinator never uses.
+    const ONE_FAULT: &str = "chronoloop faults\n\
+                             partition on node 4 -> node 5 from 0.000000000s until forever\n";
+
+    #[test]
+    fn a_count_of_one_is_written_in_the_singular() {
+        // Every line a command writes with a count in it, at the count that reads wrongly with the
+        // noun left plural. The many side is pinned by the cases each command already has.
+        let one = NonZeroU64::new(1).unwrap_or_else(|| panic!("one is not zero"));
+        let jobs = NonZeroUsize::new(1).unwrap_or_else(|| panic!("one is not zero"));
+        let said = |result: Result<String, CliError>| match result {
+            Ok(good) => good,
+            Err(bad) => bad.to_string(),
+        };
+
+        let cases = [
+            (
+                "a check under one fault",
+                said(checked(HOLDS_UP, &faults(ONE_FAULT))),
+                "seed 1: held up under 1 fault\n",
+            ),
+            (
+                "a sweep of one seed under one fault",
+                said(swept(one, jobs, &faults(ONE_FAULT))),
+                "swept 1 seed under 1 fault: every one held up\n",
+            ),
+            (
+                "a sweep of one seed, which broke",
+                said(swept(one, jobs, &faults(LOSSY))),
+                "1 of 1 seed broke\n  seed 0: failed at step 13: round 3 lost quorum",
+            ),
+            (
+                "a hunt of one seed",
+                said(hunted(one, jobs)),
+                "hunted 1 seed under faults drawn from each: every one held up\n",
+            ),
+        ];
+        for (name, got, want) in cases {
+            assert_eq!(got, want, "{name}");
+        }
     }
 
     #[test]
