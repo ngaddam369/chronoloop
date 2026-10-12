@@ -215,11 +215,6 @@ impl Region {
     pub fn new(name: Name) -> Self {
         Self(name)
     }
-
-    /// What the region is called.
-    pub fn name(&self) -> &Name {
-        &self.0
-    }
 }
 
 impl fmt::Display for Region {
@@ -320,16 +315,6 @@ impl Placement {
             return Err(PlacementError::PrimaryAlsoStandby { region: primary });
         }
         Ok(Self { primary, standbys })
-    }
-
-    /// The region the primary is wanted in.
-    pub fn primary(&self) -> &Region {
-        &self.primary
-    }
-
-    /// The regions a standby is wanted in, in name order.
-    pub fn standbys(&self) -> impl Iterator<Item = &Region> {
-        self.standbys.iter()
     }
 
     /// Every region a replica is wanted in, with the role wanted of it.
