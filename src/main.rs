@@ -54,6 +54,7 @@
 
 use core::fmt;
 use core::num::{NonZeroU64, NonZeroUsize};
+use core::str::FromStr;
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -74,6 +75,47 @@ use chronoloop::sweep::{Survey, Unfinished, sweep};
 use chronoloop::systems::{RunError, System, pingpong, reconciler, ring};
 use chronoloop::trace::{ParseTraceError, Step, Trace};
 
+/// Why an argument is not a number written the way chronoloop writes one.
+#[derive(Debug)]
+enum NumberError<E> {
+    /// It is not a run of digits: it has a sign, a space, or something that is not a digit at all.
+    NotDigits,
+    /// It is digits, and the number they spell is not one the argument takes.
+    Unheld(E),
+}
+
+impl<E: fmt::Display> fmt::Display for NumberError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotDigits => write!(f, "a number is written in digits alone, with no sign"),
+            Self::Unheld(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for NumberError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotDigits => None,
+            Self::Unheld(error) => Some(error),
+        }
+    }
+}
+
+/// Reads a number typed on the command line by the rule every file the crate reads holds a number
+/// to: digits, at least one, and nothing else.
+///
+/// A number on the command line is the same number a trace or a repro then writes down, so it is
+/// read the same way. Left to `str::parse`, `--seed +7` would run seed 7 and write `7` into every
+/// file it produced, which is a second rule for one number. Whatever the digits spell is then the
+/// type's own to accept, so a range of no seeds is still refused as zero.
+fn number<T: FromStr>(text: &str) -> Result<T, NumberError<T::Err>> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(NumberError::NotDigits);
+    }
+    text.parse().map_err(NumberError::Unheld)
+}
+
 /// Deterministic simulation of infrastructure control loops.
 #[derive(Debug, Parser)]
 #[command(name = "chronoloop", version)]
@@ -89,7 +131,7 @@ enum Command {
     /// Run a simulation and write the history it produced.
     Run {
         /// The seed every choice in the run is drawn from.
-        #[arg(long)]
+        #[arg(long, value_parser = number::<u64>)]
         seed: u64,
     },
     /// Run again the seed a recorded history names, and check the result still matches it.
@@ -100,7 +142,7 @@ enum Command {
     /// Run a simulation and write what it passed through, state by state.
     Trace {
         /// The seed every choice in the run is drawn from.
-        #[arg(long)]
+        #[arg(long, value_parser = number::<u64>)]
         seed: u64,
     },
     /// Show one step of a recorded trace, and the world the run was in after it.
@@ -108,7 +150,7 @@ enum Command {
         /// A trace written earlier by `trace` or by `fork`.
         path: PathBuf,
         /// Which step to show, counting from zero.
-        #[arg(long)]
+        #[arg(long, value_parser = number::<usize>)]
         step: usize,
     },
     /// Say what changed between the states two of a recorded trace's steps left the run in.
@@ -116,8 +158,10 @@ enum Command {
         /// A trace written earlier by `trace` or by `fork`.
         path: PathBuf,
         /// The step to compare from.
+        #[arg(value_parser = number::<usize>)]
         before: usize,
         /// The step to compare to.
+        #[arg(value_parser = number::<usize>)]
         after: usize,
     },
     /// Run a recorded trace again, drawing from another seed after the instant of one of its steps.
@@ -126,22 +170,22 @@ enum Command {
         path: PathBuf,
         /// The last step that stays the trace's own, counting from zero: the run draws from the new
         /// seed only after this step's instant, so a later step at the same instant stays too.
-        #[arg(long)]
+        #[arg(long, value_parser = number::<usize>)]
         at: usize,
         /// The seed every draw after that step's instant comes from.
-        #[arg(long)]
+        #[arg(long, value_parser = number::<u64>)]
         seed: u64,
     },
     /// Run the coordinator over many seeds under a schedule of faults, and say which of them broke.
     Sweep {
         /// How many seeds to run, counting up from zero.
-        #[arg(long)]
+        #[arg(long, value_parser = number::<NonZeroU64>)]
         seeds: NonZeroU64,
         /// How many seeds to run at once.
         ///
         /// A cost rather than a choice: every count of workers sweeps the same seeds and finds the
         /// same failures, so the default is the one that asks nothing of the machine.
-        #[arg(long, default_value = "1")]
+        #[arg(long, default_value = "1", value_parser = number::<NonZeroUsize>)]
         jobs: NonZeroUsize,
         /// The faults to put every run through.
         #[arg(long)]
@@ -150,7 +194,7 @@ enum Command {
     /// Run the coordinator under a schedule of faults, and say how it went.
     Check {
         /// The seed every choice in the run is drawn from.
-        #[arg(long)]
+        #[arg(long, value_parser = number::<u64>)]
         seed: u64,
         /// The faults to put the run through.
         #[arg(long)]
@@ -160,7 +204,7 @@ enum Command {
     /// repro.
     Shrink {
         /// The seed every choice in the run is drawn from.
-        #[arg(long)]
+        #[arg(long, value_parser = number::<u64>)]
         seed: u64,
         /// The faults to reduce, which the run of this seed has to break under.
         #[arg(long)]
@@ -174,19 +218,19 @@ enum Command {
     /// Run the reconciler over many seeds, each under faults drawn from it, and say which broke.
     Hunt {
         /// How many seeds to run, counting up from zero.
-        #[arg(long)]
+        #[arg(long, value_parser = number::<NonZeroU64>)]
         seeds: NonZeroU64,
         /// How many seeds to run at once.
         ///
         /// A cost rather than a choice, exactly as it is for `sweep`.
-        #[arg(long, default_value = "1")]
+        #[arg(long, default_value = "1", value_parser = number::<NonZeroUsize>)]
         jobs: NonZeroUsize,
     },
     /// Cut the faults drawn for one of the reconciler's seeds down to the ones that broke it, and
     /// write the repro.
     Corner {
         /// The seed the run and its faults are both drawn from.
-        #[arg(long)]
+        #[arg(long, value_parser = number::<u64>)]
         seed: u64,
     },
 }
@@ -1077,6 +1121,130 @@ mod tests {
             Refused {
                 name: "a replay with no path",
                 argv: &["chronoloop", "replay"],
+            },
+        ]);
+    }
+
+    #[test]
+    fn the_root_reads_a_number_the_way_every_file_does() {
+        // Every reader of a written form refuses a sign, since nothing in the crate writes one; a
+        // number typed on the command line is the same number and is read by the same rule, so
+        // `--seed +7` cannot run a seed that every file it writes then names as `7`. One case for
+        // every seed and count a command takes; the steps a trace is asked about are below.
+        refuses(&[
+            Refused {
+                name: "a seed with a sign",
+                argv: &["chronoloop", "run", "--seed", "+7"],
+            },
+            Refused {
+                name: "a range of seeds with a sign",
+                argv: &[
+                    "chronoloop",
+                    "sweep",
+                    "--seeds",
+                    "+20",
+                    "--faults",
+                    "run.faults",
+                ],
+            },
+            Refused {
+                name: "a count of workers with a sign",
+                argv: &[
+                    "chronoloop",
+                    "sweep",
+                    "--seeds",
+                    "20",
+                    "--jobs",
+                    "+2",
+                    "--faults",
+                    "run.faults",
+                ],
+            },
+            Refused {
+                name: "a seed to check with a sign",
+                argv: &[
+                    "chronoloop",
+                    "check",
+                    "--seed",
+                    "+1",
+                    "--faults",
+                    "run.faults",
+                ],
+            },
+            Refused {
+                name: "a seed to shrink with a sign",
+                argv: &[
+                    "chronoloop",
+                    "shrink",
+                    "--seed",
+                    "+1",
+                    "--faults",
+                    "run.faults",
+                ],
+            },
+            Refused {
+                name: "a range to hunt with a sign",
+                argv: &["chronoloop", "hunt", "--seeds", "+500"],
+            },
+            Refused {
+                name: "a count of hunting workers with a sign",
+                argv: &["chronoloop", "hunt", "--seeds", "500", "--jobs", "+8"],
+            },
+            Refused {
+                name: "a seed to corner with a sign",
+                argv: &["chronoloop", "corner", "--seed", "+5"],
+            },
+            Refused {
+                name: "a seed to trace with a sign",
+                argv: &["chronoloop", "trace", "--seed", "+7"],
+            },
+            Refused {
+                name: "a seed with a space in front of it",
+                argv: &["chronoloop", "run", "--seed", " 7"],
+            },
+        ]);
+    }
+
+    #[test]
+    fn the_root_reads_a_step_the_way_every_file_does() {
+        // The same rule for the numbers that point into a trace, one case for each — and the seed a
+        // fork goes to, since it arrives beside one.
+        refuses(&[
+            Refused {
+                name: "a step with a sign",
+                argv: &["chronoloop", "inspect", "run.trace", "--step", "+7"],
+            },
+            Refused {
+                name: "a step to compare from with a sign",
+                argv: &["chronoloop", "diff", "run.trace", "+7", "8"],
+            },
+            Refused {
+                name: "a step to compare to with a sign",
+                argv: &["chronoloop", "diff", "run.trace", "7", "+8"],
+            },
+            Refused {
+                name: "a step to fork at with a sign",
+                argv: &[
+                    "chronoloop",
+                    "fork",
+                    "run.trace",
+                    "--at",
+                    "+7",
+                    "--seed",
+                    "99",
+                ],
+            },
+            Refused {
+                name: "a seed to fork to with a sign",
+                argv: &[
+                    "chronoloop",
+                    "fork",
+                    "run.trace",
+                    "--at",
+                    "7",
+                    "--seed",
+                    "+99",
+                ],
             },
         ]);
     }
