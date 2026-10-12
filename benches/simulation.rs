@@ -7,8 +7,9 @@
 //! touch it.
 //!
 //! This is the one place in the crate allowed to read a wall clock: it measures the engine from
-//! outside rather than taking part in a simulation. Nothing here is asserted and nothing here runs
-//! in CI. Run it with `make bench`.
+//! outside rather than taking part in a simulation. No duration is ever asserted — the two checks
+//! below only make sure the work measured was the work meant — and nothing here runs in CI. Run it
+//! with `make bench`.
 
 use core::cell::Cell;
 use core::future::Future;

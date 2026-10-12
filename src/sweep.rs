@@ -10,7 +10,7 @@
 //!
 //! Seeds are independent: a run of one draws nothing from a run of another, and each is an ordinary
 //! single-threaded simulation on an executor of its own. So the seeds can be spread across workers
-//! without the fourth determinism rule — *no threads inside a simulation* — being bent at all.
+//! without the rule of *no threads inside a simulation* being bent at all.
 //! Nothing is shared between the workers: each builds its own list and the lists are merged
 //! afterwards.
 //!
@@ -402,7 +402,7 @@ mod tests {
     #[ignore = "hangs rather than failing if the workers do not really run at once; `make local-validation` runs it"]
     fn the_workers_of_a_sweep_run_at_the_same_time() {
         // The one thing `--jobs` promises that nothing above can hold: that asking for four workers
-        // gets four. It cannot be shown by timing anything — the first determinism rule forbids a
+        // gets four. It cannot be shown by timing anything — the rule against a wall clock forbids a
         // wall clock, and a bound on a loaded machine flakes — so it is shown by a predicate that
         // only returns once every worker has arrived. One seed per worker, so all four have to be
         // in flight at once for any of them to finish.

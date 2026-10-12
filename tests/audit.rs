@@ -1,6 +1,7 @@
 //! The determinism rules, enforced rather than documented.
 //!
-//! The engine's guarantee is that a run is a pure function of its seed. That holds today because
+//! The engine's guarantee is that a run is a pure function of its seed and the faults it is handed.
+//! That holds today because
 //! every line has been written with it in mind, which is not the same as it being true — a rule
 //! nothing enforces is a comment. This scan reads every Rust file under `src/` and `tests/` and
 //! fails the build when one of them names something that would let the outside world reach a

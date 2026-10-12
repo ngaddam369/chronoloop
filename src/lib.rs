@@ -36,39 +36,39 @@
 //! [`shuttle`]: https://github.com/awslabs/shuttle
 //! [`loom`]: https://github.com/tokio-rs/loom
 //!
-//! # Status
+//! # What is in it
 //!
-//! What works today is the deterministic core and the systems that exercise it, met below in the
-//! order the engine needed them. A run is driven by a
-//! [`VirtualClock`] over an [`EventQueue`], polled by a single-threaded [`Executor`], with every
-//! random choice drawn from a [`SeededRng`]; [`pingpong`] is a two-task exchange over that clock,
-//! and its [`Recording`] can be written to a file and replayed against a later run of the engine.
+//! The deterministic core, and the systems that exercise it, each met beside the part of the engine
+//! it shows. A run is driven by a [`VirtualClock`] over an [`EventQueue`], polled by a
+//! single-threaded [`Executor`], with every random choice drawn from a [`SeededRng`]; [`pingpong`]
+//! is a two-task exchange over that clock, and its [`Recording`] can be written to a file and
+//! replayed against a later run of the engine.
 //!
-//! Time, randomness and the wire are already capabilities a system asks for rather than reaches
-//! for: written against [`Clock`], [`Rng`] and [`Network`], it can wait, arm a deadline, draw a
-//! delay and talk to another node, and it has no way to get at the machine's clock, its entropy or
-//! a socket. What its messages go through is a [`VirtualNetwork`], where latency, loss, duplication
-//! and partitions all come from the same seed as everything else. A running task can start another
-//! and wait for what it produces, with identifiers handed out in spawn order rather than taken from
-//! an address. The trouble a run is put through is a [`FaultSchedule`] — a value written to a file
-//! and read back, rather than a method called on a network — which is what the shrinking will
-//! reduce. And the state a run leaves behind is now content-addressed: a [`World`] of named
-//! resources hands back a tree of [`Snapshot`] nodes whose branches hash over their children's
-//! hashes, so two states are the same state exactly when they answer to one [`StateHash`], and
-//! a part of the world that did not change keeps the name it had. A [`StateStore`] takes that up:
-//! it keeps each node once under the name it answers to, with a branch naming its children rather
-//! than holding them, so a run costs what it changed rather than a copy of the world per step. What
-//! puts those states in order is a [`Trace`]: for every step, the event and the name of the state it
-//! left the run in, written to a file and read back strictly enough that a file with a step missing
-//! from the middle is refused. A trace is addressed by step, and two of its states can be told
-//! apart: [`diff`] walks both at once and stops wherever two subtrees answer to one name, so what
-//! comes back is the path down to each thing that moved and what stands there on either side, at a
-//! cost that is the size of the change rather than the size of the world. And a recorded step is
-//! somewhere a run can be sent off from: [`fork`] names the instant a step happened at, and a run
-//! given that instant and another seed draws from its own seed up to it and from the other one
-//! after — so the steps up to the fork are not an approximation of where the run had got to, they
-//! are the run, and the steps after it are another. [`ring`] is the system that shows it, a ring of
-//! nodes writing down what they hear.
+//! Time, randomness and the wire are capabilities a system asks for rather than reaches for:
+//! written against [`Clock`], [`Rng`] and [`Network`], it can wait, arm a deadline, draw a delay
+//! and talk to another node, and it has no way to get at the machine's clock, its entropy or a
+//! socket. What its messages go through is a [`VirtualNetwork`], where latency, loss and
+//! duplication are drawn from the run's seed and partitions come from its fault schedule. A running
+//! task can start another and wait for what it produces, with identifiers handed out in spawn order
+//! rather than taken from an address. The trouble a run is put through is a [`FaultSchedule`] — a
+//! value written to a file and read back, rather than a method called on a network — which is what
+//! a reduction cuts down. And the state a run leaves behind is content-addressed: a [`World`] of
+//! named resources hands back a tree of [`Snapshot`] nodes whose branches hash over their
+//! children's hashes, so two states are the same state exactly when they answer to one
+//! [`StateHash`], and a part of the world that did not change keeps the name it had. A
+//! [`StateStore`] takes that up: it keeps each node once under the name it answers to, with a
+//! branch naming its children rather than holding them, so a run costs what it changed rather than
+//! a copy of the world per step. What puts those states in order is a [`Trace`]: for every step,
+//! the event and the name of the state it left the run in, written to a file and read back strictly
+//! enough that a file with a step missing from the middle is refused. A trace is addressed by step,
+//! and two of its states can be told apart: [`diff`] walks both at once and stops wherever two
+//! subtrees answer to one name, so what comes back is the path down to each thing that moved and
+//! what stands there on either side, at a cost that is the size of the change rather than the size
+//! of the world. And a recorded step is somewhere a run can be sent off from: [`fork`] names the
+//! instant a step happened at, and a run given that instant and another seed draws from its own
+//! seed up to it and from the other one after — so the steps up to the fork are not an
+//! approximation of where the run had got to, they are the run, and the steps after it are another.
+//! [`ring`] is the system that shows it, a ring of nodes writing down what they hear.
 //!
 //! All of that is reachable from a terminal. `trace --seed <n>` writes a run's trace to a file, and
 //! `inspect --step`, `diff` and `fork --at` read one back: the first shows a step and, through
@@ -91,73 +91,71 @@
 //! makes it smaller: it drops entries by delta debugging over the list, narrows each window by
 //! bisection towards the span the failure needs, and lowers each odds by bisection towards the
 //! fewest occurrences it needs, running the system again after every candidate and keeping only
-//! those whose run still fails for the same reason. What comes back is a [`Reduction`] — the faults the failure could not do
-//! without, and the failure the run under them produces — which is what turns a schedule a sweep
-//! threw at a run into a repro a person can read.
+//! those whose run still fails for the same reason. What comes back is a [`Reduction`] — the faults
+//! the failure could not do without, and the failure the run under them produces — which is what
+//! turns a schedule a sweep threw at a run into a repro a person can read.
 //!
 //! A reduction dies with the process that made it, and a [`Repro`] is what outlives one: the system
 //! it is of, the seed, the faults the failure could not do without, and the failure to expect out
-//! the other end, written to a file of a few hundred bytes and read back. It invents no form of its own — the failure is an
-//! [`Outcome`] as an outcome writes itself, and everything under it is a [`FaultSchedule`] as a
-//! schedule writes itself, header and all, so the tail of a repro file is a schedule file. A failing
-//! run of a five-node system comes to under a third of a kilobyte, which is small enough to commit as
-//! a fixture and hand to a run months later.
+//! the other end, written to a file of a few hundred bytes and read back. It invents no form of its
+//! own — the failure is an [`Outcome`] as an outcome writes itself, and everything under it is a
+//! [`FaultSchedule`] as a schedule writes itself, header and all, so the tail of a repro file is a
+//! schedule file. A failing run of a five-node system comes to under a third of a kilobyte, which
+//! is small enough to commit as a fixture and hand to a run months later.
 //!
-//! All of that starts from a seed that is known to break, and [`sweep`] is what finds one: it runs a
-//! whole range of seeds under one schedule of faults and hands back the ones that could not take it,
-//! each of which is something a reduction can then cut down. Seeds are independent — a run of one
-//! draws nothing from a run of another — so this is the one place in the engine that uses real
-//! threads, and the fourth determinism rule is untouched because every run is still a
-//! single-threaded simulation on an executor of its own. What the rule does demand is that nothing
-//! about the answer come from the split, so a sweep runs every seed even after one has broken and
-//! merges what the workers found **by seed**: `--jobs` buys wall-clock time and moves nothing else.
-//! The scan in `tests/audit.rs` names that one file as the one place a thread is allowed, for that
-//! one rule, in a table that says why.
+//! All of that starts from a seed that is known to break, and [`sweep`] is what finds one: it runs
+//! a whole range of seeds under one schedule of faults and hands back the ones that could not take
+//! it, each of which is something a reduction can then cut down. Seeds are independent — a run of
+//! one draws nothing from a run of another — so this is the one place in the engine that uses real
+//! threads, and the rule of no threads inside a simulation is untouched because every run is still
+//! a single-threaded simulation on an executor of its own. What the rule does demand is that
+//! nothing about the answer come from the split, so a sweep runs every seed even after one has
+//! broken and merges what the workers found **by seed**: `--jobs` buys wall-clock time and moves
+//! nothing else. The scan in `tests/audit.rs` names that one file as the one place a thread is
+//! allowed, for that one rule, in a table that says why.
 //!
-//! Every system so far is a protocol, and [`reconciler`] is the first **control loop**: a controller
-//! that wakes on a resync period, asks an API server what is wanted and what exists, and asks for
-//! the difference. Its decision reads those two states and nothing else, so it is
-//! **level-triggered** — an action the wire lost is asked for again on the next pass without
-//! anything deciding to retry it, and a controller restarted from nothing decides exactly what one
-//! that was there all along would. What it keeps in place is a set of replicated databases across
-//! regions — a primary and its standbys — in a world where nothing is ready the moment it is asked
-//! for: replicas take their time to be provisioned, and a standby takes longer still to catch up.
-//! That is what gives the order of things consequences, and the world keeps the worst of them as a
-//! fact: a primary taken away while none of its standbys has caught up destroys the database's data.
-//! The timeline it runs moves a primary, and a decision that asked for every difference at once
-//! took the old primary away in the same breath as it promoted the new one — so a run held up on
-//! its way there could lose the data whenever the delete landed first.
+//! The systems above are protocols, and [`reconciler`] is a **control loop**: a controller that
+//! wakes on a resync period, asks an API server what is wanted and what exists, and asks for the
+//! difference. Its decision reads those two states and nothing else, so it is **level-triggered** —
+//! an action the wire lost is asked for again on the next pass without anything deciding to retry
+//! it, and a controller restarted from nothing decides exactly what one that was there all along
+//! would. What it keeps in place is a set of replicated databases across regions — a primary and
+//! its standbys — in a world where nothing is ready the moment it is asked for: replicas take their
+//! time to be provisioned, and a standby takes longer still to catch up. That is what gives the
+//! order of things consequences, and the world keeps the worst of them as a fact: a primary taken
+//! away while none of its standbys has caught up destroys the database's data. The timeline it runs
+//! moves a primary, so the order its actions land in is the whole question.
 //!
-//! Nothing had to be told that for it to be found. [`drawn_faults`] throws each seed its own trouble
-//! on the link between controller and server — drawn from the seed, knowing only the link and when
-//! the passes are, and over before the last of them — and a sweep of the reconciler under it found
-//! seeds that lost the data, and nothing else. The lowest of them cut down to one fault: a stretch
-//! of loss eating the first pass's creates, the very thing a schedule written by hand would have had
-//! to know to aim at. That repro is still committed. The decision now never deletes a still-wanted
-//! database's primary: it promotes the standby, looks again a moment later, and takes the old
-//! primary away once it has stepped down — and the same sweep, under the very same faults, finds
-//! nothing.
+//! [`drawn_faults`] throws each seed its own trouble on the link between controller and server —
+//! drawn from the seed, knowing only the link and when the passes are, and over before the last of
+//! them — so a sweep under it finds what the trouble finds rather than what someone aimed it at. An
+//! earlier version of this controller asked for every difference at once, taking the old primary
+//! away in the same breath as it promoted the new one, and a sweep under those faults found seeds
+//! that lost the data. The lowest of them cut down to one fault — a stretch of loss eating the
+//! first pass's creates, the very thing a schedule written by hand would have had to know to aim at
+//! — and that repro is committed as `tests/fixtures/lost-data.repro`. The decision never deletes a
+//! still-wanted database's primary: it promotes the standby, looks again a moment later, and takes
+//! the old primary away once it has stepped down — and the same sweep, under the very same faults,
+//! finds nothing.
 //!
-//! Before invariants, every verdict was written inside the system it judges, read off notes it kept
-//! while it ran. An [`Invariant`] is one written **outside** it: a promise about the [`World`] each
-//! step left the run in, which [`check`] reads back out of the store the trace already points into,
-//! so judging a run asks nothing of a system beyond the trace it records. A **safety** invariant
-//! holds after every step; a **liveness** one may stop holding for a while and must hold again
-//! within a span of virtual time, and a run that ends before it does has broken it. What comes back
-//! is every broken invariant's first breach, naming the step and the state it left the run in, and
-//! each becomes an [`Outcome`] — so a reduction, a repro and a sweep take it as they are. The
-//! reconciler is judged that way itself: its verdict is two invariants over the world it recorded,
-//! that no wanted database loses its data and that the loop does not end short of what was asked.
-//! So is the coordinator, with one invariant a round named for its round, so that a failure moved
-//! to another round by a reduction is still told apart from the one it started as.
+//! An [`Invariant`] is a verdict written **outside** the system it judges: a promise about the
+//! [`World`] each step left the run in, which [`check`] reads back out of the store the trace
+//! already points into, so judging a run asks nothing of a system beyond the trace it records. A
+//! **safety** invariant holds after every step; a **liveness** one may stop holding for a while and
+//! must hold again within a span of virtual time, and a run that ends before it does has broken it.
+//! What comes back is every broken invariant's first breach, naming the step and the state it left
+//! the run in, and each becomes an [`Outcome`] — so a reduction, a repro and a sweep take it as
+//! they are. The reconciler is judged that way itself: its verdict is two invariants over the world
+//! it recorded, that no wanted database loses its data and that the loop does not end short of what
+//! was asked. So is the coordinator, with one invariant a round named for its round, so that a
+//! failure moved to another round by a reduction is still told apart from the one it started as.
 //!
-//! The reconciler is a control loop, and [`replog`] is there to show the engine is not shaped around
-//! one: a replicated log, Raft-shaped, with five replicas electing a leader and three clients
-//! sending it commands. A replica asks whether it could stand before it does — a pre-vote, which
-//! moves no term — and refuses a candidate whose log is behind its own. Its verdict is four
-//! invariants over the world it recorded: never two leaders in one term, never a committed entry
-//! changed, the applied order **linearizable** as the clients saw it, and every command committed
-//! by the end of the run.
+//! [`replog`] is there to show the engine is not shaped around a control loop: a replicated log,
+//! Raft-shaped, with five replicas electing a leader and three clients sending it commands. A
+//! replica asks whether it could stand before it does — a pre-vote, which moves no term — and
+//! refuses a candidate whose log is behind its own. Its verdict is four invariants over the world
+//! it recorded: never two leaders in one term, never a committed entry changed, the applied order
+//! **linearizable** as the clients saw it, and every command committed by the end of the run.
 //!
 //! [`fork`]: fork::fork
 //! [`ring`]: systems::ring

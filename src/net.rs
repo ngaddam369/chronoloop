@@ -2,8 +2,9 @@
 //! another.
 //!
 //! A link takes time, loses things, occasionally says them twice, and can stop carrying anything at
-//! all in one direction. Every one of those is drawn from the run's seed, so the wire a system met
-//! on one run is the wire it meets on the next.
+//! all in one direction. The first three are drawn from the run's seed and the last comes from the
+//! fault schedule the run is handed, so given the same two the wire a system met on one run is the
+//! wire it meets on the next.
 //!
 //! Reordering is not among the settings, because it is not a decision: each copy of a message draws
 //! its own delay, so one sent later can land first whenever the wire is uneven. That is also what
@@ -474,7 +475,10 @@ fn landing(now: VirtualTime, link: &Link, rng: &mut impl Rng) -> VirtualTime {
     now.saturating_add(delay)
 }
 
-/// A network of nodes and the links between them, every decision drawn from one generator.
+/// A network of nodes and the links between them, every draw made from one generator.
+///
+/// What a link does by chance — a delay, a loss, a duplicate — is drawn; whether it is cut off is
+/// read from the fault schedule, and nothing is drawn to decide it.
 ///
 /// The generator is the network's own, seeded from the run's, so what a link does to a message does
 /// not shift because a task happened to draw more often than it used to.

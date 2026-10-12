@@ -38,8 +38,8 @@ pub trait Rng {
 
 /// A run's random choices, drawn from its seed and nothing else.
 ///
-/// Two generators built from one seed produce the same draws forever, which is what makes a run a
-/// pure function of its seed:
+/// Two generators built from one seed produce the same draws forever, which is what makes every
+/// choice a run leaves to chance a pure function of its seed:
 ///
 /// ```
 /// use chronoloop::rng::{Rng, SeededRng};

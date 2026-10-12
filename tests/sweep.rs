@@ -17,7 +17,7 @@
 //!
 //! It promises that the seeds it names are the seeds that broke, in seed order, whatever `jobs` is
 //! set to. It does not promise that `jobs` workers ran at once — nothing here can say that without
-//! timing something, which the first determinism rule forbids, and the case that does say it is the
+//! timing something, which the rule against a wall clock forbids, and the case that does say it is the
 //! barrier in `src/sweep.rs`, gated out of CI because it hangs rather than failing.
 
 use core::num::{NonZeroU64, NonZeroUsize};

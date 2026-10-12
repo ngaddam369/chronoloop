@@ -115,8 +115,8 @@ fn failed_at(outcome: &Outcome) -> usize {
 /// Every round-closing step of `trace`, as its position and the count it reported.
 ///
 /// Read out of the text the run wrote down, which is a different route from the one the verdict
-/// took: the coordinator counted acknowledgements as they landed, and this reads back afterwards
-/// what it said about them. An expectation derived this way can disagree with the verdict, which is
+/// took: the verdict reads the `round` and `quorum` fields of each step's recorded world through the
+/// coordinator's invariants, and this reads back what the trace's steps said about each round. An expectation derived this way can disagree with the verdict, which is
 /// the whole point of deriving it rather than asking for it.
 fn closes(trace: &Trace) -> Vec<(usize, u64)> {
     trace

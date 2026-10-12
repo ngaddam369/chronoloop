@@ -29,8 +29,9 @@ pub mod ring;
 /// name. Each is written as the module it lives in, so a person reading the header knows which file
 /// to open.
 ///
-/// Only the systems that take faults are here. The exchange and the ring take none — a schedule has
-/// nothing to say to either — so a repro could never be of them.
+/// The exchange and the ring take no faults — a schedule has nothing to say to either — so a repro
+/// could never be of them. The replicated log takes faults but is not here yet: nothing writes a
+/// repro of it, so there is no file for its name to be read off.
 ///
 /// ```
 /// use chronoloop::systems::System;

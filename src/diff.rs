@@ -212,7 +212,8 @@ impl fmt::Display for Change {
 ///
 /// The order is the walk's rather than a sort afterwards: a branch's children are held in a
 /// [`BTreeMap`], so descending one visits its children in the order their names sort in, and a
-/// depth-first descent of that is path order. Determinism rule three, satisfied by the type.
+/// depth-first descent of that is path order. The rule of ordered collections only, satisfied by the
+/// type.
 ///
 /// [`BTreeMap`]: std::collections::BTreeMap
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -45,8 +45,8 @@
 //!
 //! Every piece of it earns its place. The leading byte keeps a leaf of no bytes from hashing like a
 //! branch of no children. Children are held in a [`BTreeMap`], so their order is their names' order
-//! rather than the order something inserted them: determinism rule three, satisfied by the type
-//! rather than by care.
+//! rather than the order something inserted them: the rule of ordered collections only, satisfied
+//! by the type rather than by care.
 //!
 //! The lengths are worth being exact about, because it would be easy to claim more for them than
 //! they do. As the encoding stands they are not what keeps two states apart: a child's hash is 32

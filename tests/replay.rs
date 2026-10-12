@@ -1,4 +1,4 @@
-//! Replay: a run is a function of its seed, and of nothing else.
+//! Replay: a run handed no faults is a function of its seed, and of nothing else.
 
 use core::time::Duration;
 
