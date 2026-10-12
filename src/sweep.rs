@@ -35,6 +35,7 @@
 //! `tests/audit.rs`'s scan forbids a thread anywhere in `src/` and `tests/`, and names this file
 //! as the single exception, for one rule, in a table that says why.
 
+use core::fmt;
 use core::num::{NonZeroU64, NonZeroUsize};
 use std::panic::resume_unwind;
 use std::thread;
@@ -66,6 +67,41 @@ impl Survey {
     /// Returns the seeds that broke, in seed order.
     pub fn broke(&self) -> &[Broke] {
         &self.broke
+    }
+}
+
+/// The lowest seed a sweep could not finish, and why it could not.
+///
+/// The seed travels with the error because the error is the run's and the seed is the sweep's: a
+/// run that stalled knows nothing of which seed it was handed, and the seed is what lets someone run
+/// that one again on its own. Written the way a seed that broke is, seed first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unfinished<E> {
+    seed: u64,
+    error: E,
+}
+
+impl<E> Unfinished<E> {
+    /// Returns the seed that could not be finished — the lowest of them, if there were several.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Returns what the run under that seed returned instead of an outcome.
+    pub fn error(&self) -> &E {
+        &self.error
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for Unfinished<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "seed {}: {}", self.seed, self.error)
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for Unfinished<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -113,14 +149,15 @@ impl Survey {
 ///
 /// # Errors
 ///
-/// Returns whatever `run` returned for the **lowest** seed it could not finish, which is the same
-/// seed however the work was split. A run that broke is not an error — it is what a sweep is for.
+/// Returns the **lowest** seed it could not finish together with whatever `run` returned for it,
+/// which is the same seed however the work was split. A run that broke is not an error — it is
+/// what a sweep is for.
 ///
 /// # Panics
 ///
 /// Propagates a panic from a worker, once every worker has been joined. A simulation that panicked
 /// is a bug belonging to whoever asked for the sweep, not a verdict to fold into the report.
-pub fn sweep<E, F>(seeds: NonZeroU64, jobs: NonZeroUsize, run: F) -> Result<Survey, E>
+pub fn sweep<E, F>(seeds: NonZeroU64, jobs: NonZeroUsize, run: F) -> Result<Survey, Unfinished<E>>
 where
     F: Fn(u64) -> Result<Outcome, E> + Sync,
     E: Send,
@@ -159,8 +196,8 @@ where
             }
         }
     }
-    if let Some((_, error)) = unfinished {
-        return Err(error);
+    if let Some((seed, error)) = unfinished {
+        return Err(Unfinished { seed, error });
     }
 
     // The merge, and the reason a survey says the same thing at every count of workers: what comes
@@ -326,18 +363,39 @@ mod tests {
         // Which seed is reported must not depend on which worker got there first. Seeds 3 and 6 are
         // in different workers at four of the five splits below and in one worker at the fifth, so
         // the answer being the same at all five is the answer not coming from the split.
+        //
+        // The error says nothing about its seed, so the seed reported is the sweep's to keep. An
+        // error that named it would hold the answer up with the sweep throwing the seed away.
         let run = |seed: u64| match seed {
-            3 | 6 => Err(seed),
+            3 | 6 => Err("could not finish"),
             other => Ok(broke_at(other)),
         };
 
         for workers in [1, 2, 3, 4, WORKERS] {
+            let unfinished = sweep(seeds(SEEDS), jobs(workers), run)
+                .err()
+                .unwrap_or_else(|| panic!("over {workers} workers, two seeds could not finish"));
+            assert_eq!(unfinished.seed(), 3, "over {workers} workers");
             assert_eq!(
-                sweep(seeds(SEEDS), jobs(workers), run).err(),
-                Some(3),
+                unfinished.error(),
+                &"could not finish",
                 "over {workers} workers"
             );
         }
+    }
+
+    #[test]
+    fn a_seed_that_could_not_finish_is_written_with_its_error() {
+        // The seed is what lets someone run that one seed again, so it leads, in the form a seed
+        // that broke is written in.
+        let unfinished = sweep(seeds(SEEDS), jobs(WORKERS), |seed| match seed {
+            5 => Err("simulation stalled"),
+            _ => Ok(Outcome::Pass),
+        })
+        .err()
+        .unwrap_or_else(|| panic!("seed 5 could not finish"));
+
+        assert_eq!(unfinished.to_string(), "seed 5: simulation stalled");
     }
 
     #[test]

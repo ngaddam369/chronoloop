@@ -24,7 +24,7 @@ use core::num::{NonZeroU64, NonZeroUsize};
 
 use chronoloop::fault::FaultSchedule;
 use chronoloop::outcome::Broke;
-use chronoloop::sweep::{Survey, sweep};
+use chronoloop::sweep::{Survey, Unfinished, sweep};
 use chronoloop::systems::{RunError, quorum};
 
 /// Faults whose failure the run's draws take part in, so one seed breaks under them and another does
@@ -77,7 +77,7 @@ fn swept(count: u64, jobs: usize, schedule: &FaultSchedule) -> Survey {
     sweep(range(count), workers(jobs), |seed| {
         quorum::run(seed, schedule).map(|(_, _, outcome)| outcome)
     })
-    .unwrap_or_else(|e: RunError| panic!("every run of the coordinator finishes: {e}"))
+    .unwrap_or_else(|e: Unfinished<RunError>| panic!("every run of the coordinator finishes: {e}"))
 }
 
 /// The seeds a survey says broke.
@@ -141,6 +141,31 @@ fn how_many_workers_a_sweep_uses_does_not_change_which_seeds_it_finds() {
             swept(SEEDS, jobs, &lossy),
             alone,
             "{jobs} workers and one worker found different things"
+        );
+    }
+}
+
+#[test]
+fn a_sweep_that_could_not_finish_names_the_lowest_seed_it_could_not() {
+    // Real runs of the coordinator either side of the two seeds that cannot finish, so the seed
+    // reported has to come out from among seeds that broke and seeds that held up. The error names
+    // no seed of its own: what tells a reader which seed to run again is the sweep, or nothing.
+    let lossy = faults(LOSSY);
+    for jobs in [1, 3, 8] {
+        let unfinished = sweep(range(SEEDS), workers(jobs), |seed| match seed {
+            9 | 14 => Err(String::from("simulation stalled")),
+            _ => quorum::run(seed, &lossy)
+                .map(|(_, _, outcome)| outcome)
+                .map_err(|e| e.to_string()),
+        })
+        .err()
+        .unwrap_or_else(|| panic!("over {jobs} workers, two seeds could not finish"));
+
+        assert_eq!(unfinished.seed(), 9, "over {jobs} workers");
+        assert_eq!(
+            unfinished.to_string(),
+            "seed 9: simulation stalled",
+            "over {jobs} workers"
         );
     }
 }

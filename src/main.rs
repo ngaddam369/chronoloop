@@ -70,7 +70,7 @@ use chronoloop::outcome::{Broke, Outcome};
 use chronoloop::repro::{ParseReproError, Repro, ReproError};
 use chronoloop::shrink::shrink;
 use chronoloop::store::StateStore;
-use chronoloop::sweep::{Survey, sweep};
+use chronoloop::sweep::{Survey, Unfinished, sweep};
 use chronoloop::systems::{RunError, System, pingpong, reconciler, ring};
 use chronoloop::trace::{ParseTraceError, Step, Trace};
 
@@ -320,6 +320,8 @@ enum CliError {
     Broke(Broke),
     /// Some of the seeds a sweep covered broke under the faults they were given.
     SomeSeedsBroke(Survey),
+    /// A seed a sweep covered produced no history.
+    Unfinished(Unfinished<RunError>),
     /// The run held up, so there is no failure to cut down.
     NothingToReduce {
         /// The seed it was run under.
@@ -340,6 +342,7 @@ impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Run(error) => write!(f, "{error}"),
+            Self::Unfinished(error) => write!(f, "{error}"),
             Self::Read { path, source } => write!(f, "cannot read {}: {source}", path.display()),
             Self::Parse(error) => write!(f, "{error}"),
             Self::ParseTrace(error) => write!(f, "{error}"),
@@ -400,6 +403,7 @@ impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Run(error) => Some(error),
+            Self::Unfinished(error) => Some(error),
             Self::Read { source, .. } | Self::Write(source) => Some(source),
             Self::Parse(error) => Some(error),
             Self::ParseTrace(error) => Some(error),
@@ -422,6 +426,12 @@ impl std::error::Error for CliError {
 impl From<RunError> for CliError {
     fn from(error: RunError) -> Self {
         Self::Run(error)
+    }
+}
+
+impl From<Unfinished<RunError>> for CliError {
+    fn from(error: Unfinished<RunError>) -> Self {
+        Self::Unfinished(error)
     }
 }
 
