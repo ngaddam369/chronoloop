@@ -81,6 +81,51 @@ fn a_write_that_cannot_land_is_reported_rather_than_panicking() {
     assert!(!said.contains("panicked"), "reported, not panicked: {said}");
 }
 
+/// Asks for a replay of a file that is not there, so the command fails, with its complaint sent to
+/// `stderr`, and returns what the process did.
+fn fail_complaining_to(stderr: Stdio) -> Output {
+    let missing = PathBuf::from(SCRATCH).join("never-written.history");
+    Command::new(BINARY)
+        .arg("replay")
+        .arg(&missing)
+        .stderr(stderr)
+        .output()
+        .unwrap_or_else(|e| panic!("could not run {BINARY}: {e}"))
+}
+
+#[test]
+#[ignore = "drives a real pipe; run it with `make local-validation`"]
+fn a_failure_survives_a_complaint_nobody_is_reading() {
+    // Bad news goes to standard error, and a reader there can go away just as one on standard output
+    // can. The failure is the command's answer and the complaint only says why, so losing the
+    // complaint must not turn a failure into a crash: exit status 1, never the 101 of a panic.
+    let (reader, writer) = io::pipe().expect("the system can make a pipe");
+    drop(reader);
+    let output = fail_complaining_to(Stdio::from(writer));
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a failed command fails, whether or not anyone hears why"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "writes to /dev/full; run it with `make local-validation`"]
+fn a_failure_survives_a_complaint_that_cannot_land() {
+    // A complaint that cannot be written has nowhere left to be reported, so the exit status is all
+    // that is left to say it — and it says the command failed, not that it panicked.
+    let full = fs::File::create("/dev/full").expect("/dev/full takes writes and keeps none");
+    let output = fail_complaining_to(Stdio::from(full));
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a failed command fails, whether or not its complaint lands"
+    );
+}
+
 #[test]
 #[ignore = "redirects to a real file; run it with `make local-validation`"]
 fn a_history_redirected_to_a_file_lands_whole() {

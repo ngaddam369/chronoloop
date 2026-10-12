@@ -787,13 +787,26 @@ fn emit(output: &str, out: &mut impl Write) -> Result<(), CliError> {
     }
 }
 
+/// Writes the complaint about `error` to `err`, for a command that has failed.
+///
+/// The failure is the command's answer and the complaint only says why, so a complaint that cannot
+/// be written changes nothing about how the command ends. That is why this returns nothing:
+/// standard error is the last place anything could be reported, so a write that fails there —
+/// a reader that has gone, a device with no room — has nowhere left to go, and the exit status is
+/// what still says the command failed. `eprintln!` would panic instead, and a panic exits with a
+/// status that reads as a crash rather than as a failure.
+fn complain(error: &CliError, err: &mut impl Write) {
+    let written = writeln!(err, "chronoloop: {error}").and_then(|()| err.flush());
+    drop(written);
+}
+
 fn main() -> ExitCode {
     let carried_out =
         execute(&Cli::parse().command).and_then(|output| emit(&output, &mut io::stdout().lock()));
     match carried_out {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("chronoloop: {error}");
+            complain(&error, &mut io::stderr().lock());
             ExitCode::FAILURE
         }
     }
